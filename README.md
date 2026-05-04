@@ -9,17 +9,20 @@ making with rebate capture.
 
 **Phase 2 in progress.** Phase 1 complete in code (live shake-down
 on a real Kalshi key still open). Phase 2 has the risk gate
-(`predigy-risk`) and the order management state machine
-(`predigy-oms` — single-task runtime, Executor trait, deterministic
-cids, VWAP + realised-P&L bookkeeping, kill switch, reconcile).
-Coming next: `kalshi-exec` (FIX) and `arb-trader` (first live
-strategy).
+(`predigy-risk`), the order management state machine (`predigy-oms`
+— single-task runtime, Executor trait, deterministic cids, VWAP +
+realised-P&L bookkeeping, kill switch, reconcile), and the REST
+flavour of the Kalshi executor (`predigy-kalshi-exec` — submits
+and cancels through the V2 endpoints, polls fills into
+ExecutionReports). Coming next: `arb-trader` (first live strategy:
+static intra-venue arb), then the FIX-flavoured executor for
+latency-sensitive strategies later.
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
 | 1 | Read-only stack (REST + WS + book + recorder) | ✅ (logic) |
-| 2 | OMS + risk + FIX exec + first live strategy | 🟡 in progress (`risk` + `oms` done) |
+| 2 | OMS + risk + FIX exec + first live strategy | 🟡 in progress (`risk` + `oms` + `kalshi-exec` (REST) done) |
 | 3 | Backtester / sim | ⬜ |
 | 4 | Market making (deferred until $25k account) | ⬜ |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ |
@@ -59,6 +62,10 @@ crates/
                 risk; allocates deterministic cids; submits via Executor
                 trait; consumes ExecutionReports and updates VWAP +
                 realised P&L. Kill switch + reconcile.
+  kalshi-exec/  REST flavour of the OMS Executor over Kalshi V2.
+                Maps Yes/No intents to bid/ask-at-complement, posts
+                /portfolio/events/orders, deletes for cancels, polls
+                /portfolio/fills into PartiallyFilled/Filled reports.
 bin/
   md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
                 market list, writes one event per line, on Gap fetches a
