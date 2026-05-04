@@ -26,8 +26,8 @@
 | 3 | Backtester + sim | ✅ (logic): `predigy-sim` with IOC SimExecutor + NDJSON Replay + queue-position module for resting orders + `bin/sim-runner` CLI. Queue model integration into SimExecutor pending. |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k). FIX exec ready when MM lands. |
 | 5 | Cross-venue signal arb (primary engine) | ✅ (logic): `bin/cross-arb-trader`. Stat-arb on Kalshi vs Polymarket reference; live shake-down pending. |
-| 6 | News/data latency (free feeds first) | 🟡 In progress (`predigy-ext-feeds` with NWS active-alerts polling client + Feed-trait scaffolding; `latency-trader` binary pending) |
-| 7 | Statistical / model alpha | 🟡 In progress (`predigy-signals` with Beta-Binomial Bayes posterior, Elo rating, Kelly-fraction sizing; `stat-trader` binary pending) |
+| 6 | News/data latency (free feeds first) | ✅ (logic): `predigy-ext-feeds` (NWS active-alerts) + `bin/latency-trader` wired through OMS. Live shake-down pending. |
+| 7 | Statistical / model alpha | ✅ (logic): `predigy-signals` (Beta-Binomial / Elo / Kelly) + `bin/stat-trader` wired through OMS. Live shake-down pending. |
 | 8 | Hardening & scaling | ⬜ Ongoing |
 
 ## What's in the repo right now
@@ -244,6 +244,38 @@ predigy/
     │                                  gap-induced resync; replay the NDJSON;
     │                                  assert replayed book ≡ recorder's
     │                                  in-memory book
+    ├── latency-trader/                ✅ Phase 6
+    │   └── src/
+    │       ├── lib.rs                 module roots + re-exports
+    │       ├── strategy.rs            LatencyStrategy + LatencyRule (serde):
+    │       │                          event-substring + optional area-substring
+    │       │                          + min-Severity match against NwsAlert.
+    │       │                          First armed rule fires once → IOC Intent
+    │       │                          at rule.max_price_cents; rule disarms
+    │       │                          until rearm_all/rearm.
+    │       └── main.rs                CLI (clap): --rule-file (JSON),
+    │                                  --nws-states, --nws-user-agent,
+    │                                  per-market + account risk caps,
+    │                                  --cid-store, --dry-run. Single
+    │                                  tokio::select! over nws_rx +
+    │                                  oms.next_event + ctrl-c.
+    ├── stat-trader/                   ✅ Phase 7
+    │   └── src/
+    │       ├── lib.rs                 module roots + re-exports
+    │       ├── strategy.rs            StatStrategy + StatRule (serde):
+    │       │                          per-market model probability + side.
+    │       │                          Derives ask via complement-of-opposite-bid;
+    │       │                          fires IOC when ask < model_p * 100 by
+    │       │                          ≥ min_edge_cents; size = quarter-Kelly
+    │       │                          contracts (factor configurable) capped
+    │       │                          by max_size and book depth; per-market
+    │       │                          cooldown.
+    │       └── main.rs                CLI (clap): --rule-file (JSON),
+    │                                  --bankroll-cents, --kelly-factor,
+    │                                  --cooldown-ms, risk caps, --cid-store,
+    │                                  --dry-run. Subscribes to Kalshi WS
+    │                                  for the rules' markets, evaluates on
+    │                                  every snapshot/delta.
     └── arb-trader/                    ✅ Phase 2 part 4
         └── src/
             ├── lib.rs                 module roots + re-exports
@@ -338,8 +370,18 @@ cross-arb-trader    6 tests   (no-intent-until-poly, buys YES when Kalshi
                                 under-prices vs Poly, NO mirror, no-edge
                                 when over-prices, cooldown throttle,
                                 unknown-market ignored)
+latency-trader      8 tests   (substring match → IOC at max_price_cents;
+                                disarm-after-fire; rearm; area filter;
+                                min-severity gate; first-rule-wins;
+                                Severity ordering; Unknown < Minor)
+stat-trader         8 tests   (no-intent when ask above model_p; YES
+                                fires when under-priced vs model; NO
+                                mirror via 1-model_p; min_edge_cents
+                                gate; Kelly size cap by max_size;
+                                cooldown blocks repeat then expires;
+                                book-depth caps qty; unknown market
+                                ignored)
                    ─────────
-                  207 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /

@@ -1,0 +1,36 @@
+[package]
+name = "stat-trader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "stat-trader"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+predigy-core = { workspace = true }
+predigy-book = { workspace = true }
+predigy-kalshi-rest = { workspace = true }
+predigy-kalshi-md = { workspace = true }
+predigy-signals = { workspace = true }
+predigy-risk = { workspace = true }
+predigy-oms = { workspace = true }
+predigy-kalshi-exec = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
