@@ -13,6 +13,7 @@ workspace = true
 predigy-core = { workspace = true }
 predigy-oms = { workspace = true }
 predigy-kalshi-rest = { workspace = true }
+predigy-kalshi-md = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -150,7 +150,13 @@ async fn handle_md_event(
         MdEvent::Ticker { .. }
         | MdEvent::Trade { .. }
         | MdEvent::Subscribed { .. }
-        | MdEvent::ServerError { .. } => None,
+        | MdEvent::ServerError { .. }
+        // Authed-channel events from a possibly-shared WS connection
+        // (or a future refactor that subscribes alongside) — not
+        // relevant to the arb strategy's book evaluation.
+        | MdEvent::Fill { .. }
+        | MdEvent::MarketPosition { .. }
+        | MdEvent::UnhandledType { .. } => None,
         MdEvent::Disconnected { attempt, reason } => {
             warn!(attempt, reason, "md disconnected");
             None

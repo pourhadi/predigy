@@ -35,6 +35,7 @@ use predigy_core::order::TimeInForce;
 use predigy_core::price::{Price, Qty};
 use predigy_core::side::{Action, Side};
 use predigy_kalshi_exec::{PollerConfig, RestExecutor};
+use predigy_kalshi_md::Client as MdClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent, OmsHandle};
 use predigy_risk::{AccountLimits, Limits, PerMarketLimits, RateLimits, RiskEngine};
@@ -65,6 +66,7 @@ async fn main() -> Result<()> {
         .transpose()?
         .unwrap_or(15);
 
+    let use_ws_fills = std::env::var("KALSHI_FILLS_WS").as_deref() == Ok("1");
     let signer = Signer::from_pem(&key_id, &pem).map_err(|e| anyhow!("signer: {e}"))?;
     let rest = RestClient::authed(signer).map_err(|e| anyhow!("rest: {e}"))?;
 
@@ -109,13 +111,28 @@ async fn main() -> Result<()> {
 
     // Step 2: spin up OMS with caps that limit blast radius.
     let cap = u64::from(safety_ceiling);
-    let (executor, reports) = RestExecutor::spawn(
-        rest,
-        PollerConfig {
-            interval: Duration::from_millis(500),
-            initial_lookback: Duration::from_mins(1),
-        },
-    );
+    let (executor, reports) = if use_ws_fills {
+        eprintln!("using WS-pushed fills (KALSHI_FILLS_WS=1)");
+        let ws_signer = Signer::from_pem(&key_id, &pem).map_err(|e| anyhow!("ws signer: {e}"))?;
+        let ws_client = MdClient::new(ws_signer).map_err(|e| anyhow!("ws client: {e}"))?;
+        RestExecutor::spawn_with_ws_fills(
+            rest,
+            ws_client,
+            // Slow REST poll as catch-up safety net for WS gaps.
+            PollerConfig {
+                interval: Duration::from_secs(5),
+                initial_lookback: Duration::from_mins(1),
+            },
+        )
+    } else {
+        RestExecutor::spawn(
+            rest,
+            PollerConfig {
+                interval: Duration::from_millis(500),
+                initial_lookback: Duration::from_mins(1),
+            },
+        )
+    };
     let limits = Limits {
         per_market: PerMarketLimits {
             max_contracts_per_side: 2,
