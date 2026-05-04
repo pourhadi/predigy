@@ -149,7 +149,7 @@ impl Replay {
                 market, snapshot, ..
             } => {
                 let ticker = MarketTicker::new(&market);
-                self.store.apply_snapshot(&ticker, snapshot);
+                self.store.apply_rest_snapshot(&ticker, snapshot);
                 debug!(market = %ticker, "replay: rest_resync applied");
                 Ok(ReplayUpdate::BookUpdated(ticker))
             }
