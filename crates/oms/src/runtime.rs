@@ -46,19 +46,34 @@ const EVENT_CAPACITY: usize = 4096;
 /// Configuration handed to [`Oms::spawn`].
 #[derive(Debug, Clone)]
 pub struct OmsConfig {
-    /// Identifier embedded in client order ids and used for log filtering.
+    /// Identifier embedded in client order ids and used for log
+    /// filtering.
     pub strategy_id: String,
-    /// Sequence number to start the cid allocator at. In production,
-    /// load this from durable storage so cids never repeat across
-    /// restarts.
-    pub start_cid_seq: u64,
+    /// Cid allocator backing. Use [`CidBacking::InMemory`] for tests
+    /// and [`CidBacking::Persistent`] in production so cids survive
+    /// restarts (see [`crate::cid::CidStore`]).
+    pub cid_backing: CidBacking,
+}
+
+#[derive(Debug, Clone)]
+pub enum CidBacking {
+    /// Start at `start_seq`. Cids are not persisted — on restart they
+    /// reset.
+    InMemory { start_seq: u64 },
+    /// Persistent file-backed allocation. The OMS pre-claims chunks
+    /// to avoid an fsync per submit; at most `chunk_size − 1` cids
+    /// are wasted across a crash but no cid is ever reused.
+    Persistent {
+        store_path: std::path::PathBuf,
+        chunk_size: u64,
+    },
 }
 
 impl Default for OmsConfig {
     fn default() -> Self {
         Self {
             strategy_id: "default".into(),
-            start_cid_seq: 0,
+            cid_backing: CidBacking::InMemory { start_seq: 0 },
         }
     }
 }
@@ -283,9 +298,34 @@ impl<E: Executor + 'static> Oms<E> {
         executor: E,
         reports: mpsc::Receiver<ExecutionReport>,
     ) -> OmsHandle {
+        Self::try_spawn(config, risk, executor, reports)
+            .expect("OmsConfig::cid_backing initialisation; use try_spawn for fallible variant")
+    }
+
+    /// Fallible spawn — reports cid-store I/O errors instead of
+    /// panicking. Production binaries should call this and surface
+    /// the error in their startup path.
+    pub fn try_spawn(
+        config: OmsConfig,
+        risk: RiskEngine,
+        executor: E,
+        reports: mpsc::Receiver<ExecutionReport>,
+    ) -> Result<OmsHandle, crate::cid::CidError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
-        let cid_alloc = CidAllocator::new(&config.strategy_id, config.start_cid_seq);
+        let cid_alloc = match &config.cid_backing {
+            CidBacking::InMemory { start_seq } => {
+                CidAllocator::new(&config.strategy_id, *start_seq)
+            }
+            CidBacking::Persistent {
+                store_path,
+                chunk_size,
+            } => CidAllocator::with_store_and_chunk(
+                &config.strategy_id,
+                crate::cid::CidStore::new(store_path.clone()),
+                *chunk_size,
+            )?,
+        };
         let oms = Self {
             config,
             risk,
@@ -295,11 +335,11 @@ impl<E: Executor + 'static> Oms<E> {
             cid_alloc,
         };
         let task = tokio::spawn(run_task(oms, cmd_rx, reports, event_tx));
-        OmsHandle {
+        Ok(OmsHandle {
             cmd_tx,
             event_rx,
             task: Some(task),
-        }
+        })
     }
 }
 
@@ -366,6 +406,39 @@ impl<E: Executor> Oms<E> {
             }
             OmsCmd::ArmKillSwitch => {
                 self.state.arm_kill_switch();
+                // Best-effort mass cancel of every live order. The
+                // executor's individual cancel might fail (already
+                // filled, race with a partial fill) — log and keep
+                // going; the goal is "stop new exposure" which the
+                // kill-switch flag already guarantees by rejecting
+                // future submits.
+                let live: Vec<OrderId> = self
+                    .orders
+                    .iter()
+                    .filter_map(|(cid, r)| {
+                        if r.is_terminal() || r.cancel_in_flight {
+                            None
+                        } else {
+                            Some(cid.clone())
+                        }
+                    })
+                    .collect();
+                let count = live.len();
+                for cid in live {
+                    if let Some(r) = self.orders.get_mut(&cid) {
+                        r.cancel_in_flight = true;
+                    }
+                    if let Err(e) = self.executor.cancel(&cid).await {
+                        warn!(cid = %cid, error = %e, "kill-switch cancel failed; continuing");
+                        if let Some(r) = self.orders.get_mut(&cid) {
+                            r.cancel_in_flight = false;
+                        }
+                    }
+                }
+                info!(
+                    orders_cancelled = count,
+                    "kill switch armed; cancels dispatched"
+                );
                 if event_tx.send(OmsEvent::KillSwitchArmed).await.is_err() {
                     return Err(EventChannelClosed);
                 }

@@ -22,10 +22,10 @@
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
 | 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
-| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ✅ Done (logic): `risk` + `oms` + `kalshi-exec` (REST) + `arb-trader`. Live shake-down with real capital is the open item. FIX-flavoured exec deferred to MM phase. |
-| 3 | Backtester + sim | 🟡 In progress (`predigy-sim`: BookStore + IOC SimExecutor + NDJSON Replay + arb-strategy integration test done; queue-position model for resting/maker orders pending) |
-| 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
-| 5 | Cross-venue signal arb (primary engine) | ⬜ Not started |
+| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ✅ Done (logic): `risk` + `oms` (with durable cid + mass-cancel-on-kill) + `kalshi-exec` (REST) + `kalshi-fix` (FIX 4.4) + `arb-trader`. Live shake-down with real capital is the open item. |
+| 3 | Backtester + sim | ✅ (logic): `predigy-sim` with IOC SimExecutor + NDJSON Replay + queue-position module for resting orders + `bin/sim-runner` CLI. Queue model integration into SimExecutor pending. |
+| 4 | Market making + rebate capture | ⬜ Deferred (≥$25k). FIX exec ready when MM lands. |
+| 5 | Cross-venue signal arb (primary engine) | ✅ (logic): `bin/cross-arb-trader`. Stat-arb on Kalshi vs Polymarket reference; live shake-down pending. |
 | 6 | News/data latency (free feeds first) | ⬜ Not started |
 | 7 | Statistical / model alpha | ⬜ Not started |
 | 8 | Hardening & scaling | ⬜ Ongoing |
@@ -286,12 +286,15 @@ predigy-risk       21 tests   (limits round-trip / overrides / for_market;
                                 engine: kill switch, per-market position +
                                 notional, gross notional, daily-loss, rate
                                 limit, sell-shrinks-only, 0=disabled)
-predigy-oms        25 tests   (17 unit: cid allocator, position_math VWAP +
-                                P&L, OrderRecord state machine;
-                                + 8 integration: submit→ack→fill,
+predigy-oms        31 tests   (22 unit: cid allocator + persistent cid
+                                store round-trips + chunk refill +
+                                no-repeat-across-restart, position_math
+                                VWAP + P&L, OrderRecord state machine;
+                                + 9 integration: submit→ack→fill,
                                 risk-reject, partial+final fill, sell
                                 realises P&L, cancel, kill switch,
-                                reconcile mismatch, executor-failure path)
+                                kill-switch mass-cancel,
+                                reconcile mismatch, executor-failure)
 predigy-kalshi-exec 15 tests   (12 unit: Yes/No mapping (4 cases) including
                                 NO-at-complement, post_only as GTC+flag,
                                 Market rejected, FillRecord → domain
@@ -310,22 +313,33 @@ arb-trader          8 tests   (strategy: balanced market → no arb;
                                 marginal opportunity blocked by fees;
                                 empty book side → no arb;
                                 reset_cooldown clears throttle)
-predigy-sim        20 tests   (19 unit: BookStore lazy-create + missing-
-                                market; matching: 7 cases (touch fill,
-                                limit-too-low, partial, NO leg,
-                                empty-side, sell-unsupported, second-match-
-                                sees-consumption); SimExecutor: 6 cases
-                                (filled, no-liquidity-cancelled,
-                                partial+remainder-cancelled, unknown-market
-                                rejected, non-IOC rejected, unknown-cid
-                                cancel); Replay: snapshot-then-delta order,
-                                gap surfaced, unsupported-schema rejected,
-                                schema-version-constant matches recorder;
+predigy-sim        28 tests   (27 unit: BookStore + matching (7 cases) +
+                                SimExecutor (6 cases) + Replay (4 cases) +
+                                queue-position (8 cases: queue-ahead
+                                consumed before fill, fills after
+                                queue-pass, cap-at-remaining, side-
+                                mismatch, price-mismatch, NO-bid hit by
+                                YES-taker, maker-fee on synth fill,
+                                zero-count noop);
                                 + 1 integration: ArbStrategy through
-                                Replay+OMS+SimExecutor with YES+NO position
-                                + book-consumption assertions)
+                                Replay+OMS+SimExecutor)
+predigy-kalshi-fix 23 tests   (21 unit: frame round-trip + corruption +
+                                partial + garbage detection; messages
+                                Logon/NewOrderSingle/Cancel/Heartbeat
+                                round-trip, ExecutionReport parse for
+                                Filled and Rejected, post_only-rejected,
+                                missing-required-tag; session: out_seq
+                                monotonic, in_seq advances on happy path,
+                                rejects compid/seq mismatch + replay;
+                                + 2 integration: full Logon→Submit→
+                                Acked→Filled against a TCP loopback
+                                FIX server)
+cross-arb-trader    6 tests   (no-intent-until-poly, buys YES when Kalshi
+                                under-prices vs Poly, NO mirror, no-edge
+                                when over-prices, cooldown throttle,
+                                unknown-market ignored)
                    ─────────
-                  165 tests   (+ 4 doctests)
+                  207 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /

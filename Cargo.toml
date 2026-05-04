@@ -9,9 +9,12 @@ members = [
     "crates/risk",
     "crates/oms",
     "crates/kalshi-exec",
+    "crates/kalshi-fix",
     "crates/sim",
     "bin/md-recorder",
     "bin/arb-trader",
+    "bin/sim-runner",
+    "bin/cross-arb-trader",
 ]
 
 [workspace.package]
@@ -44,6 +47,8 @@ predigy-risk = { path = "crates/risk" }
 predigy-oms = { path = "crates/oms" }
 predigy-kalshi-exec = { path = "crates/kalshi-exec" }
 predigy-sim = { path = "crates/sim" }
+predigy-poly-md = { path = "crates/poly-md" }
+predigy-kalshi-fix = { path = "crates/kalshi-fix" }
 md-recorder = { path = "bin/md-recorder" }
 
 serde = { version = "1", features = ["derive"] }

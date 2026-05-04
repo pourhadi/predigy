@@ -3,8 +3,9 @@
 use crate::auth::Signer;
 use crate::error::Error;
 use crate::types::{
-    CancelOrderResponse, CreateOrderRequest, CreateOrderResponse, FillsResponse,
-    MarketDetailResponse, MarketsResponse, OrderbookResponse, PositionsResponse,
+    BatchCancelOrdersRequest, BatchCancelOrdersResponse, CancelOrderResponse, CreateOrderRequest,
+    CreateOrderResponse, FillsResponse, MarketDetailResponse, MarketsResponse, OrderbookResponse,
+    PositionsResponse,
 };
 use predigy_book::Snapshot;
 use predigy_core::price::Price;
@@ -130,6 +131,26 @@ impl Client {
         Self::decode_response(resp).await
     }
 
+    /// `DELETE` with a JSON body. Required for Kalshi's V2 batch
+    /// cancel endpoint, which is one of the few REST APIs in the
+    /// wild that demands a body on `DELETE`.
+    async fn delete_json_body<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        sub_path: &str,
+        body: &B,
+    ) -> Result<T, Error> {
+        let url = self.build_url(sub_path)?;
+        let headers = self.sign_headers(&Method::DELETE, sub_path)?;
+        let resp = self
+            .http
+            .delete(url)
+            .headers(headers)
+            .json(body)
+            .send()
+            .await?;
+        Self::decode_response(resp).await
+    }
+
     async fn decode_response<T: serde::de::DeserializeOwned>(
         resp: reqwest::Response,
     ) -> Result<T, Error> {
@@ -230,6 +251,21 @@ impl Client {
             return Err(Error::Auth("cancel_order requires a signer".into()));
         }
         self.delete_json(&format!("/portfolio/events/orders/{order_id}"), &[])
+            .await
+    }
+
+    /// `DELETE /portfolio/events/orders/batched` (auth required).
+    /// Cancels every venue order id in `request.orders` in one round
+    /// trip. Per-order results are returned individually — Kalshi does
+    /// not roll back the batch if some entries fail.
+    pub async fn batch_cancel_orders(
+        &self,
+        request: &BatchCancelOrdersRequest,
+    ) -> Result<BatchCancelOrdersResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("batch_cancel_orders requires a signer".into()));
+        }
+        self.delete_json_body("/portfolio/events/orders/batched", request)
             .await
     }
 

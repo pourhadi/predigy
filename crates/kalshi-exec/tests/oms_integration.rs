@@ -114,7 +114,7 @@ async fn submit_emits_acked_then_polled_fill_emits_filled_and_position() {
     let mut oms = Oms::spawn(
         OmsConfig {
             strategy_id: "arb".into(),
-            start_cid_seq: 0,
+            cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
         },
         RiskEngine::new(permissive()),
         executor,
