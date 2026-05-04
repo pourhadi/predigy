@@ -7,7 +7,7 @@ use std::fmt;
 ///
 /// Kept as an owned `String`. Cheap-clone usage on hot paths should switch to
 /// `Arc<str>` if profiling shows it; for now correctness > micro-optimization.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MarketTicker(String);
 
