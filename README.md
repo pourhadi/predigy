@@ -7,9 +7,10 @@ making with rebate capture.
 
 ## Status
 
-**Phase 1 in progress.** Core types, fee math, order-book engine, and
-read-only Kalshi REST client are done. WebSocket feed, md-recorder binary,
-and Polymarket reference client come next.
+**Phase 1 in progress.** Core types, fee math, order-book engine,
+read-only Kalshi REST client, and the Kalshi WebSocket market-data client
+(orderbook / ticker / trade with reconnect + sub-replay) are done.
+md-recorder binary and Polymarket reference client come next.
 
 | Phase | Description | Status |
 |---|---|---|
@@ -42,12 +43,14 @@ crates/
   core/         Price (cents 1..=99), Qty, Side, Order, Fill, Position, fees
   book/         L2 order book: snapshot/delta apply, sequence-gap detection
   kalshi-rest/  RSA-PSS auth + REST client (markets, orderbook, positions)
+  kalshi-md/    WS client: orderbook/ticker/trade decode, auto-reconnect
+                with sub replay, integration tests against a loopback server
 ```
 
-Crates that will be added in subsequent phases: `kalshi-md`, `kalshi-exec`,
-`poly-md`, `ext-feeds`, `oms`, `risk`, `strategy`, `signals`, `sim`,
-`store`, `ops`, plus binaries `md-recorder`, `arb-trader`, `mm-trader`,
-`latency-trader`, `stat-trader`.
+Crates that will be added in subsequent phases: `kalshi-exec`, `poly-md`,
+`ext-feeds`, `oms`, `risk`, `strategy`, `signals`, `sim`, `store`, `ops`,
+plus binaries `md-recorder`, `arb-trader`, `mm-trader`, `latency-trader`,
+`stat-trader`.
 
 ## Build
 
