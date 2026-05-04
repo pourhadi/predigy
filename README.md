@@ -8,17 +8,18 @@ making with rebate capture.
 ## Status
 
 **Phase 2 in progress.** Phase 1 complete in code (live shake-down
-on a real Kalshi key still open). Phase 2 has begun with the
-`predigy-risk` crate: pre-trade limits + breakers (per-market position
-and notional, account gross notional, daily-loss breaker, sliding
-order-rate window, kill switch). Coming next: `oms`, `kalshi-exec`
-(FIX), and `arb-trader` (first live strategy).
+on a real Kalshi key still open). Phase 2 has the risk gate
+(`predigy-risk`) and the order management state machine
+(`predigy-oms` — single-task runtime, Executor trait, deterministic
+cids, VWAP + realised-P&L bookkeeping, kill switch, reconcile).
+Coming next: `kalshi-exec` (FIX) and `arb-trader` (first live
+strategy).
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
 | 1 | Read-only stack (REST + WS + book + recorder) | ✅ (logic) |
-| 2 | OMS + risk + FIX exec + first live strategy | 🟡 in progress (`risk` done) |
+| 2 | OMS + risk + FIX exec + first live strategy | 🟡 in progress (`risk` + `oms` done) |
 | 3 | Backtester / sim | ⬜ |
 | 4 | Market making (deferred until $25k account) | ⬜ |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ |
@@ -53,6 +54,11 @@ crates/
   risk/         Pre-trade limits + breakers (per-market position/notional,
                 account gross notional, daily-loss breaker, order-rate
                 window, kill switch). Synchronous; first breach wins.
+  oms/          Order management state machine. Single tokio task owns
+                AccountState + per-order ledger; routes Intent through
+                risk; allocates deterministic cids; submits via Executor
+                trait; consumes ExecutionReports and updates VWAP +
+                realised P&L. Kill switch + reconcile.
 bin/
   md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
                 market list, writes one event per line, on Gap fetches a
@@ -62,7 +68,7 @@ bin/
 ```
 
 Crates that will be added in subsequent phases: `kalshi-exec`,
-`ext-feeds`, `oms`, `strategy`, `signals`, `sim`, `store`, `ops`,
+`ext-feeds`, `strategy`, `signals`, `sim`, `store`, `ops`,
 plus binaries `arb-trader`, `mm-trader`, `latency-trader`, `stat-trader`.
 
 ## Build

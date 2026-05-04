@@ -22,7 +22,7 @@
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
 | 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
-| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | 🟡 In progress (`risk` done; `oms`, `kalshi-exec`, `arb-trader` pending) |
+| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | 🟡 In progress (`risk` + `oms` done; `kalshi-exec`, `arb-trader` pending) |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ Not started |
@@ -120,12 +120,46 @@ predigy/
 │           │                          order timestamps for rate limiting,
 │           │                          kill-switch flag. Pruning amortised over
 │           │                          orders_in_window calls.
-│           └── engine.rs              RiskEngine.check(intent, state, now) →
-│                                      Decision::Approve | Reject(Reason). First
-│                                      breach wins; checks every limit type
-│                                      including kill switch, order rate, daily
-│                                      loss, per-market position/notional, and
-│                                      account gross notional.
+│   │       └── engine.rs              RiskEngine.check(intent, state, now) →
+│   │                                  Decision::Approve | Reject(Reason). First
+│   │                                  breach wins; checks every limit type
+│   │                                  including kill switch, order rate, daily
+│   │                                  loss, per-market position/notional, and
+│   │                                  account gross notional.
+│   └── oms/                           ✅ Phase 2 part 2
+│       ├── src/
+│       │   ├── lib.rs                 module roots + re-exports
+│       │   ├── cid.rs                 CidAllocator: deterministic
+│       │   │                          {strategy_id}:{market}:{seq:08} ids
+│       │   ├── executor.rs            Executor trait (submit/cancel async fns,
+│       │   │                          no async-trait crate needed); ExecutionReport
+│       │   │                          envelope (Acked/PartiallyFilled/Filled/
+│       │   │                          Cancelled/Rejected); StubExecutor for tests
+│       │   ├── position_math.rs       apply_fill — pure VWAP + realised-P&L math
+│       │   │                          (Buy blends VWAP w/ banker's rounding;
+│       │   │                          Sell shrinks position and books P&L vs
+│       │   │                          old avg; sells caps at held qty)
+│       │   ├── record.rs              OrderRecord — per-order tracking
+│       │   │                          (cid, state machine, cumulative fill,
+│       │   │                          VWAP per order, cancel-in-flight flag,
+│       │   │                          venue order id). Drops out-of-order
+│       │   │                          fill reports.
+│       │   └── runtime.rs             Oms<E> + OmsHandle. Single tokio task
+│       │                              owns AccountState, orders map, cid
+│       │                              allocator, risk engine, executor.
+│       │                              All inputs cross mpsc boundaries
+│       │                              (submit/cancel/kill/reconcile +
+│       │                              ExecutionReports). biased select! so
+│       │                              fills can't starve under heavy submits.
+│       │                              OmsEvent stream surfaces every state
+│       │                              transition + PositionUpdated.
+│       └── tests/runtime.rs           submit→ack→fill (happy path);
+│                                      risk rejection blocks executor; partial
+│                                      then terminal fill blends VWAP;
+│                                      sell after buy realises P&L; cancel;
+│                                      kill switch blocks/unblocks; reconcile
+│                                      flags mismatches; executor failure
+│                                      doesn't book a phantom order.
 └── bin/                               ✅ Phase 1 part 4
     └── md-recorder/
         ├── src/
@@ -167,11 +201,17 @@ predigy-risk       21 tests   (limits round-trip / overrides / for_market;
                                 engine: kill switch, per-market position +
                                 notional, gross notional, daily-loss, rate
                                 limit, sell-shrinks-only, 0=disabled)
+predigy-oms        25 tests   (17 unit: cid allocator, position_math VWAP +
+                                P&L, OrderRecord state machine;
+                                + 8 integration: submit→ack→fill,
+                                risk-reject, partial+final fill, sell
+                                realises P&L, cancel, kill switch,
+                                reconcile mismatch, executor-failure path)
 md-recorder         5 tests   (4 unit: RecordedEvent round-trips for
                                 snapshot/delta/rest_resync + schema tag;
                                 1 integration: Phase 1 acceptance)
                    ─────────
-                   97 tests   (+ 4 doctests)
+                  122 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
@@ -247,21 +287,23 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Next chunk to build
 
-Phase 2 in flight. `risk` is in; the remaining pieces:
+Phase 2 mid-flight. `risk` and `oms` are in; the remaining pieces:
 
-1. `crates/oms/` — order state machine, idempotent client-order-id,
-   reconciliation loop, kill-switch wiring. Depends on `risk` and a
-   `Executor` trait. Uses `predigy_core::Intent` as input. Exposes a
-   bounded-channel async API like the WS clients.
-2. `crates/kalshi-exec/` — implements `Executor` over Kalshi FIX 4.4
-   (logon/heartbeat/NewOrderSingle/OrderCancelRequest/ExecutionReport).
-   REST fallback behind the same trait for non-order ops. Needs the
-   FIX library decision (quickfix-rs vs hand-rolled per Kalshi spec).
-3. `bin/arb-trader/` — first live strategy: static intra-venue arb
-   (`YES + NO < $1` minus fees). Smallest blast radius for shaking down
-   the OMS+exec+risk path together.
-4. Parallel: live shake-down of `md-recorder` against the production
+1. `crates/kalshi-exec/` — implements `oms::Executor` over Kalshi
+   FIX 4.4 (logon / heartbeat / NewOrderSingle / OrderCancelRequest /
+   ExecutionReport / OrderMassCancelRequest). REST fallback behind
+   the same trait for non-order ops. Needs the FIX library decision
+   (quickfix-rs vs hand-rolled per Kalshi's spec).
+2. `bin/arb-trader/` — first live strategy: static intra-venue arb
+   (`YES + NO < $1` minus fees). Smallest blast radius for shaking
+   down the OMS+exec+risk path together.
+3. Parallel: live shake-down of `md-recorder` against the production
    Kalshi endpoint (Phase 1's last open item).
+4. Phase-2 hardening (after the binary lands):
+   - Durable cid sequence storage so cids never repeat across restarts.
+   - Mass-cancel wiring on kill-switch arm.
+   - Persistent OMS state (`sqlx`/Postgres) per the plan.
+   - Order amend (Kalshi `OrderCancelReplaceRequest`).
 
 ## Build / run
 
@@ -281,6 +323,7 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
+| _pending_ | Add `predigy-oms` (order management state machine) — Phase 2, part 2 |
 | _pending_ | Add `predigy-risk` (pre-trade limits + breakers) — Phase 2, part 1 |
 | `bb1b072` | Merge PR #4: `predigy-poly-md` (Polymarket WS reference client) |
 | `efe0c1f` | Merge PR #5: `bin/md-recorder` (NDJSON recorder w/ REST resync) — Phase 1, part 4 |

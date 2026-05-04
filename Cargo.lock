@@ -981,6 +981,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-oms"
+version = "0.1.0"
+dependencies = [
+ "predigy-core",
+ "predigy-risk",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "predigy-poly-md"
 version = "0.1.0"
 dependencies = [
