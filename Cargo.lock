@@ -981,6 +981,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-poly-md"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -5,6 +5,7 @@ members = [
     "crates/book",
     "crates/kalshi-rest",
     "crates/kalshi-md",
+    "crates/poly-md",
     "bin/md-recorder",
 ]
 

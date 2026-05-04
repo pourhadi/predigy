@@ -7,12 +7,12 @@ making with rebate capture.
 
 ## Status
 
-**Phase 1 nearly complete.** Core types, fee math, order-book engine,
-Kalshi REST + WS clients, and the `md-recorder` binary (with
-sequence-gap REST resync and a replay-vs-recorder integration test)
-are done. Polymarket reference client tracked separately in PR #4.
-Live shake-down against a real Kalshi key is the last open item before
-moving to Phase 2.
+**Phase 1 complete (logic).** Core types, fee math, order-book engine,
+Kalshi REST + WS clients, the Polymarket reference WS client, and the
+`md-recorder` binary (with sequence-gap REST resync and a
+replay-vs-recorder integration test) are all in place. Live shake-down
+against a real Kalshi key is the last open item before moving to
+Phase 2.
 
 | Phase | Description | Status |
 |---|---|---|
@@ -47,6 +47,8 @@ crates/
   kalshi-rest/  RSA-PSS auth + REST client (markets, orderbook, positions)
   kalshi-md/    Kalshi WS: orderbook/ticker/trade decode, auto-reconnect
                 with sub replay, integration tests against a loopback server
+  poly-md/      Polymarket WS reference: book/price_change/last_trade_price/
+                tick_size_change decode, no auth, batched-frame handling
 bin/
   md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
                 market list, writes one event per line, on Gap fetches a

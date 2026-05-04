@@ -21,7 +21,7 @@
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
-| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | 🟡 In progress (REST + book + WS + md-recorder done; poly-md tracked separately in PR #4) |
+| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
 | 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ⬜ Not started |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
@@ -42,72 +42,94 @@ predigy/
 ├── docs/
 │   ├── PLAN.md                        full architecture / strategy / infra plan
 │   └── STATUS.md                      this file
-└── crates/
-    ├── core/                          ✅ Phase 0
-    │   └── src/
-    │       ├── lib.rs                 module roots + re-exports
-    │       ├── price.rs               Price (cents 1..=99), Qty (non-zero u32)
-    │       ├── side.rs                Side (Yes/No), Action (Buy/Sell)
-    │       ├── market.rs              MarketTicker, Market, MarketStatus
-    │       ├── order.rs               Order, OrderId, OrderType, TimeInForce, OrderState
-    │       ├── fill.rs                Fill (with maker flag, fee_cents)
-    │       ├── position.rs            Position with unrealized PnL
-    │       └── fees.rs                Kalshi Feb-2026 fee formula (integer cents)
-    ├── book/                          ✅ Phase 1 part 1
-    │   └── src/lib.rs                 OrderBook, Snapshot, Delta, ApplyOutcome
-    │                                  - apply_snapshot / apply_delta
-    │                                  - sequence-gap detection (last_seq preserved on gap)
-    │                                  - best YES bid/ask/no-bid, mid, spread
-    │                                  - YES asks derived from NO bids by complement
-    ├── kalshi-rest/                   ✅ Phase 1 part 1
-    │   ├── src/
-    │   │   ├── lib.rs                 module roots + re-exports
-    │   │   ├── auth.rs                Signer (RSA-PSS-SHA256, PKCS#1 or PKCS#8 PEM)
-    │   │   ├── client.rs              Client (auth-optional, reqwest, rustls-tls)
-    │   │   ├── error.rs               Error enum (Http, Api, Auth, Decode, Url)
-    │   │   └── types.rs               JSON response types (decimal price schema)
-    │   └── examples/smoke.rs          live read-only smoke test
-    └── kalshi-md/                     ✅ Phase 1 part 2
+├── crates/
+│   ├── core/                          ✅ Phase 0
+│   │   └── src/
+│   │       ├── lib.rs                 module roots + re-exports
+│   │       ├── price.rs               Price (cents 1..=99), Qty (non-zero u32)
+│   │       ├── side.rs                Side (Yes/No), Action (Buy/Sell)
+│   │       ├── market.rs              MarketTicker, Market, MarketStatus
+│   │       ├── order.rs               Order, OrderId, OrderType, TimeInForce, OrderState
+│   │       ├── fill.rs                Fill (with maker flag, fee_cents)
+│   │       ├── position.rs            Position with unrealized PnL
+│   │       └── fees.rs                Kalshi Feb-2026 fee formula (integer cents)
+│   ├── book/                          ✅ Phase 1 part 1
+│   │   └── src/lib.rs                 OrderBook, Snapshot, Delta, ApplyOutcome
+│   │                                  - apply_snapshot / apply_delta
+│   │                                  - sequence-gap detection (last_seq preserved on gap)
+│   │                                  - best YES bid/ask/no-bid, mid, spread
+│   │                                  - YES asks derived from NO bids by complement
+│   ├── kalshi-rest/                   ✅ Phase 1 part 1
+│   │   ├── src/
+│   │   │   ├── lib.rs                 module roots + re-exports
+│   │   │   ├── auth.rs                Signer (RSA-PSS-SHA256, PKCS#1 or PKCS#8 PEM)
+│   │   │   ├── client.rs              Client (auth-optional, reqwest, rustls-tls)
+│   │   │   ├── error.rs               Error enum (Http, Api, Auth, Decode, Url)
+│   │   │   └── types.rs               JSON response types (decimal price schema)
+│   │   └── examples/smoke.rs          live read-only smoke test
+│   ├── kalshi-md/                     ✅ Phase 1 part 2
+│   │   ├── src/
+│   │   │   ├── lib.rs                 module roots + re-exports + quick-start
+│   │   │   ├── messages.rs            wire types: Outgoing (Subscribe/Unsubscribe/
+│   │   │   │                          UpdateSubscription) + Incoming envelope
+│   │   │   │                          (snapshot/delta/ticker/trade/subscribed/error/ok)
+│   │   │   ├── decode.rs              "0.0800"→Price, "300.00"→u32, "-54.00"→i32;
+│   │   │   │                          wire snapshot/delta → predigy_book::{Snapshot,Delta}
+│   │   │   ├── backoff.rs             exp backoff w/ full jitter (Brooker 2015)
+│   │   │   ├── client.rs              Client + Connection: auth on upgrade, command
+│   │   │   │                          and event channels, single-task multiplexer,
+│   │   │   │                          reconnect with replay of saved subscriptions
+│   │   │   └── error.rs               Error enum (WebSocket, Upgrade, Server, Decode,
+│   │   │                              OutOfRange, Closed, Invalid, Url)
+│   │   └── tests/
+│   │       ├── loopback_session.rs    end-to-end: subscribe → snapshot → delta →
+│   │       │                          ticker → trade against an in-process mock
+│   │       └── reconnect_replay.rs    server drops, client reconnects, replays the
+│   │                                  saved sub with the original req_id
+│   └── poly-md/                       ✅ Phase 1 part 3
+│       ├── src/
+│       │   ├── lib.rs                 module roots + re-exports + quick-start
+│       │   ├── messages.rs            wire types: Subscribe (assets_ids/type/
+│       │   │                          custom_feature_enabled) + Incoming
+│       │   │                          tagged on `event_type` (book / price_change /
+│       │   │                          last_trade_price / tick_size_change / Other)
+│       │   ├── decode.rs              parse_price (string → f64 ∈ [0,1]) and
+│       │   │                          parse_size (non-negative)
+│       │   ├── backoff.rs             same algorithm as kalshi-md (duplicated,
+│       │   │                          ~80 lines, no shared crate yet)
+│       │   ├── client.rs              Client + Connection: no auth, single-payload
+│       │   │                          subscribe, BTreeSet of saved asset_ids,
+│       │   │                          reconnect with consolidated re-subscribe.
+│       │   │                          Handles both `{...}` and `[{...},{...}]`
+│       │   │                          framing (Polymarket batches multiple events).
+│       │   └── error.rs               Error enum
+│       └── tests/
+│           ├── loopback_session.rs    end-to-end against an in-process mock; covers
+│           │                          single-frame events and JSON-array batching
+│           └── reconnect_replay.rs    server drops, client adds a second asset
+│                                      during backoff, reconnect sends the union
+└── bin/                               ✅ Phase 1 part 4
+    └── md-recorder/
         ├── src/
-        │   ├── lib.rs                 module roots + re-exports + quick-start
-        │   ├── messages.rs            wire types: Outgoing (Subscribe/Unsubscribe/
-        │   │                          UpdateSubscription) + Incoming envelope
-        │   │                          (snapshot/delta/ticker/trade/subscribed/error/ok)
-        │   ├── decode.rs              "0.0800"→Price, "300.00"→u32, "-54.00"→i32;
-        │   │                          wire snapshot/delta → predigy_book::{Snapshot,Delta}
-        │   ├── backoff.rs             exp backoff w/ full jitter (Brooker 2015)
-        │   ├── client.rs              Client + Connection: auth on upgrade, command
-        │   │                          and event channels, single-task multiplexer,
-        │   │                          reconnect with replay of saved subscriptions
-        │   └── error.rs               Error enum (WebSocket, Upgrade, Server, Decode,
-        │                              OutOfRange, Closed, Invalid, Url)
-    │   └── tests/
-    │       ├── loopback_session.rs    end-to-end: subscribe → snapshot → delta →
-    │       │                          ticker → trade against an in-process mock
-    │       └── reconnect_replay.rs    server drops, client reconnects, replays the
-    │                                  saved sub with the original req_id
-    └── ../bin/                        ✅ Phase 1 part 4 (bin/md-recorder)
-        └── md-recorder/
-            ├── src/
-            │   ├── lib.rs             module roots + re-exports
-            │   ├── recorded.rs        on-disk NDJSON schema (versioned), with a
-            │   │                      synthetic RestResync event the recorder
-            │   │                      injects after a Gap-triggered REST fetch
-            │   ├── recorder.rs        Recorder<P: SnapshotProvider> — drains the
-            │   │                      kalshi-md Connection, writes one NDJSON
-            │   │                      line per event, applies snapshot/delta to
-            │   │                      a per-market OrderBook, on Gap pulls a
-            │   │                      fresh snapshot via P and emits RestResync,
-            │   │                      on Reconnected forces a resync per market
-            │   └── main.rs            CLI (clap): --output, --market…,
-            │                          --kalshi-key-id, --kalshi-pem; SIGINT for
-            │                          graceful shutdown; tracing-subscriber logs
-            └── tests/
-                └── replay_vs_recorder.rs   Phase 1 acceptance: drive recorder
-                                            through subscribe→snapshot→delta→
-                                            gap-induced resync; replay the
-                                            NDJSON; assert replayed book ≡
-                                            recorder's in-memory book
+        │   ├── lib.rs                 module roots + re-exports
+        │   ├── recorded.rs            on-disk NDJSON schema (versioned), with a
+        │   │                          synthetic RestResync event the recorder
+        │   │                          injects after a Gap-triggered REST fetch
+        │   ├── recorder.rs            Recorder<P: SnapshotProvider> — drains the
+        │   │                          kalshi-md Connection, writes one NDJSON
+        │   │                          line per event, applies snapshot/delta to
+        │   │                          a per-market OrderBook, on Gap pulls a
+        │   │                          fresh snapshot via P and emits RestResync,
+        │   │                          on Reconnected forces a resync per market
+        │   └── main.rs                CLI (clap): --output, --market…,
+        │                              --kalshi-key-id, --kalshi-pem; SIGINT for
+        │                              graceful shutdown; tracing-subscriber logs
+        └── tests/
+            └── replay_vs_recorder.rs  Phase 1 acceptance: drive recorder
+                                       through subscribe→snapshot→delta→
+                                       gap-induced resync; replay the NDJSON;
+                                       assert replayed book ≡ recorder's
+                                       in-memory book
 ```
 
 ## Test counts
@@ -120,15 +142,16 @@ predigy-kalshi-rest 6 tests   (auth round-trip, PSS non-determinism, bad PEM,
 predigy-kalshi-md  27 tests   (25 unit: backoff, decode, messages, client;
                                 + 2 integration: loopback session, reconnect
                                 replay)
+predigy-poly-md    14 tests   (12 unit: backoff, decode, messages;
+                                + 2 integration: loopback session w/ batched
+                                JSON-array framing, reconnect replay)
 md-recorder         5 tests   (4 unit: RecordedEvent round-trips for snapshot/
                                 delta/rest_resync + schema-version tag;
                                 + 1 integration: Phase 1 acceptance —
                                 replay-vs-recorder identical book)
                    ─────────
-                   59 tests
+                   73 tests   (+ 3 doctests)
 ```
-
-(predigy-poly-md adds 14 more in PR #4 — 73 once both PRs land.)
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 `claude/**` and on every PR against `main`):
@@ -176,10 +199,19 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 - Request access via `[email protected]`.
 - Used for order entry/cancel/amend in Phase 2.
 
-### Polymarket WS (not yet implemented)
+### Polymarket WS
 - URL: `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- No auth needed for the public market channel (book + price).
-- Used as a reference price; we never execute on Polymarket.
+- No auth needed for the public market channel.
+- Subscribe payload: `{ "assets_ids": [...], "type": "market",
+  "custom_feature_enabled": false }`. Note the documented spelling:
+  **`assets_ids`** (plural with trailing `s` on `assets`).
+- No in-band unsubscribe — to drop a subscription, close the connection.
+- Events tagged on `event_type`: `book` (full snapshot), `price_change`
+  (incremental, carries `best_bid`/`best_ask`), `last_trade_price`,
+  `tick_size_change`. Multi-event JSON-array framing is supported by the
+  decoder.
+- Numerics are decimal strings (variable tick size); parsed to f64.
+  Reference price only — never used for execution sizing.
 
 ## Known limitations / open items
 
@@ -194,17 +226,20 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Next chunk to build
 
-Still inside Phase 1:
+The remaining Phase 1 work is operational, not code:
 
-1. (PR #4 in flight) `crates/poly-md/` — Polymarket WS reference client.
-2. **Live shake-down on a real Kalshi key**: run `md-recorder` against
+1. **Live shake-down on a real Kalshi key**: run `md-recorder` against
    the production WS+REST endpoints from a workstation with public CA
    roots, capture an hour or two of data, replay it, confirm
-   replay-vs-recorder identical. This is what closes the Phase 1
-   acceptance criterion in practice; the integration test only proves
-   the logic.
-3. Parquet rotation (Phase 3 work, but the schema is stable enough
-   today that it can be added incrementally).
+   replay-vs-recorder identical. The integration test in
+   `bin/md-recorder/tests/replay_vs_recorder.rs` proves the logic; this
+   step proves the wire/auth path.
+2. Optional: capture a 24h sample for the Phase 1 acceptance corpus.
+3. Optional: parquet rotation for the on-disk schema (deferred to
+   Phase 3 unless storage volume forces the issue earlier).
+
+Then we move to Phase 2: OMS + risk + FIX exec + first live strategy
+(intra-venue arb).
 
 ## Build / run
 
@@ -224,7 +259,8 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
-| _pending_ | Add `bin/md-recorder` (NDJSON recorder w/ REST resync) — Phase 1, part 4 |
+| _pending_ | Add `predigy-poly-md` (Polymarket WS reference client) — Phase 1, part 3 |
+| `efe0c1f` | Merge PR #5: `bin/md-recorder` (NDJSON recorder w/ REST resync) — Phase 1, part 4 |
 | `df6bb53` | Merge PR #3: `predigy-kalshi-md` (Kalshi WS client) |
 | `c5ed5be` | Merge PR #2: docs + CI workflow |
 | `bdc8019` | Fix `clippy::map_unwrap_or` in `current_unix_ms` |
