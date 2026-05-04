@@ -108,14 +108,25 @@ pub struct PositionsResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketPosition {
     pub ticker: String,
-    /// Signed: positive = YES, negative = NO.
-    pub position: i64,
+    /// Wire field: `position_fp`, decimal-string contract count
+    /// (`"0.00"`, `"-3.00"`). Signed: positive = YES, negative = NO.
+    /// Decimal because Kalshi supports fractional contracts on some
+    /// markets (off by default for elections / sports).
+    #[serde(default, deserialize_with = "de_dollars::opt", rename = "position_fp")]
+    pub position_contracts: Option<f64>,
     #[serde(default, deserialize_with = "de_dollars::opt")]
     pub realized_pnl_dollars: Option<f64>,
     #[serde(default, deserialize_with = "de_dollars::opt")]
     pub fees_paid_dollars: Option<f64>,
     #[serde(default, deserialize_with = "de_dollars::opt")]
     pub total_traded_dollars: Option<f64>,
+    #[serde(default, deserialize_with = "de_dollars::opt")]
+    pub market_exposure_dollars: Option<f64>,
+    #[serde(default)]
+    pub resting_orders_count: Option<u32>,
+    /// RFC3339 timestamp.
+    #[serde(default)]
+    pub last_updated_ts: Option<String>,
 }
 
 // -------------------------------------------------------------- Orders

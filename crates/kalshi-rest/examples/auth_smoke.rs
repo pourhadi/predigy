@@ -22,8 +22,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for p in resp.market_positions.iter().take(5) {
         println!(
-            "  {} pos={} realized_pnl={:?} fees_paid={:?}",
-            p.ticker, p.position, p.realized_pnl_dollars, p.fees_paid_dollars
+            "  {} pos_contracts={:?} exposure={:?} realized_pnl={:?} fees_paid={:?} resting_orders={:?}",
+            p.ticker,
+            p.position_contracts,
+            p.market_exposure_dollars,
+            p.realized_pnl_dollars,
+            p.fees_paid_dollars,
+            p.resting_orders_count,
         );
     }
     Ok(())

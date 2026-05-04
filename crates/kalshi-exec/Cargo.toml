@@ -24,3 +24,5 @@ rand = { workspace = true }
 predigy-risk = { workspace = true }
 rsa = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
