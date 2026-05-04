@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::types::{
     BatchCancelOrdersRequest, BatchCancelOrdersResponse, CancelOrderResponse, CreateOrderRequest,
     CreateOrderResponse, FillsResponse, MarketDetailResponse, MarketsResponse, OrderbookResponse,
-    PositionsResponse,
+    PositionsResponse, SeriesListResponse,
 };
 use predigy_book::Snapshot;
 use predigy_core::price::Price;
@@ -189,6 +189,44 @@ impl Client {
             q.push(("cursor", c.to_string()));
         }
         self.get_json("/markets", &q).await
+    }
+
+    /// `GET /markets?series_ticker=...` — Kalshi supports both
+    /// `event_ticker` and `series_ticker` as filters; the latter
+    /// matches every event in a series. Used by the weather-market
+    /// scanner to avoid paginating the full universe of markets.
+    pub async fn list_markets_in_series(
+        &self,
+        series_ticker: &str,
+        status: Option<&str>,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<MarketsResponse, Error> {
+        let mut q = vec![("series_ticker", series_ticker.to_string())];
+        if let Some(s) = status {
+            q.push(("status", s.to_string()));
+        }
+        if let Some(l) = limit {
+            q.push(("limit", l.to_string()));
+        }
+        if let Some(c) = cursor {
+            q.push(("cursor", c.to_string()));
+        }
+        self.get_json("/markets", &q).await
+    }
+
+    /// `GET /series` filtered by category. Kalshi's category names
+    /// are stable strings (`"Climate and Weather"`, `"Politics"`,
+    /// `"Sports"`, etc.). Returns the full list — not paginated.
+    pub async fn list_series_by_category(
+        &self,
+        category: &str,
+    ) -> Result<SeriesListResponse, Error> {
+        let q = vec![("category", category.to_string())];
+        // Some Kalshi accounts get `series: null` instead of an
+        // empty array when there's no match; the type's
+        // serde(default) handles that case.
+        self.get_json("/series", &q).await
     }
 
     /// `GET /markets/{ticker}`.
