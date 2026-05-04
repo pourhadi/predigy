@@ -11,6 +11,7 @@
 
 use predigy_core::price::Price;
 use predigy_core::side::Side;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A single price level: `(price → resting quantity)`.
@@ -152,7 +153,10 @@ impl OrderBook {
 }
 
 /// Snapshot payload (already parsed from Kalshi REST or WS).
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` are provided so the `md-recorder` binary can
+/// archive snapshots to NDJSON and replay them on demand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub seq: u64,
     pub yes_bids: Vec<(Price, u32)>,
@@ -160,7 +164,7 @@ pub struct Snapshot {
 }
 
 /// One incremental order-book change.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Delta {
     pub market: String,
     pub seq: u64,

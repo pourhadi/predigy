@@ -7,10 +7,12 @@ making with rebate capture.
 
 ## Status
 
-**Phase 1 in progress.** Core types, fee math, order-book engine,
-read-only Kalshi REST client, and the Kalshi WebSocket market-data client
-(orderbook / ticker / trade with reconnect + sub-replay) are done.
-md-recorder binary and Polymarket reference client come next.
+**Phase 1 nearly complete.** Core types, fee math, order-book engine,
+Kalshi REST + WS clients, and the `md-recorder` binary (with
+sequence-gap REST resync and a replay-vs-recorder integration test)
+are done. Polymarket reference client tracked separately in PR #4.
+Live shake-down against a real Kalshi key is the last open item before
+moving to Phase 2.
 
 | Phase | Description | Status |
 |---|---|---|
@@ -43,14 +45,19 @@ crates/
   core/         Price (cents 1..=99), Qty, Side, Order, Fill, Position, fees
   book/         L2 order book: snapshot/delta apply, sequence-gap detection
   kalshi-rest/  RSA-PSS auth + REST client (markets, orderbook, positions)
-  kalshi-md/    WS client: orderbook/ticker/trade decode, auto-reconnect
+  kalshi-md/    Kalshi WS: orderbook/ticker/trade decode, auto-reconnect
                 with sub replay, integration tests against a loopback server
+bin/
+  md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
+                market list, writes one event per line, on Gap fetches a
+                fresh REST snapshot via predigy-kalshi-rest and emits a
+                synthetic RestResync line so replay reconstructs identical
+                book state.
 ```
 
-Crates that will be added in subsequent phases: `kalshi-exec`, `poly-md`,
+Crates that will be added in subsequent phases: `kalshi-exec`,
 `ext-feeds`, `oms`, `risk`, `strategy`, `signals`, `sim`, `store`, `ops`,
-plus binaries `md-recorder`, `arb-trader`, `mm-trader`, `latency-trader`,
-`stat-trader`.
+plus binaries `arb-trader`, `mm-trader`, `latency-trader`, `stat-trader`.
 
 ## Build
 

@@ -5,6 +5,7 @@ members = [
     "crates/book",
     "crates/kalshi-rest",
     "crates/kalshi-md",
+    "bin/md-recorder",
 ]
 
 [workspace.package]
@@ -32,12 +33,16 @@ cast_sign_loss = "allow"
 predigy-core = { path = "crates/core" }
 predigy-book = { path = "crates/book" }
 predigy-kalshi-rest = { path = "crates/kalshi-rest" }
+predigy-kalshi-md = { path = "crates/kalshi-md" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "fs", "signal", "io-util"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 http = "1"
