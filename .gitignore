@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local dev
+.env
+.env.*
+!.env.example
+*.log
+/data/
+/tmp/
+
+# Secrets — NEVER commit
+*.pem
+*.key
+*.p12
+secrets/
