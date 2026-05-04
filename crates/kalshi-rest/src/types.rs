@@ -5,6 +5,35 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Decimal-string-or-number `_dollars` deserializer. Kalshi's
+/// post-Mar-2026 REST schema serialises every `*_dollars` /
+/// `*_fp` field as a quoted decimal string (`"0.5300"`), but
+/// older snapshots and some test fixtures still emit raw floats.
+/// Accept both, parse to `f64`, and fold empty strings to `None`.
+mod de_dollars {
+    use serde::Deserialize;
+    use serde::de::{Deserializer, Error};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Num(f64),
+        Str(String),
+    }
+
+    pub fn opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+        match Option::<Repr>::deserialize(d)? {
+            None => Ok(None),
+            Some(Repr::Num(n)) => Ok(Some(n)),
+            Some(Repr::Str(s)) if s.is_empty() => Ok(None),
+            Some(Repr::Str(s)) => s
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|e| D::Error::custom(format!("parse f64 from '{s}': {e}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketsResponse {
     pub markets: Vec<MarketSummary>,
@@ -18,11 +47,11 @@ pub struct MarketSummary {
     pub event_ticker: String,
     pub status: String,
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub yes_bid_dollars: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub yes_ask_dollars: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub last_price_dollars: Option<f64>,
     pub close_time: String, // RFC3339
 }
@@ -39,30 +68,33 @@ pub struct MarketDetail {
     pub title: String,
     pub status: String,
     pub close_time: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub yes_bid_dollars: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub yes_ask_dollars: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub liquidity_dollars: Option<f64>,
     #[serde(default)]
     pub volume: Option<u64>,
 }
 
-/// Raw orderbook response. Kalshi returns `yes_bids` and `no_bids` only —
-/// there is no ask side; YES asks are derived from NO bids by complement.
+/// Raw orderbook response. Kalshi wraps the levels in `orderbook_fp`
+/// and names the sides `yes_dollars` / `no_dollars`; each level is a
+/// two-element array of decimal strings: `["0.4200", "100.00"]`.
+/// There is no ask side — YES asks are derived from NO bids by
+/// complement at the book layer.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderbookResponse {
-    pub orderbook: Orderbook,
+    pub orderbook_fp: Orderbook,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Orderbook {
-    /// Each entry: `[price_dollars, qty]`.
+    /// Each entry: `[price_dollars_str, qty_str]`. Decimal strings.
     #[serde(default)]
-    pub yes: Vec<[f64; 2]>,
+    pub yes_dollars: Vec<[String; 2]>,
     #[serde(default)]
-    pub no: Vec<[f64; 2]>,
+    pub no_dollars: Vec<[String; 2]>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,11 +110,11 @@ pub struct MarketPosition {
     pub ticker: String,
     /// Signed: positive = YES, negative = NO.
     pub position: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub realized_pnl_dollars: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub fees_paid_dollars: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_dollars::opt")]
     pub total_traded_dollars: Option<f64>,
 }
 
