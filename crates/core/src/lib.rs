@@ -5,6 +5,7 @@
 
 pub mod fees;
 pub mod fill;
+pub mod intent;
 pub mod market;
 pub mod order;
 pub mod position;
@@ -13,8 +14,9 @@ pub mod side;
 
 pub use fees::{maker_fee, taker_fee};
 pub use fill::Fill;
+pub use intent::Intent;
 pub use market::{Market, MarketTicker};
 pub use order::{Order, OrderId, OrderState, OrderType, TimeInForce};
 pub use position::Position;
 pub use price::{Price, Qty};
-pub use side::Side;
+pub use side::{Action, Side};

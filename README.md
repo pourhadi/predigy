@@ -7,18 +7,18 @@ making with rebate capture.
 
 ## Status
 
-**Phase 1 complete (logic).** Core types, fee math, order-book engine,
-Kalshi REST + WS clients, the Polymarket reference WS client, and the
-`md-recorder` binary (with sequence-gap REST resync and a
-replay-vs-recorder integration test) are all in place. Live shake-down
-against a real Kalshi key is the last open item before moving to
-Phase 2.
+**Phase 2 in progress.** Phase 1 complete in code (live shake-down
+on a real Kalshi key still open). Phase 2 has begun with the
+`predigy-risk` crate: pre-trade limits + breakers (per-market position
+and notional, account gross notional, daily-loss breaker, sliding
+order-rate window, kill switch). Coming next: `oms`, `kalshi-exec`
+(FIX), and `arb-trader` (first live strategy).
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
-| 1 | Read-only stack (REST + WS + book + recorder) | 🟡 in progress |
-| 2 | OMS + risk + FIX exec + first live strategy | ⬜ |
+| 1 | Read-only stack (REST + WS + book + recorder) | ✅ (logic) |
+| 2 | OMS + risk + FIX exec + first live strategy | 🟡 in progress (`risk` done) |
 | 3 | Backtester / sim | ⬜ |
 | 4 | Market making (deferred until $25k account) | ⬜ |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ |
@@ -42,13 +42,17 @@ Chicago VPS (Kalshi's matching engine is in Chicago — AWS us-east-1 is
 
 ```
 crates/
-  core/         Price (cents 1..=99), Qty, Side, Order, Fill, Position, fees
+  core/         Price (cents 1..=99), Qty, Side, Action, Intent, Order,
+                Fill, Position, fees
   book/         L2 order book: snapshot/delta apply, sequence-gap detection
   kalshi-rest/  RSA-PSS auth + REST client (markets, orderbook, positions)
   kalshi-md/    Kalshi WS: orderbook/ticker/trade decode, auto-reconnect
                 with sub replay, integration tests against a loopback server
   poly-md/      Polymarket WS reference: book/price_change/last_trade_price/
                 tick_size_change decode, no auth, batched-frame handling
+  risk/         Pre-trade limits + breakers (per-market position/notional,
+                account gross notional, daily-loss breaker, order-rate
+                window, kill switch). Synchronous; first breach wins.
 bin/
   md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
                 market list, writes one event per line, on Gap fetches a
@@ -58,7 +62,7 @@ bin/
 ```
 
 Crates that will be added in subsequent phases: `kalshi-exec`,
-`ext-feeds`, `oms`, `risk`, `strategy`, `signals`, `sim`, `store`, `ops`,
+`ext-feeds`, `oms`, `strategy`, `signals`, `sim`, `store`, `ops`,
 plus binaries `arb-trader`, `mm-trader`, `latency-trader`, `stat-trader`.
 
 ## Build

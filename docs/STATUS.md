@@ -22,7 +22,7 @@
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
 | 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
-| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ⬜ Not started |
+| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | 🟡 In progress (`risk` done; `oms`, `kalshi-exec`, `arb-trader` pending) |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ Not started |
@@ -103,11 +103,29 @@ predigy/
 │       │   │                          Handles both `{...}` and `[{...},{...}]`
 │       │   │                          framing (Polymarket batches multiple events).
 │       │   └── error.rs               Error enum
-│       └── tests/
-│           ├── loopback_session.rs    end-to-end against an in-process mock; covers
-│           │                          single-frame events and JSON-array batching
-│           └── reconnect_replay.rs    server drops, client adds a second asset
-│                                      during backoff, reconnect sends the union
+│   │   └── tests/
+│   │       ├── loopback_session.rs    end-to-end against an in-process mock; covers
+│   │       │                          single-frame events and JSON-array batching
+│   │       └── reconnect_replay.rs    server drops, client adds a second asset
+│   │                                  during backoff, reconnect sends the union
+│   └── risk/                          ✅ Phase 2 part 1
+│       └── src/
+│           ├── lib.rs                 module roots + re-exports + quick-start
+│           ├── limits.rs              Limits / PerMarketLimits / AccountLimits /
+│           │                          RateLimits config (0 = disabled by convention).
+│           │                          Per-market overrides supported. JSON-friendly
+│           │                          duration_ms serde for the rate-limit window.
+│           ├── state.rs               AccountState — positions per (market, side),
+│           │                          daily realised P&L, sliding window of recent
+│           │                          order timestamps for rate limiting,
+│           │                          kill-switch flag. Pruning amortised over
+│           │                          orders_in_window calls.
+│           └── engine.rs              RiskEngine.check(intent, state, now) →
+│                                      Decision::Approve | Reject(Reason). First
+│                                      breach wins; checks every limit type
+│                                      including kill switch, order rate, daily
+│                                      loss, per-market position/notional, and
+│                                      account gross notional.
 └── bin/                               ✅ Phase 1 part 4
     └── md-recorder/
         ├── src/
@@ -135,22 +153,25 @@ predigy/
 ## Test counts
 
 ```
-predigy-core       15 tests   (price 4, side 1, position 2, fees 8)
+predigy-core       18 tests   (price 4, side 1, position 2, fees 8, intent 3)
 predigy-book        6 tests   (snapshot/delta/gap/wrong-market/edge cases)
 predigy-kalshi-rest 6 tests   (auth round-trip, PSS non-determinism, bad PEM,
                                url builder, public client, auth required)
 predigy-kalshi-md  27 tests   (25 unit: backoff, decode, messages, client;
                                 + 2 integration: loopback session, reconnect
                                 replay)
-predigy-poly-md    14 tests   (12 unit: backoff, decode, messages;
-                                + 2 integration: loopback session w/ batched
-                                JSON-array framing, reconnect replay)
-md-recorder         5 tests   (4 unit: RecordedEvent round-trips for snapshot/
-                                delta/rest_resync + schema-version tag;
-                                + 1 integration: Phase 1 acceptance —
-                                replay-vs-recorder identical book)
+predigy-poly-md    14 tests   (12 unit + 2 integration: loopback session w/
+                                batched JSON-array framing, reconnect replay)
+predigy-risk       21 tests   (limits round-trip / overrides / for_market;
+                                state position+pnl+rate-window invariants;
+                                engine: kill switch, per-market position +
+                                notional, gross notional, daily-loss, rate
+                                limit, sell-shrinks-only, 0=disabled)
+md-recorder         5 tests   (4 unit: RecordedEvent round-trips for
+                                snapshot/delta/rest_resync + schema tag;
+                                1 integration: Phase 1 acceptance)
                    ─────────
-                   73 tests   (+ 3 doctests)
+                   97 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
@@ -226,20 +247,21 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Next chunk to build
 
-The remaining Phase 1 work is operational, not code:
+Phase 2 in flight. `risk` is in; the remaining pieces:
 
-1. **Live shake-down on a real Kalshi key**: run `md-recorder` against
-   the production WS+REST endpoints from a workstation with public CA
-   roots, capture an hour or two of data, replay it, confirm
-   replay-vs-recorder identical. The integration test in
-   `bin/md-recorder/tests/replay_vs_recorder.rs` proves the logic; this
-   step proves the wire/auth path.
-2. Optional: capture a 24h sample for the Phase 1 acceptance corpus.
-3. Optional: parquet rotation for the on-disk schema (deferred to
-   Phase 3 unless storage volume forces the issue earlier).
-
-Then we move to Phase 2: OMS + risk + FIX exec + first live strategy
-(intra-venue arb).
+1. `crates/oms/` — order state machine, idempotent client-order-id,
+   reconciliation loop, kill-switch wiring. Depends on `risk` and a
+   `Executor` trait. Uses `predigy_core::Intent` as input. Exposes a
+   bounded-channel async API like the WS clients.
+2. `crates/kalshi-exec/` — implements `Executor` over Kalshi FIX 4.4
+   (logon/heartbeat/NewOrderSingle/OrderCancelRequest/ExecutionReport).
+   REST fallback behind the same trait for non-order ops. Needs the
+   FIX library decision (quickfix-rs vs hand-rolled per Kalshi spec).
+3. `bin/arb-trader/` — first live strategy: static intra-venue arb
+   (`YES + NO < $1` minus fees). Smallest blast radius for shaking down
+   the OMS+exec+risk path together.
+4. Parallel: live shake-down of `md-recorder` against the production
+   Kalshi endpoint (Phase 1's last open item).
 
 ## Build / run
 
@@ -259,7 +281,8 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
-| _pending_ | Add `predigy-poly-md` (Polymarket WS reference client) — Phase 1, part 3 |
+| _pending_ | Add `predigy-risk` (pre-trade limits + breakers) — Phase 2, part 1 |
+| `bb1b072` | Merge PR #4: `predigy-poly-md` (Polymarket WS reference client) |
 | `efe0c1f` | Merge PR #5: `bin/md-recorder` (NDJSON recorder w/ REST resync) — Phase 1, part 4 |
 | `df6bb53` | Merge PR #3: `predigy-kalshi-md` (Kalshi WS client) |
 | `c5ed5be` | Merge PR #2: docs + CI workflow |
