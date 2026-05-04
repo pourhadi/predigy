@@ -74,6 +74,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arb-trader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "predigy-book",
+ "predigy-core",
+ "predigy-kalshi-exec",
+ "predigy-kalshi-md",
+ "predigy-kalshi-rest",
+ "predigy-oms",
+ "predigy-risk",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1032,6 +1054,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-sim"
+version = "0.1.0"
+dependencies = [
+ "arb-trader",
+ "md-recorder",
+ "predigy-book",
+ "predigy-core",
+ "predigy-oms",
+ "predigy-risk",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 
