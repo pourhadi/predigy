@@ -17,6 +17,8 @@ members = [
     "bin/arb-trader",
     "bin/sim-runner",
     "bin/cross-arb-trader",
+    "bin/latency-trader",
+    "bin/stat-trader",
 ]
 
 [workspace.package]
