@@ -169,6 +169,15 @@ impl<P: SnapshotProvider + Send + Sync> Recorder<P> {
                 RecordedKind::Reconnected
             }
             Event::Malformed { raw, error } => RecordedKind::Malformed { raw, error },
+            // Authed-channel events shouldn't show up on a public
+            // recorder, but if they do (e.g. an operator points
+            // md-recorder at an authed WS by mistake), drop them
+            // rather than trying to record. UnhandledType from new
+            // schema additions also gets dropped — schema drift is
+            // visible via tracing if it matters.
+            Event::Fill { .. } | Event::MarketPosition { .. } | Event::UnhandledType { .. } => {
+                return Ok(());
+            }
         };
 
         let head = wrap(kind);

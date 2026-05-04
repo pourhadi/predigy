@@ -1027,6 +1027,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "predigy-core",
+ "predigy-kalshi-md",
  "predigy-kalshi-rest",
  "predigy-oms",
  "predigy-risk",
@@ -1068,6 +1069,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

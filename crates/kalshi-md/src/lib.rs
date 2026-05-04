@@ -53,4 +53,4 @@ pub mod messages;
 pub use backoff::Backoff;
 pub use client::{Client, Connection, DEFAULT_ENDPOINT, Event};
 pub use error::Error;
-pub use messages::{Channel, TickerBody, TradeBody};
+pub use messages::{Channel, FillBody, MarketPositionBody, TickerBody, TradeBody};

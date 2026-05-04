@@ -16,6 +16,8 @@
 //! When market-making lands (Phase 4), we'll add a WS-driven variant
 //! behind the same trait.
 
+#![allow(clippy::too_many_lines)]
+
 use crate::error::Error as MapErr;
 use crate::mapping::{fill_to_domain, order_to_create_request};
 use predigy_core::order::{Order, OrderId};
@@ -65,8 +67,9 @@ pub struct RestExecutor {
     rest: Arc<RestClient>,
     report_tx: mpsc::Sender<ExecutionReport>,
     tracked: Arc<Mutex<TrackedOrders>>,
-    /// Aborted on drop so the polling task exits with the OMS shutdown.
-    _poll_guard: Arc<PollGuard>,
+    /// Aborted on drop so background tasks exit with the OMS shutdown.
+    /// Holds 1 task in REST-only mode, 2 in REST+WS mode.
+    _poll_guards: Vec<Arc<PollGuard>>,
 }
 
 impl std::fmt::Debug for RestExecutor {
@@ -93,20 +96,13 @@ impl RestExecutor {
         let rest = Arc::new(rest);
         let (report_tx, report_rx) = mpsc::channel(REPORT_CAPACITY);
         let tracked = Arc::new(Mutex::new(TrackedOrders::default()));
+        let seen_fills = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
-        let initial_min_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .map(|d| {
-                let secs = d.as_secs();
-                let lookback = config.initial_lookback.as_secs();
-                secs.saturating_sub(lookback)
-            })
-            .map_or(0, |v| i64::try_from(v).unwrap_or(0));
-
+        let initial_min_ts = compute_initial_min_ts(config.initial_lookback);
         let poll_task = tokio::spawn(run_poller(
             rest.clone(),
             tracked.clone(),
+            seen_fills,
             report_tx.clone(),
             config.interval,
             initial_min_ts,
@@ -116,10 +112,72 @@ impl RestExecutor {
             rest,
             report_tx,
             tracked,
-            _poll_guard: Arc::new(PollGuard(poll_task)),
+            _poll_guards: vec![Arc::new(PollGuard(poll_task))],
         };
         (executor, report_rx)
     }
+
+    /// Spawn the executor with **WS-pushed fills as the primary
+    /// source** plus a slow REST poller as the catch-up safety net.
+    ///
+    /// Push fills arrive in milliseconds (vs. 250-500ms typical for
+    /// the REST poller's jittered cadence), but the WS connection
+    /// can drop. The REST poller runs at `config.interval` (use a
+    /// generous interval like 5 s here, not 500 ms — its only job
+    /// is to recover fills missed during a WS outage). Both sources
+    /// share a `seen_fills` set so a fill seen on either path
+    /// won't be processed twice.
+    ///
+    /// `ws_client` is consumed; the executor owns the connection
+    /// for its lifetime. On WS reconnect the saved subscription
+    /// (`fill` + `market_position`) is replayed automatically by
+    /// `kalshi-md`.
+    pub fn spawn_with_ws_fills(
+        rest: RestClient,
+        ws_client: predigy_kalshi_md::Client,
+        config: PollerConfig,
+    ) -> (Self, mpsc::Receiver<ExecutionReport>) {
+        let rest = Arc::new(rest);
+        let (report_tx, report_rx) = mpsc::channel(REPORT_CAPACITY);
+        let tracked = Arc::new(Mutex::new(TrackedOrders::default()));
+        let seen_fills = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        let initial_min_ts = compute_initial_min_ts(config.initial_lookback);
+        let poll_task = tokio::spawn(run_poller(
+            rest.clone(),
+            tracked.clone(),
+            seen_fills.clone(),
+            report_tx.clone(),
+            config.interval,
+            initial_min_ts,
+        ));
+        let ws_task = tokio::spawn(run_ws_fill_listener(
+            ws_client,
+            tracked.clone(),
+            seen_fills,
+            report_tx.clone(),
+        ));
+
+        let executor = Self {
+            rest,
+            report_tx,
+            tracked,
+            _poll_guards: vec![Arc::new(PollGuard(poll_task)), Arc::new(PollGuard(ws_task))],
+        };
+        (executor, report_rx)
+    }
+}
+
+fn compute_initial_min_ts(lookback: Duration) -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| {
+            let secs = d.as_secs();
+            let lookback_s = lookback.as_secs();
+            secs.saturating_sub(lookback_s)
+        })
+        .map_or(0, |v| i64::try_from(v).unwrap_or(0))
 }
 
 impl Executor for RestExecutor {
@@ -221,13 +279,13 @@ impl Executor for RestExecutor {
 async fn run_poller(
     rest: Arc<RestClient>,
     tracked: Arc<Mutex<TrackedOrders>>,
+    seen_fills: Arc<Mutex<std::collections::HashSet<String>>>,
     report_tx: mpsc::Sender<ExecutionReport>,
     interval: Duration,
     initial_min_ts: i64,
 ) {
     info!(?interval, initial_min_ts, "kalshi-exec poller starting");
     let mut min_ts = initial_min_ts;
-    let mut seen_fills: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         tokio::time::sleep(jittered(interval)).await;
@@ -242,17 +300,20 @@ async fn run_poller(
                 }
                 // Process newest-first so we can advance min_ts cleanly.
                 let mut max_ts_seen = min_ts;
-                let mut newest_fills: Vec<&FillRecord> = response
-                    .fills
-                    .iter()
-                    .filter(|f| !seen_fills.contains(&f.fill_id))
-                    .collect();
+                let mut newest_fills: Vec<&FillRecord> = {
+                    let seen = seen_fills.lock().unwrap();
+                    response
+                        .fills
+                        .iter()
+                        .filter(|f| !seen.contains(&f.fill_id))
+                        .collect()
+                };
                 // Process in chronological order so cumulative_qty
                 // accumulates monotonically.
                 newest_fills.sort_by_key(|f| f.ts_ms.unwrap_or_else(|| f.ts.unwrap_or(0) * 1000));
 
                 for fill in newest_fills {
-                    seen_fills.insert(fill.fill_id.clone());
+                    seen_fills.lock().unwrap().insert(fill.fill_id.clone());
                     let event_ts = fill.ts_ms.unwrap_or_else(|| fill.ts.unwrap_or(0) * 1000);
                     if event_ts > max_ts_seen {
                         max_ts_seen = event_ts;
@@ -347,6 +408,171 @@ async fn run_poller(
             }
         }
     }
+}
+
+/// WS-based fill listener. Subscribes to the authed `fill` and
+/// `market_position` channels, decodes incoming fills into the same
+/// `ExecutionReport` shape the REST poller emits, and dedupes
+/// against a shared `seen_fills` set so the slow REST catch-up
+/// poller doesn't double-process anything the WS path already saw.
+///
+/// On WS disconnect the underlying `kalshi-md` client backs off and
+/// reconnects, replaying the saved subscription. Fills missed during
+/// the gap are recovered by the slow REST poller (which is why the
+/// WS-fills variant runs *both* sources).
+async fn run_ws_fill_listener(
+    ws_client: predigy_kalshi_md::Client,
+    tracked: Arc<Mutex<TrackedOrders>>,
+    seen_fills: Arc<Mutex<std::collections::HashSet<String>>>,
+    report_tx: mpsc::Sender<ExecutionReport>,
+) {
+    use predigy_kalshi_md::{Channel, Event as MdEvent};
+    info!("kalshi-exec ws fill listener starting");
+    let mut conn = ws_client.connect();
+
+    // Empty market_tickers ⇒ "all markets for this user" on authed
+    // channels. The kalshi-md client knows to omit the wire field
+    // when the slice is empty.
+    if let Err(e) = conn
+        .subscribe(&[Channel::Fill, Channel::MarketPositions], &[])
+        .await
+    {
+        warn!(error = %e, "ws fill subscribe failed; listener exiting (REST poller still running)");
+        return;
+    }
+
+    loop {
+        if report_tx.is_closed() {
+            debug!("report channel closed; ws fill listener exiting");
+            return;
+        }
+        let Some(ev) = conn.next_event().await else {
+            warn!("ws stream ended; listener exiting");
+            return;
+        };
+        match ev {
+            MdEvent::Fill { body, .. } => {
+                if !seen_fills.lock().unwrap().insert(body.trade_id.clone()) {
+                    // Already processed via REST poller.
+                    continue;
+                }
+                let venue_id = body.order_id.clone();
+                let lookup = tracked.lock().unwrap().lookup(&venue_id);
+                let Some((order_side, order_action)) = lookup else {
+                    debug!(venue_id = %venue_id, "ws fill for untracked venue order; skipping");
+                    continue;
+                };
+                let record = ws_fill_to_record(&body);
+                let domain_fill =
+                    match crate::mapping::fill_to_domain(&record, order_side, order_action) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            warn!(?e, trade_id = %body.trade_id, "skipping malformed ws fill");
+                            continue;
+                        }
+                    };
+                let outcome: Option<(OrderId, u32, u32, bool)> = {
+                    let mut t = tracked.lock().unwrap();
+                    t.note_fill(&venue_id, domain_fill.qty.get()).map(|entry| {
+                        let cid = entry.cid.clone();
+                        let cumulative = entry.cumulative;
+                        let target = entry.target;
+                        let terminal = cumulative >= target;
+                        if terminal {
+                            t.terminal(&cid);
+                        }
+                        (cid, cumulative, target, terminal)
+                    })
+                };
+                let Some((cid, cumulative, target, terminal)) = outcome else {
+                    continue;
+                };
+                let kind = if terminal {
+                    ExecutionReportKind::Filled {
+                        fill: domain_fill,
+                        cumulative_qty: cumulative.min(target),
+                    }
+                } else {
+                    ExecutionReportKind::PartiallyFilled {
+                        fill: domain_fill,
+                        cumulative_qty: cumulative,
+                    }
+                };
+                if report_tx
+                    .send(ExecutionReport {
+                        cid,
+                        ts_ms: now_ms(),
+                        kind,
+                    })
+                    .await
+                    .is_err()
+                {
+                    debug!("report channel closed; ws fill listener exiting");
+                    return;
+                }
+            }
+            MdEvent::MarketPosition { body, .. } => {
+                // Reconciliation signal — for now just trace it.
+                // A future PR can route this into the OMS as a
+                // `Reconciled` event.
+                debug!(
+                    market = %body.market_ticker,
+                    position = %body.position_fp,
+                    realized_pnl = %body.realized_pnl_dollars,
+                    fees = %body.fees_paid_dollars,
+                    "ws market_position"
+                );
+            }
+            MdEvent::ServerError { code, msg, .. } => {
+                warn!(code, msg = %msg, "ws fill subscribe rejected; listener exiting");
+                return;
+            }
+            MdEvent::Disconnected { attempt, reason } => {
+                debug!(attempt, reason = %reason, "ws fill listener: disconnected");
+            }
+            MdEvent::Reconnected => {
+                info!("ws fill listener: reconnected; saved subs replayed");
+            }
+            // Public-channel events / sub-acks / unhandled types
+            // are noise here.
+            _ => {}
+        }
+    }
+}
+
+/// Repackage a `kalshi_md::FillBody` into the REST `FillRecord`
+/// shape the existing `mapping::fill_to_domain` consumes. Avoids
+/// duplicating the V2 fill→domain conversion across the two
+/// fill sources.
+fn ws_fill_to_record(b: &predigy_kalshi_md::FillBody) -> FillRecord {
+    FillRecord {
+        fill_id: b.trade_id.clone(),
+        trade_id: Some(b.trade_id.clone()),
+        order_id: b.order_id.clone(),
+        market_ticker: Some(b.market_ticker.clone()),
+        ticker: None,
+        side: b.side.clone(),
+        action: b.action.clone(),
+        count_fp: b.count_fp.clone(),
+        yes_price_dollars: b.yes_price_dollars.clone(),
+        no_price_dollars: b
+            .no_price_dollars
+            .clone()
+            .unwrap_or_else(|| complement_dollars(&b.yes_price_dollars)),
+        is_taker: Some(b.is_taker),
+        fee_cost: b.fee_cost.clone(),
+        ts: b.ts,
+        ts_ms: b.ts_ms,
+    }
+}
+
+/// `"0.0800"` → `"0.9200"`. The WS fill envelope sometimes only
+/// carries one leg of the price pair; we synthesise the other from
+/// the complement so `fill_to_domain` can pick by side.
+fn complement_dollars(yes: &str) -> String {
+    yes.parse::<f64>()
+        .map(|p| format!("{:.4}", 1.0 - p))
+        .unwrap_or_default()
 }
 
 fn jittered(base: Duration) -> Duration {

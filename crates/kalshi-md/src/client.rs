@@ -26,7 +26,8 @@ use crate::backoff::Backoff;
 use crate::decode::{delta_from_wire, snapshot_from_wire};
 use crate::error::Error;
 use crate::messages::{
-    Channel, Incoming, Outgoing, SubscribeParams, TickerBody, TradeBody, UnsubscribeParams,
+    Channel, FillBody, Incoming, MarketPositionBody, Outgoing, SubscribeParams, TickerBody,
+    TradeBody, UnsubscribeParams,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
@@ -137,8 +138,17 @@ impl Connection {
         if channels.is_empty() {
             return Err(Error::Invalid("subscribe: channels is empty".into()));
         }
-        if market_tickers.is_empty() {
-            return Err(Error::Invalid("subscribe: market_tickers is empty".into()));
+        // Authenticated channels (`fill`, `order_state`,
+        // `market_positions`) cover *every* market the account
+        // touches, so an empty market_tickers is the correct
+        // shape — Kalshi treats absent `market_tickers` as
+        // "all markets for this user". For public channels we
+        // still require at least one ticker.
+        let all_authed = channels.iter().all(|c| c.requires_auth());
+        if market_tickers.is_empty() && !all_authed {
+            return Err(Error::Invalid(
+                "subscribe: market_tickers required for public channels".into(),
+            ));
         }
         let req_id = self.next_req_id;
         self.next_req_id += 1;
@@ -215,6 +225,12 @@ pub enum Event {
     Ticker { sid: u64, body: TickerBody },
     /// Public trade.
     Trade { sid: u64, body: TradeBody },
+    /// User fill from the authed `fill` channel. Lower-latency
+    /// equivalent of the REST `/portfolio/fills` poller.
+    Fill { sid: u64, body: FillBody },
+    /// Position update from the authed `market_positions`
+    /// subscription. Reconciliation signal vs the OMS ledger.
+    MarketPosition { sid: u64, body: MarketPositionBody },
     /// Server-side error response (e.g. unknown channel, already subscribed).
     ServerError {
         req_id: Option<u64>,
@@ -232,6 +248,12 @@ pub enum Event {
     /// Frame we couldn't parse against any known schema. Surfaced rather
     /// than silently dropped so schema drift is visible.
     Malformed { raw: String, error: String },
+    /// Wire envelope had a `type` tag we don't model yet (e.g. a new
+    /// channel Kalshi added that we haven't decoded into a typed
+    /// `Event` variant). The raw JSON is surfaced so probes can
+    /// capture and we can extend the schema without dropping
+    /// messages.
+    UnhandledType { raw: String },
 }
 
 // ---------------------------------------------------------------- internals
@@ -477,10 +499,11 @@ fn incoming_to_event(msg: Incoming, raw: &str) -> Option<Event> {
         },
         Incoming::Ticker { sid, msg } => Some(Event::Ticker { sid, body: msg }),
         Incoming::Trade { sid, msg } => Some(Event::Trade { sid, body: msg }),
-        Incoming::Other => {
-            debug!(raw = %raw, "ignored unknown envelope type");
-            None
-        }
+        Incoming::Fill { sid, msg } => Some(Event::Fill { sid, body: msg }),
+        Incoming::MarketPosition { sid, msg } => Some(Event::MarketPosition { sid, body: msg }),
+        Incoming::Other => Some(Event::UnhandledType {
+            raw: raw.to_string(),
+        }),
     }
 }
 
@@ -497,10 +520,13 @@ where
 }
 
 fn build_subscribe(sub: &SavedSub) -> Outgoing {
-    let (single, plural) = if sub.market_tickers.len() == 1 {
-        (Some(sub.market_tickers[0].clone()), None)
-    } else {
-        (None, Some(sub.market_tickers.clone()))
+    // Authenticated subscriptions can omit market_tickers entirely
+    // (Kalshi reads "all markets for this user" from the absence of
+    // the field). Public ones must use one of the two shapes.
+    let (single, plural) = match sub.market_tickers.len() {
+        0 => (None, None),
+        1 => (Some(sub.market_tickers[0].clone()), None),
+        _ => (None, Some(sub.market_tickers.clone())),
     };
     Outgoing::Subscribe {
         id: sub.req_id,

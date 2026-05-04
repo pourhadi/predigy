@@ -13,15 +13,21 @@ use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------- Channels
 
-/// Public market-data channels supported by this crate.
-///
-/// Authenticated channels (`fill`, `user_orders`, `market_positions`, etc.)
-/// are out of scope for Phase 1.
+/// Channels supported by this crate. Authenticated channels (`Fill`,
+/// `OrderState`, `MarketPositions`) require the WS upgrade to have
+/// been signed; the public channels do not.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Channel {
+    // Public.
     OrderbookDelta,
     Ticker,
     Trade,
+    // Authenticated. Carry the user's own fills, order lifecycle, and
+    // position deltas. Used by `WsExecutor` as a push-based
+    // alternative to polling `/portfolio/fills` over REST.
+    Fill,
+    OrderState,
+    MarketPositions,
 }
 
 impl Channel {
@@ -31,7 +37,16 @@ impl Channel {
             Self::OrderbookDelta => "orderbook_delta",
             Self::Ticker => "ticker",
             Self::Trade => "trade",
+            Self::Fill => "fill",
+            Self::OrderState => "order_state",
+            Self::MarketPositions => "market_positions",
         }
+    }
+
+    /// Whether the channel requires an authenticated upgrade.
+    #[must_use]
+    pub const fn requires_auth(self) -> bool {
+        matches!(self, Self::Fill | Self::OrderState | Self::MarketPositions)
     }
 }
 
@@ -123,9 +138,30 @@ pub enum Incoming {
         sid: u64,
         msg: TradeBody,
     },
-    /// Catch-all for envelope `type`s we don't model yet (e.g. `fill`,
-    /// `market_lifecycle_v2`). Surfaces the payload so the caller can log it
-    /// or extend handling without a hard parse failure.
+    /// User-fill event from the authed `fill` channel. Same payload
+    /// shape as `FillRecord` from the REST `/portfolio/fills`
+    /// endpoint, with two extras useful for live processing:
+    /// `post_position_fp` (the user's position in the market AFTER
+    /// this fill, as a venue-authoritative checkpoint) and
+    /// `purchased_side` (the contract side that was added to the
+    /// user's position — `"yes"` if they bought YES or sold NO,
+    /// `"no"` if they bought NO or sold YES).
+    Fill {
+        sid: u64,
+        msg: FillBody,
+    },
+    /// Position-update event from the authed `market_positions`
+    /// subscription (note the wire `type` is singular:
+    /// `market_position`). Carries the venue's authoritative view
+    /// of (position, exposure, realized P&L, fees) for one market.
+    /// Useful as a reconciliation signal vs the OMS's own ledger.
+    #[serde(rename = "market_position")]
+    MarketPosition {
+        sid: u64,
+        msg: MarketPositionBody,
+    },
+    /// Catch-all for envelope `type`s we don't model yet. Surfaces
+    /// via [`Event::UnhandledType`] so schema drift is visible.
     #[serde(other)]
     Other,
 }
@@ -212,6 +248,80 @@ pub struct TradeBody {
     pub no_price_dollars: String,
     pub count_fp: String,
     pub taker_side: Side,
+    #[serde(default)]
+    pub ts_ms: Option<i64>,
+}
+
+/// User-fill payload from the authed `fill` channel.
+///
+/// Mirrors the REST `FillRecord` shape with two extras the WS
+/// channel includes for free:
+/// - `post_position_fp`: the venue's view of the user's position
+///   in this market AFTER this fill, signed (`"1.00"`, `"-3.00"`).
+/// - `purchased_side`: which contract side was added to the user's
+///   position. `"yes"` for (buy YES) or (sell NO at complement);
+///   `"no"` for (buy NO at complement) or (sell YES). Useful as a
+///   sanity check against our cid-based tracking.
+///
+/// Like `FillRecord`, `action` is empty in V2 — the trader's
+/// (Side, Action) must come from the originating order's tracking
+/// entry, not from this wire field.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FillBody {
+    pub trade_id: String,
+    pub order_id: String,
+    /// The cid we sent on submit (`client_order_id`). Used to
+    /// route the fill back to the originating order without going
+    /// through the venue id.
+    pub client_order_id: String,
+    pub market_ticker: String,
+    /// `"yes"` or `"no"` — the venue book side, NOT the trader's
+    /// intended side (those differ for any (No, *) order, which is
+    /// submitted as wire-YES at complement).
+    pub side: String,
+    /// Trader's purchased side. `"yes"` when the trade increased
+    /// (or partially filled an order to increase) the user's YES
+    /// position; `"no"` for NO. Reflects the trader's intent.
+    pub purchased_side: String,
+    /// Empty in V2 — kept for forward compatibility.
+    #[serde(default)]
+    pub action: String,
+    pub yes_price_dollars: String,
+    /// Some V2 envelopes only carry `yes_price_dollars`; the NO
+    /// leg is implicit at the complement.
+    #[serde(default)]
+    pub no_price_dollars: Option<String>,
+    pub count_fp: String,
+    #[serde(default)]
+    pub fee_cost: Option<String>,
+    pub is_taker: bool,
+    /// Venue position after this fill, decimal-string.
+    #[serde(default)]
+    pub post_position_fp: Option<String>,
+    #[serde(default)]
+    pub ts: Option<i64>,
+    #[serde(default)]
+    pub ts_ms: Option<i64>,
+}
+
+/// Position-update payload from the authed `market_positions`
+/// subscription. The venue's authoritative view of one market's
+/// position state. Cumulative across the account's lifetime —
+/// realized P&L and fees are total-since-inception, not deltas.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MarketPositionBody {
+    pub user_id: String,
+    pub market_ticker: String,
+    pub position_fp: String,
+    pub position_cost_dollars: String,
+    pub realized_pnl_dollars: String,
+    pub fees_paid_dollars: String,
+    #[serde(default)]
+    pub position_fee_cost_dollars: Option<String>,
+    #[serde(default)]
+    pub volume_fp: Option<String>,
+    #[serde(default)]
+    pub subaccount: Option<u32>,
     #[serde(default)]
     pub ts_ms: Option<i64>,
 }
