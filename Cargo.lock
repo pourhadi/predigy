@@ -1058,6 +1058,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-sim"
+version = "0.1.0"
+dependencies = [
+ "arb-trader",
+ "md-recorder",
+ "predigy-book",
+ "predigy-core",
+ "predigy-oms",
+ "predigy-risk",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"

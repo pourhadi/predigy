@@ -7,19 +7,21 @@ making with rebate capture.
 
 ## Status
 
-**Phase 2 complete (logic).** Risk gate (`predigy-risk`), OMS state
-machine (`predigy-oms`), Kalshi REST executor (`predigy-kalshi-exec`),
-and the first live strategy (`bin/arb-trader` — static intra-venue
-arb that lifts YES+NO when the touch totals < $1 - fees) are all in
-place. Remaining: live shake-down with real capital, plus
-FIX-flavoured exec when market-making lands later.
+**Phases 1-2 complete (logic). Phase 3 in flight.** Risk gate, OMS
+state machine, Kalshi REST executor, and the intra-venue arb
+strategy (`bin/arb-trader`) are all in place — pending live
+shake-down with real capital. Phase 3 has the backtester runtime
+(`predigy-sim`): an `Executor` impl that matches IOC orders against
+a `BookStore`, plus a `Replay` engine that streams `md-recorder`
+NDJSON through the same OMS path strategies use in production —
+so an `ArbStrategy` runs unchanged in sim and live.
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
 | 1 | Read-only stack (REST + WS + book + recorder) | ✅ (logic) |
 | 2 | OMS + risk + FIX exec + first live strategy | ✅ (logic — `risk` + `oms` + `kalshi-exec` (REST) + `arb-trader` done; FIX flavour deferred to MM) |
-| 3 | Backtester / sim | ⬜ |
+| 3 | Backtester / sim | 🟡 in progress (`sim`: BookStore + IOC SimExecutor + NDJSON Replay + arb integration done) |
 | 4 | Market making (deferred until $25k account) | ⬜ |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ |
 | 6 | News/data latency (free feeds first) | ⬜ |
@@ -62,6 +64,11 @@ crates/
                 Maps Yes/No intents to bid/ask-at-complement, posts
                 /portfolio/events/orders, deletes for cancels, polls
                 /portfolio/fills into PartiallyFilled/Filled reports.
+  sim/          Backtester runtime. BookStore + IOC SimExecutor
+                (Executor impl that matches against the touch and
+                consumes liquidity via synthetic deltas) + Replay
+                (md-recorder NDJSON → BookStore → strategy callback).
+                Strategies run unchanged in sim and live.
 bin/
   md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
                 market list, writes one event per line, on Gap fetches a

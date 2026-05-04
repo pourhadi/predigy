@@ -23,7 +23,7 @@
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
 | 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
 | 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ✅ Done (logic): `risk` + `oms` + `kalshi-exec` (REST) + `arb-trader`. Live shake-down with real capital is the open item. FIX-flavoured exec deferred to MM phase. |
-| 3 | Backtester + sim | ⬜ Not started |
+| 3 | Backtester + sim | 🟡 In progress (`predigy-sim`: BookStore + IOC SimExecutor + NDJSON Replay + arb-strategy integration test done; queue-position model for resting/maker orders pending) |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ Not started |
 | 6 | News/data latency (free feeds first) | ⬜ Not started |
@@ -160,33 +160,68 @@ predigy/
 │   │                                  kill switch blocks/unblocks; reconcile
 │   │                                  flags mismatches; executor failure
 │   │                                  doesn't book a phantom order.
-│   └── kalshi-exec/                   ✅ Phase 2 part 3 (REST flavour)
+│   ├── kalshi-exec/                   ✅ Phase 2 part 3 (REST flavour)
+│   │   ├── src/
+│   │   │   ├── lib.rs                 module roots + re-exports + quick-start
+│   │   │   ├── error.rs               Error enum (Rest, Unsupported, Decode)
+│   │   │   ├── mapping.rs             Order → Kalshi V2 CreateOrderRequest:
+│   │   │   │                          (Yes, Buy)→bid, (Yes, Sell)→ask,
+│   │   │   │                          (No, Buy)→ask at complement,
+│   │   │   │                          (No, Sell)→bid at complement.
+│   │   │   │                          PostOnly→GTC + post_only=true.
+│   │   │   │                          FillRecord → predigy_core::Fill.
+│   │   │   └── executor.rs            RestExecutor implements oms::Executor.
+│   │   │                              submit() POSTs and synthesises
+│   │   │                              Acked / Rejected; cancel() DELETEs and
+│   │   │                              synthesises Cancelled. Background task
+│   │   │                              polls /portfolio/fills (jittered
+│   │   │                              ±10%) and maps each new fill into an
+│   │   │                              ExecutionReport (PartiallyFilled /
+│   │   │                              Filled when cumulative reaches target).
+│   │   │                              Aborted on drop.
+│   │   └── tests/
+│   │       ├── http_mock.rs           hand-rolled HTTP/1.1 mock server;
+│   │       │                          one request per connection,
+│   │       │                          mutable route table.
+│   │       └── oms_integration.rs     end-to-end: submit→Acked→polled fill
+│   │                                  drives Filled+PositionUpdated;
+│   │                                  cancel emits Cancelled; submit
+│   │                                  failure (4xx) leaves zero state.
+│   └── sim/                           ✅ Phase 3 part 1
 │       ├── src/
-│       │   ├── lib.rs                 module roots + re-exports + quick-start
-│       │   ├── error.rs               Error enum (Rest, Unsupported, Decode)
-│       │   ├── mapping.rs             Order → Kalshi V2 CreateOrderRequest:
-│       │   │                          (Yes, Buy)→bid, (Yes, Sell)→ask,
-│       │   │                          (No, Buy)→ask at complement,
-│       │   │                          (No, Sell)→bid at complement.
-│       │   │                          PostOnly→GTC + post_only=true.
-│       │   │                          FillRecord → predigy_core::Fill.
-│       │   └── executor.rs            RestExecutor implements oms::Executor.
-│       │                              submit() POSTs and synthesises
-│       │                              Acked / Rejected; cancel() DELETEs and
-│       │                              synthesises Cancelled. Background task
-│       │                              polls /portfolio/fills (jittered
-│       │                              ±10%) and maps each new fill into an
-│       │                              ExecutionReport (PartiallyFilled /
-│       │                              Filled when cumulative reaches target).
-│       │                              Aborted on drop.
+│       │   ├── lib.rs                 module roots + re-exports
+│       │   ├── book_store.rs          BookStore — Arc<Mutex<HashMap<MarketTicker,
+│       │   │                          OrderBook>>> shared between Replay and
+│       │   │                          SimExecutor; with_book / with_book_mut
+│       │   │                          callbacks scope the lock tightly so the
+│       │   │                          (non-Send) MutexGuard never crosses an
+│       │   │                          await.
+│       │   ├── matching.rs            Pure match_ioc: walks the touch only,
+│       │   │                          mutates the book via a synthetic Delta,
+│       │   │                          handles Buy YES + Buy NO (with
+│       │   │                          NO-at-complement mapping).
+│       │   │                          Sells flagged Unsupported (strategies
+│       │   │                          should express exits as buy-of-opposite).
+│       │   ├── executor.rs            SimExecutor implements oms::Executor.
+│       │   │                          IOC only for v1; emits Acked then
+│       │   │                          Filled / PartiallyFilled+Cancelled
+│       │   │                          (or Cancelled with "no liquidity" if
+│       │   │                          the limit doesn't cross). GTC and FOK
+│       │   │                          rejected with Unsupported. Aborted on drop.
+│       │   └── replay.rs              Replay: streams md-recorder NDJSON
+│       │                              line-by-line through the BookStore,
+│       │                              calling an async on_update callback
+│       │                              after each event so the strategy can
+│       │                              run inline. Surfaces sequence gaps as
+│       │                              ReplayUpdate::Gap; rejects unknown
+│       │                              schema versions.
 │       └── tests/
-│           ├── http_mock.rs           hand-rolled HTTP/1.1 mock server;
-│           │                          one request per connection,
-│           │                          mutable route table.
-│           └── oms_integration.rs     end-to-end: submit→Acked→polled fill
-│                                      drives Filled+PositionUpdated;
-│                                      cancel emits Cancelled; submit
-│                                      failure (4xx) leaves zero state.
+│           └── arb_replay.rs          end-to-end: build a 2-snapshot NDJSON
+│                                      payload (no-arb, then arb-fires),
+│                                      drive ArbStrategy via Replay through
+│                                      a real OMS+SimExecutor, assert YES
+│                                      and NO position updates and book
+│                                      consumption (75 left at each touch).
 └── bin/
     ├── md-recorder/                   ✅ Phase 1 part 4
     │   ├── src/
@@ -275,8 +310,22 @@ arb-trader          8 tests   (strategy: balanced market → no arb;
                                 marginal opportunity blocked by fees;
                                 empty book side → no arb;
                                 reset_cooldown clears throttle)
+predigy-sim        20 tests   (19 unit: BookStore lazy-create + missing-
+                                market; matching: 7 cases (touch fill,
+                                limit-too-low, partial, NO leg,
+                                empty-side, sell-unsupported, second-match-
+                                sees-consumption); SimExecutor: 6 cases
+                                (filled, no-liquidity-cancelled,
+                                partial+remainder-cancelled, unknown-market
+                                rejected, non-IOC rejected, unknown-cid
+                                cancel); Replay: snapshot-then-delta order,
+                                gap surfaced, unsupported-schema rejected,
+                                schema-version-constant matches recorder;
+                                + 1 integration: ArbStrategy through
+                                Replay+OMS+SimExecutor with YES+NO position
+                                + book-consumption assertions)
                    ─────────
-                  145 tests   (+ 4 doctests)
+                  165 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
@@ -352,31 +401,32 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Next chunk to build
 
-Phase 2 logic is complete. Remaining items before declaring Phase 2
-"done in production":
+Phase 3 in flight. Sim runtime + matching + replay + arb integration
+test landed. Still open:
 
-1. **Live shake-down of `arb-trader`** with a real Kalshi key and a
-   small capital cap (per the plan: $500). Verify OMS reconciles to
-   $0.00, no orphan orders, positive-or-flat PnL after fees over a
-   one-week window.
-2. **Live shake-down of `md-recorder`** against the production
-   endpoints (Phase 1's open item — same blocker, same shake-down).
-3. **Phase-2 hardening** (do these after a clean week of live trading
-   so the priorities are informed by what actually breaks):
-   - Durable cid sequence storage so cids never repeat across restarts.
-   - Mass-cancel wiring on kill-switch arm. REST batch-cancel exists
-     today; the FIX `OrderMassCancelRequest` (35=q) lands with the
-     FIX exec.
-   - Persistent OMS state (`sqlx`/Postgres) per the plan.
-   - Order amend (`OrderCancelReplaceRequest`).
-4. **`crates/kalshi-fix`** (or `kalshi-exec` with a FIX feature flag)
-   — FIX 4.4 variant of the `oms::Executor`. Required before the
-   Phase 4 market-making strategy where fill latency matters.
-   `arb-trader` does not need it.
+1. **Queue-position model for resting orders.** The current sim
+   handles IOC takers only; GTC / `PostOnly` makers sit in a queue
+   and fill iff cumulative trade volume past their seq number exceeds
+   their queue-ahead. Lands when a maker strategy needs it (Phase 4
+   MM) — earliest. `arb-trader` doesn't exercise it.
+2. **Realistic-cadence replay.** Today the simulator walks the file
+   as fast as the disk. A `--respect-timestamps` mode that sleeps
+   between events so latency-sensitive sims see the right
+   inter-arrival distribution.
+3. **Backtest binary** (`bin/sim-runner` or similar). Today the sim
+   is exercised via `cargo test`; a CLI that loads a strategy +
+   NDJSON file + risk limits and prints PnL summary statistics is a
+   small follow-up.
 
-After that, Phase 3: `crates/sim` — event-driven replay of recorded
-parquet, naïve queue-position model. Strategies must run unchanged
-in sim and live (same `Strategy` interface, same `Intent` outputs).
+Pending Phase 2 items remain valid:
+
+- Live shake-down of `arb-trader` with a real Kalshi key and a
+  $500 cap.
+- Live shake-down of `md-recorder` against production endpoints.
+- Phase-2 hardening (durable cid storage, mass-cancel-on-kill,
+  persistent OMS state, order amend).
+- `predigy-kalshi-fix` — FIX 4.4 executor for the eventual MM
+  strategy.
 
 ## Build / run
 
@@ -396,7 +446,9 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
-| _pending_ | Add `bin/arb-trader` (intra-venue arb, first live strategy) — Phase 2, part 4 |
+| _pending_ | Add `predigy-sim` (backtester runtime) — Phase 3, part 1 |
+| `7bf53fd` | Merge PR #10: `bin/arb-trader` (intra-venue arb, first live strategy) — Phase 2, part 4 |
+| `b1e1370` | Merge PR #9: promote `oms` + `kalshi-exec` stack to main |
 | `b931435` | Merge PR #8: `predigy-kalshi-exec` (REST executor) — Phase 2, part 3 |
 | `07a48d7` | Merge PR #7: `predigy-oms` (order management state machine) — Phase 2, part 2 |
 | `1c1e848` | Merge PR #6: `predigy-risk` (pre-trade limits + breakers) — Phase 2, part 1 |
