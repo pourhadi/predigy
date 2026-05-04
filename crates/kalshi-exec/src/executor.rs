@@ -19,6 +19,7 @@
 use crate::error::Error as MapErr;
 use crate::mapping::{fill_to_domain, order_to_create_request};
 use predigy_core::order::{Order, OrderId};
+use predigy_core::side::{Action, Side};
 use predigy_kalshi_rest::Client as RestClient;
 use predigy_kalshi_rest::types::FillRecord;
 use predigy_oms::{ExecutionReport, ExecutionReportKind, Executor, ExecutorError};
@@ -150,6 +151,8 @@ impl Executor for RestExecutor {
                         order.client_id.clone(),
                         response.order_id.clone(),
                         order.qty.get(),
+                        order.side,
+                        order.action,
                     );
                     let _ = report_tx
                         .send(ExecutionReport {
@@ -254,24 +257,40 @@ async fn run_poller(
                     if event_ts > max_ts_seen {
                         max_ts_seen = event_ts;
                     }
-                    let domain_fill = match fill_to_domain(fill) {
+                    // Look up the originating order's tracked side+action
+                    // FIRST. Kalshi V2 fill records have an empty `action`
+                    // field and the wire `side` is the venue's book side
+                    // (post-mapping), not the trader's intended side.
+                    // We resolve both from the tracking table so the
+                    // domain fill always reflects what the strategy
+                    // submitted.
+                    //
+                    // Lock-and-extract in a small scope so the (non-Send)
+                    // MutexGuard never crosses the await below. The OMS
+                    // would warn-log fills for venue ids it doesn't know
+                    // about; we drop them silently here so untracked
+                    // orders from other processes on the same account
+                    // don't pollute the stream.
+                    let lookup = {
+                        let t = tracked.lock().unwrap();
+                        t.lookup(&fill.order_id)
+                    };
+                    let Some((order_side, order_action)) = lookup else {
+                        debug!(venue_id = %fill.order_id, "fill for untracked venue order; skipping");
+                        continue;
+                    };
+                    let domain_fill = match fill_to_domain(fill, order_side, order_action) {
                         Ok(f) => f,
                         Err(e) => {
                             warn!(?e, fill_id = %fill.fill_id, "skipping malformed fill");
                             continue;
                         }
                     };
-                    // Lock-and-extract in a small scope so the
-                    // (non-Send) MutexGuard never crosses the await
-                    // below. The OMS would warn-log fills for venue
-                    // ids it doesn't know about; we drop them silently
-                    // here so untracked orders from other processes on
-                    // the same account don't pollute the stream.
                     let outcome: Option<(OrderId, u32, u32, bool)> = {
                         let mut t = tracked.lock().unwrap();
                         match t.note_fill(&fill.order_id, domain_fill.qty.get()) {
                             None => {
-                                debug!(venue_id = %fill.order_id, "fill for untracked venue order; skipping");
+                                debug!(venue_id = %fill.order_id, "fill for untracked venue order; skipping (vanished between lookup and note_fill)");
                                 None
                             }
                             Some(entry) => {
@@ -364,10 +383,26 @@ struct Tracked {
     venue_id: String,
     target: u32,
     cumulative: u32,
+    /// Order's domain side. Used to resolve fills, since Kalshi V2's
+    /// fill records have an empty `action` field and the wire `side`
+    /// is the venue book side (always YES post-mapping), not the
+    /// trader's intended side. Without this we can't distinguish a
+    /// (No, Buy) — submitted as wire-YES at complement — from a
+    /// (Yes, Buy) on its fill report.
+    side: Side,
+    /// Order's domain action (Buy/Sell). Same reason as `side`.
+    action: Action,
 }
 
 impl TrackedOrders {
-    fn on_submit(&mut self, cid: OrderId, venue_id: String, target: u32) {
+    fn on_submit(
+        &mut self,
+        cid: OrderId,
+        venue_id: String,
+        target: u32,
+        side: Side,
+        action: Action,
+    ) {
         self.by_cid.insert(
             cid.clone(),
             Tracked {
@@ -375,6 +410,8 @@ impl TrackedOrders {
                 venue_id: venue_id.clone(),
                 target,
                 cumulative: 0,
+                side,
+                action,
             },
         );
         self.venue_to_cid.insert(venue_id, cid);
@@ -382,6 +419,17 @@ impl TrackedOrders {
 
     fn venue_id_for(&self, cid: &OrderId) -> Option<String> {
         self.by_cid.get(cid).map(|t| t.venue_id.clone())
+    }
+
+    /// Resolve a venue order id to the tracked order's domain
+    /// `(side, action)`. Used by the fills-poller to interpret a
+    /// fill record without relying on Kalshi V2's empty `action`
+    /// field. Returns `None` if the venue id is not tracked here
+    /// (a fill from another process, or a stale order).
+    fn lookup(&self, venue_id: &str) -> Option<(Side, Action)> {
+        let cid = self.venue_to_cid.get(venue_id)?;
+        let t = self.by_cid.get(cid)?;
+        Some((t.side, t.action))
     }
 
     fn on_cancel(&mut self, cid: &OrderId) {
@@ -419,8 +467,10 @@ mod tests {
     #[test]
     fn tracking_round_trip() {
         let mut t = TrackedOrders::default();
-        t.on_submit(cid("c1"), "v1".into(), 100);
+        t.on_submit(cid("c1"), "v1".into(), 100, Side::Yes, Action::Buy);
         assert_eq!(t.venue_id_for(&cid("c1")), Some("v1".into()));
+        assert_eq!(t.lookup("v1"), Some((Side::Yes, Action::Buy)));
+        assert_eq!(t.lookup("unknown"), None);
 
         let r = t.note_fill("v1", 30).unwrap();
         assert_eq!(r.cumulative, 30);
@@ -430,6 +480,7 @@ mod tests {
 
         t.on_cancel(&cid("c1"));
         assert!(t.venue_id_for(&cid("c1")).is_none());
+        assert_eq!(t.lookup("v1"), None);
     }
 
     #[test]
