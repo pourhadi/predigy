@@ -64,35 +64,11 @@ Live read-only smoke test (needs a network with public CA roots):
 cargo run -p predigy-kalshi-rest --example smoke
 ```
 
-## CI workflow (manual setup needed)
+## CI
 
-The git proxy in the dev environment lacks `workflows` permission scope, so
-`.github/workflows/ci.yml` is not committed. Add via the GitHub UI:
-
-```yaml
-name: ci
-on:
-  push:
-    branches: [main, "claude/**"]
-  pull_request:
-    branches: [main]
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
-jobs:
-  check:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy
-          rustup default stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
-```
+GitHub Actions runs `fmt --check`, `clippy -D warnings`, and
+`test --locked` on every push to `main` / `claude/**` and every PR against
+`main`. Workflow lives at [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
 ## Confirmed Kalshi fee schedule (Feb 2026)
 

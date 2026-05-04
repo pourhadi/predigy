@@ -38,6 +38,7 @@ predigy/
 ├── rust-toolchain.toml                pins stable, components: rustfmt, clippy
 ├── .gitignore                         ignores target/, secrets, .env
 ├── README.md                          quick start + status
+├── .github/workflows/ci.yml           fmt + clippy + test on push/PR
 ├── docs/
 │   ├── PLAN.md                        full architecture / strategy / infra plan
 │   └── STATUS.md                      this file
@@ -79,7 +80,8 @@ predigy-kalshi-rest 6 tests   (auth round-trip, PSS non-determinism, bad PEM,
                    27 tests
 ```
 
-CI gates (all currently passing locally):
+CI gates (run by `.github/workflows/ci.yml` on push to `main` /
+`claude/**` and on every PR against `main`):
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
   (clippy::pedantic with sensible allows: `module_name_repetitions`,
@@ -120,10 +122,6 @@ CI gates (all currently passing locally):
 
 ## Known limitations / open items
 
-- **CI workflow**: `.github/workflows/ci.yml` is **not committed** because
-  the dev environment's git proxy and GitHub MCP both lack `workflows`
-  permission scope. Add manually via the GitHub UI; canonical content is in
-  the second commit message and reproduced in the README.
 - **TLS in this sandbox**: outbound TLS to `api.elections.kalshi.com` failed
   with `InvalidCertificate(UnknownIssuer)` — the sandbox proxy doesn't trust
   Kalshi's CA. The code uses `rustls-tls` with `webpki-roots` and works on
