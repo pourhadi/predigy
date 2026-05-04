@@ -83,7 +83,7 @@ async fn submit_ack_fill_updates_position() {
     let mut oms = Oms::spawn(
         OmsConfig {
             strategy_id: "arb".into(),
-            start_cid_seq: 0,
+            cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
         },
         RiskEngine::new(permissive_limits()),
         executor.clone(),
@@ -377,6 +377,71 @@ async fn kill_switch_blocks_new_submits() {
         .await
         .expect("ok after disarm");
     assert!(!cid.as_str().is_empty());
+    oms.close().await;
+}
+
+#[tokio::test]
+async fn arm_kill_switch_cancels_live_orders() {
+    use predigy_oms::StubCall;
+
+    let (executor, report_tx, report_rx) = stub_channel(64);
+    let mut oms = Oms::spawn(
+        OmsConfig::default(),
+        RiskEngine::new(permissive_limits()),
+        executor.clone(),
+        report_rx,
+    );
+
+    // Submit two orders and have the venue ack them so the OMS knows
+    // about live working orders.
+    let cid_a = oms.submit(buy_yes("X", 40, 10)).await.unwrap();
+    let cid_b = oms.submit(buy_yes("X", 41, 10)).await.unwrap();
+    let _ = next_event(&mut oms).await; // Submitted A
+    let _ = next_event(&mut oms).await; // Submitted B
+    report_tx
+        .send(ExecutionReport {
+            cid: cid_a.clone(),
+            ts_ms: 1,
+            kind: ExecutionReportKind::Acked {
+                venue_order_id: "V-A".into(),
+            },
+        })
+        .await
+        .unwrap();
+    report_tx
+        .send(ExecutionReport {
+            cid: cid_b.clone(),
+            ts_ms: 2,
+            kind: ExecutionReportKind::Acked {
+                venue_order_id: "V-B".into(),
+            },
+        })
+        .await
+        .unwrap();
+    let _ = next_event(&mut oms).await;
+    let _ = next_event(&mut oms).await;
+
+    // Arm the kill switch — should issue cancels for both live orders
+    // before emitting KillSwitchArmed.
+    oms.arm_kill_switch().await.unwrap();
+    match next_event(&mut oms).await {
+        OmsEvent::KillSwitchArmed => {}
+        other => panic!("expected KillSwitchArmed, got {other:?}"),
+    }
+
+    // Stub recorded two Cancel calls — order is map-iteration so we
+    // assert as a set.
+    let cancelled: std::collections::HashSet<_> = executor
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            StubCall::Cancel(cid) => Some(cid),
+            StubCall::Submit(_) => None,
+        })
+        .collect();
+    assert_eq!(cancelled.len(), 2);
+    assert!(cancelled.contains(&cid_a));
+    assert!(cancelled.contains(&cid_b));
     oms.close().await;
 }
 

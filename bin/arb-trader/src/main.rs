@@ -23,7 +23,7 @@ use predigy_core::market::MarketTicker;
 use predigy_kalshi_exec::{PollerConfig, RestExecutor};
 use predigy_kalshi_md::Client as MdClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
-use predigy_oms::{Oms, OmsConfig};
+use predigy_oms::{CidBacking, Oms, OmsConfig};
 use predigy_risk::{AccountLimits, Limits, PerMarketLimits, RateLimits, RiskEngine};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -110,6 +110,18 @@ struct Args {
     /// shaking down the wiring against live data.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// Path to a file the OMS uses to persist cid sequence numbers
+    /// across restarts. Strongly recommended for production runs —
+    /// without it, cids restart from 0 on each run and the venue
+    /// will reject duplicates from a prior session.
+    #[arg(long)]
+    cid_store: Option<PathBuf>,
+
+    /// How many cids to pre-allocate per persistence write. Higher
+    /// = fewer fsyncs at the cost of more wasted ids on a crash.
+    #[arg(long, default_value_t = 1_000)]
+    cid_chunk_size: u64,
 }
 
 #[tokio::main]
@@ -164,15 +176,28 @@ async fn main() -> Result<()> {
         },
     );
 
-    let oms = Oms::spawn(
+    let cid_backing = if let Some(path) = &args.cid_store {
+        CidBacking::Persistent {
+            store_path: path.clone(),
+            chunk_size: args.cid_chunk_size,
+        }
+    } else {
+        tracing::warn!(
+            "no --cid-store; cids will restart from 0 each run. Use --cid-store \
+             in production to avoid venue duplicate-id rejects across restarts."
+        );
+        CidBacking::InMemory { start_seq: 0 }
+    };
+    let oms = Oms::try_spawn(
         OmsConfig {
             strategy_id: args.strategy_id.clone(),
-            start_cid_seq: 0,
+            cid_backing,
         },
         RiskEngine::new(limits),
         executor,
         reports,
-    );
+    )
+    .map_err(|e| anyhow!("oms init: {e}"))?;
 
     let runner_config = RunnerConfig {
         markets: args.markets.iter().map(MarketTicker::new).collect(),

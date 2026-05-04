@@ -35,9 +35,11 @@
 pub mod book_store;
 pub mod executor;
 pub mod matching;
+pub mod queue;
 pub mod replay;
 
 pub use book_store::BookStore;
 pub use executor::SimExecutor;
 pub use matching::{Match, match_ioc};
+pub use queue::{QueueAdvance, RestingOrder, TradePulse, apply_trade, synth_fill};
 pub use replay::{Replay, ReplayError, ReplayUpdate};

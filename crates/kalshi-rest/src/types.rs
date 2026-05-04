@@ -165,6 +165,42 @@ pub struct CancelOrderResponse {
     pub reduced_by: Option<String>,
 }
 
+/// Body posted to `DELETE /portfolio/events/orders/batched`. Each
+/// element in `orders` names one venue order id to cancel. Kalshi
+/// processes the batch atomically per-order — partial success is
+/// expected and surfaced via per-element `error` in the response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchCancelOrdersRequest {
+    pub orders: Vec<BatchCancelOrderEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchCancelOrderEntry {
+    pub order_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subaccount: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchCancelOrdersResponse {
+    #[serde(default)]
+    pub orders: Vec<BatchCancelOrderResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchCancelOrderResult {
+    pub order_id: String,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
+    #[serde(default)]
+    pub reduced_by: Option<String>,
+    /// Per-order error if Kalshi couldn't cancel this specific id (e.g.
+    /// 404 Not Found, already filled). Surfaced verbatim so callers can
+    /// distinguish recoverable vs fatal cases.
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+}
+
 // -------------------------------------------------------------- Fills
 
 #[derive(Debug, Clone, Deserialize)]

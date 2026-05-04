@@ -268,6 +268,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cross-arb-trader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "predigy-book",
+ "predigy-core",
+ "predigy-kalshi-exec",
+ "predigy-kalshi-md",
+ "predigy-kalshi-rest",
+ "predigy-oms",
+ "predigy-poly-md",
+ "predigy-risk",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -982,6 +1004,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-kalshi-fix"
+version = "0.1.0"
+dependencies = [
+ "predigy-core",
+ "predigy-oms",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "predigy-kalshi-md"
 version = "0.1.0"
 dependencies = [
@@ -1465,6 +1499,26 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "sim-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arb-trader",
+ "clap",
+ "md-recorder",
+ "predigy-book",
+ "predigy-core",
+ "predigy-oms",
+ "predigy-risk",
+ "predigy-sim",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

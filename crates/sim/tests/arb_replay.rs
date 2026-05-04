@@ -96,7 +96,7 @@ fn build_pipeline() -> (
     let oms = Oms::spawn(
         OmsConfig {
             strategy_id: "arb".into(),
-            start_cid_seq: 0,
+            cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
         },
         RiskEngine::new(permissive_limits()),
         executor,

@@ -26,7 +26,8 @@
 //! Deferred (Phase 2 follow-ups):
 //! - Durable cid sequence storage so cids never repeat across
 //!   restarts. Today the binary supplies a starting seq via
-//!   [`OmsConfig::start_cid_seq`].
+//!   [`OmsConfig::cid_backing`] (use `CidBacking::Persistent` for
+//!   production).
 //! - Mass-cancel wiring on kill-switch arm. Requires the FIX exec.
 //! - Persistent OMS state (`sqlx`/Postgres) per the plan. Today the
 //!   ledger is in-memory.
@@ -39,10 +40,11 @@ pub mod record;
 pub mod runtime;
 
 pub use cid::CidAllocator;
+pub use cid::{CidError, CidStore};
 pub use executor::{
     ExecutionReport, ExecutionReportKind, Executor, ExecutorError,
     stub::{StubCall, StubExecutor, channel as stub_channel},
 };
 pub use position_math::{PositionUpdate, apply_fill};
 pub use record::OrderRecord;
-pub use runtime::{Oms, OmsConfig, OmsError, OmsEvent, OmsHandle, PositionMismatch};
+pub use runtime::{CidBacking, Oms, OmsConfig, OmsError, OmsEvent, OmsHandle, PositionMismatch};
