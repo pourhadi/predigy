@@ -7,22 +7,18 @@ making with rebate capture.
 
 ## Status
 
-**Phase 2 in progress.** Phase 1 complete in code (live shake-down
-on a real Kalshi key still open). Phase 2 has the risk gate
-(`predigy-risk`), the order management state machine (`predigy-oms`
-— single-task runtime, Executor trait, deterministic cids, VWAP +
-realised-P&L bookkeeping, kill switch, reconcile), and the REST
-flavour of the Kalshi executor (`predigy-kalshi-exec` — submits
-and cancels through the V2 endpoints, polls fills into
-ExecutionReports). Coming next: `arb-trader` (first live strategy:
-static intra-venue arb), then the FIX-flavoured executor for
-latency-sensitive strategies later.
+**Phase 2 complete (logic).** Risk gate (`predigy-risk`), OMS state
+machine (`predigy-oms`), Kalshi REST executor (`predigy-kalshi-exec`),
+and the first live strategy (`bin/arb-trader` — static intra-venue
+arb that lifts YES+NO when the touch totals < $1 - fees) are all in
+place. Remaining: live shake-down with real capital, plus
+FIX-flavoured exec when market-making lands later.
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
 | 1 | Read-only stack (REST + WS + book + recorder) | ✅ (logic) |
-| 2 | OMS + risk + FIX exec + first live strategy | 🟡 in progress (`risk` + `oms` + `kalshi-exec` (REST) done) |
+| 2 | OMS + risk + FIX exec + first live strategy | ✅ (logic — `risk` + `oms` + `kalshi-exec` (REST) + `arb-trader` done; FIX flavour deferred to MM) |
 | 3 | Backtester / sim | ⬜ |
 | 4 | Market making (deferred until $25k account) | ⬜ |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ |
@@ -72,11 +68,16 @@ bin/
                 fresh REST snapshot via predigy-kalshi-rest and emits a
                 synthetic RestResync line so replay reconstructs identical
                 book state.
+  arb-trader/   First live strategy: static intra-venue arb. When
+                yes_ask + no_ask < $1 minus taker fees, lifts both legs
+                via IOC orders. Per-market cooldown + size-cap-at-touch;
+                full risk-engine + OMS path; --dry-run for shake-downs.
 ```
 
-Crates that will be added in subsequent phases: `kalshi-exec`,
-`ext-feeds`, `strategy`, `signals`, `sim`, `store`, `ops`,
-plus binaries `arb-trader`, `mm-trader`, `latency-trader`, `stat-trader`.
+Crates that will be added in subsequent phases: `ext-feeds`,
+`strategy`, `signals`, `sim`, `store`, `ops`, plus binaries
+`mm-trader`, `latency-trader`, `stat-trader`, and a FIX flavour of
+`kalshi-exec`.
 
 ## Build
 
