@@ -41,6 +41,27 @@ pub struct MarketsResponse {
     pub cursor: Option<String>,
 }
 
+/// `GET /series?category=...` response. The `series` field can be
+/// `null` (not just empty) when the category matches nothing —
+/// `serde(default)` handles both.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SeriesListResponse {
+    #[serde(default)]
+    pub series: Vec<SeriesSummary>,
+}
+
+/// One series row. Kalshi exposes more fields than these (frequency,
+/// settlement source, contract URL, etc.); we keep only what the
+/// scanner needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SeriesSummary {
+    pub ticker: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketSummary {
     pub ticker: String,
