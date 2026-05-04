@@ -204,14 +204,16 @@ impl Client {
         let resp: OrderbookResponse = self
             .get_json(&format!("/markets/{ticker}/orderbook"), &[])
             .await?;
-        let convert = |levels: Vec<[f64; 2]>| -> Vec<(Price, u32)> {
+        let convert = |levels: Vec<[String; 2]>| -> Vec<(Price, u32)> {
             levels
                 .into_iter()
-                .filter_map(|[px_dollars, qty]| {
+                .filter_map(|[px_str, qty_str]| {
+                    let px_dollars: f64 = px_str.parse().ok()?;
                     let cents_i = (px_dollars * 100.0).round() as i32;
                     let cents_u8 = u8::try_from(cents_i).ok()?;
                     let price = Price::from_cents(cents_u8).ok()?;
-                    let q = qty.round() as i64;
+                    let qty_dollars: f64 = qty_str.parse().ok()?;
+                    let q = qty_dollars.round() as i64;
                     if q <= 0 {
                         return None;
                     }
@@ -221,8 +223,8 @@ impl Client {
         };
         Ok(Snapshot {
             seq: 0,
-            yes_bids: convert(resp.orderbook.yes),
-            no_bids: convert(resp.orderbook.no),
+            yes_bids: convert(resp.orderbook_fp.yes_dollars),
+            no_bids: convert(resp.orderbook_fp.no_dollars),
         })
     }
 

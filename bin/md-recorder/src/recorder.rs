@@ -186,6 +186,13 @@ impl<P: SnapshotProvider + Send + Sync> Recorder<P> {
     /// Fetch a fresh snapshot, apply it to the in-memory book, and return
     /// the `RecordedKind::RestResync` value the caller should write to
     /// the NDJSON file.
+    ///
+    /// Uses [`OrderBook::apply_rest_snapshot`] (not `apply_snapshot`) so
+    /// `last_seq` is left as `None` — the next WS delta becomes the new
+    /// baseline regardless of its seq number. Critical: REST has no seq,
+    /// so blindly setting `last_seq = 0` from `Snapshot::seq` would make
+    /// every subsequent WS delta look like a gap and trigger another
+    /// resync on every event.
     async fn resync(&mut self, market: &str, reason: String) -> Result<RecordedKind> {
         let snapshot = self
             .snapshot_provider
@@ -196,7 +203,7 @@ impl<P: SnapshotProvider + Send + Sync> Recorder<P> {
             .books
             .entry(market.to_string())
             .or_insert_with(|| OrderBook::new(market.to_string()));
-        book.apply_snapshot(snapshot.clone());
+        book.apply_rest_snapshot(snapshot.clone());
         Ok(RecordedKind::RestResync {
             market: market.to_string(),
             reason,

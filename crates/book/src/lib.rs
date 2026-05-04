@@ -107,6 +107,26 @@ impl OrderBook {
         self.last_seq = Some(snap.seq);
     }
 
+    /// Replace the entire book with a REST-derived snapshot. Differs
+    /// from [`apply_snapshot`] only in that `last_seq` is reset to
+    /// `None`, so the next [`apply_delta`] is accepted as the new
+    /// baseline regardless of its sequence number.
+    ///
+    /// Kalshi's REST `/markets/{ticker}/orderbook` endpoint does not
+    /// return a sequence number — a REST resync after a WS gap leaves
+    /// the book in an unknown-seq state. Without this, the next WS
+    /// delta (at seq=N for any N) compares against `last_seq=0` and
+    /// always fires another `Gap`, looping the recorder into a
+    /// REST-resync per delta.
+    ///
+    /// [`apply_snapshot`]: Self::apply_snapshot
+    /// [`apply_delta`]: Self::apply_delta
+    pub fn apply_rest_snapshot(&mut self, snap: Snapshot) {
+        self.yes_bids = snap.yes_bids.into_iter().collect();
+        self.no_bids = snap.no_bids.into_iter().collect();
+        self.last_seq = None;
+    }
+
     /// Apply an incremental delta. Returns the outcome; on `Gap` the caller
     /// must resnapshot before further deltas will be accepted.
     pub fn apply_delta(&mut self, delta: &Delta) -> ApplyOutcome {
@@ -264,6 +284,41 @@ mod tests {
         assert_eq!(
             b.apply_delta(&delta("Y", 2, Side::Yes, 41, 25)),
             ApplyOutcome::WrongMarket
+        );
+    }
+
+    #[test]
+    fn rest_snapshot_clears_last_seq_so_next_delta_at_any_seq_is_baseline() {
+        let mut b = OrderBook::new("X");
+        // WS-style snapshot at seq=10, then a clean delta at seq=11.
+        b.apply_snapshot(snap(10, vec![(40, 100)], vec![(60, 100)]));
+        assert_eq!(
+            b.apply_delta(&delta("X", 11, Side::Yes, 41, 25)),
+            ApplyOutcome::Ok
+        );
+        // REST resync (no seq number — represented as 0): book state
+        // is overwritten, gap-detection cleared.
+        b.apply_rest_snapshot(snap(0, vec![(42, 200)], vec![(53, 80)]));
+        assert_eq!(b.last_seq(), None);
+        assert_eq!(b.best_yes_bid(), Some((p(42), 200)));
+        // Next WS delta at seq=105 — far in the future relative to the
+        // pre-resync seq=11 — must be accepted, not flagged as a gap.
+        // This is the regression: before `apply_rest_snapshot`, every
+        // delta after a REST resync looped the recorder through more
+        // resyncs.
+        assert_eq!(
+            b.apply_delta(&delta("X", 105, Side::Yes, 43, 50)),
+            ApplyOutcome::Ok
+        );
+        assert_eq!(b.last_seq(), Some(105));
+        // And the *next* delta gap-detects normally against the new
+        // baseline.
+        assert_eq!(
+            b.apply_delta(&delta("X", 110, Side::Yes, 44, 10)),
+            ApplyOutcome::Gap {
+                expected: 106,
+                got: 110
+            }
         );
     }
 

@@ -37,6 +37,20 @@ impl BookStore {
         book.apply_snapshot(snapshot);
     }
 
+    /// Apply a REST-derived snapshot. Same as [`apply_snapshot`] but
+    /// resets `last_seq` to `None` so the next delta is accepted as
+    /// the new baseline. Use this for `RecordedKind::RestResync`
+    /// events during replay; mirrors the live recorder's path.
+    ///
+    /// [`apply_snapshot`]: Self::apply_snapshot
+    pub fn apply_rest_snapshot(&self, market: &MarketTicker, snapshot: Snapshot) {
+        let mut books = self.inner.lock().unwrap();
+        let book = books
+            .entry(market.clone())
+            .or_insert_with(|| OrderBook::new(market.as_str()));
+        book.apply_rest_snapshot(snapshot);
+    }
+
     /// Read-only borrow over the entire store. Use with care — holds
     /// the mutex for the duration of the closure.
     pub fn with_book<R>(

@@ -95,25 +95,27 @@ fn format_cents_to_dollars(cents: u8) -> String {
     format!("{dollars}.{frac:02}00")
 }
 
-/// Convert a Kalshi `FillRecord` into a `predigy_core::Fill`.
+/// Convert a Kalshi `FillRecord` into a `predigy_core::Fill`, using
+/// caller-supplied `side` and `action` from the originating order's
+/// tracking entry.
 ///
-/// The fill's price is taken from whichever leg matches the user's
-/// `side`: a YES-side fill uses `yes_price_dollars`, NO-side fills
-/// use `no_price_dollars`. Out-of-range prices (Kalshi sometimes
-/// reports `"0.00"` or `"1.00"` on settlement-priced fills) are
-/// rejected — those should never reach a live trader, so a hard error
-/// is the right signal.
-pub fn fill_to_domain(record: &FillRecord) -> Result<DomainFill, Error> {
-    let side = match record.side.as_str() {
-        "yes" => Side::Yes,
-        "no" => Side::No,
-        other => return Err(Error::Decode(format!("unknown side {other:?}"))),
-    };
-    let action = match record.action.as_str() {
-        "buy" => Action::Buy,
-        "sell" => Action::Sell,
-        other => return Err(Error::Decode(format!("unknown action {other:?}"))),
-    };
+/// Rationale: Kalshi V2's fill records have an empty `action` field
+/// and the wire `side` is the venue's book side (always YES
+/// post-mapping for any (No, *) order), not the trader's intended
+/// side. The executor knows the originating order's intended side
+/// and action; it passes them in and we use those as authoritative.
+///
+/// The fill's price is taken from whichever wire leg matches the
+/// resolved domain `side`: a YES-side fill uses `yes_price_dollars`,
+/// NO-side fills use `no_price_dollars`. Out-of-range prices (Kalshi
+/// sometimes reports `"0.00"` or `"1.00"` on settlement-priced
+/// fills) are rejected — those should never reach a live trader, so
+/// a hard error is the right signal.
+pub fn fill_to_domain(
+    record: &FillRecord,
+    side: Side,
+    action: Action,
+) -> Result<DomainFill, Error> {
     let qty = parse_count_fp(&record.count_fp)?;
     let price_str = match side {
         Side::Yes => &record.yes_price_dollars,
@@ -280,7 +282,12 @@ mod tests {
 
     #[test]
     fn fill_to_domain_uses_yes_price_for_yes_side() {
-        let f = fill_to_domain(&fill_record("yes", "buy", "0.4200", "0.5800", "10.00")).unwrap();
+        let f = fill_to_domain(
+            &fill_record("yes", "buy", "0.4200", "0.5800", "10.00"),
+            Side::Yes,
+            Action::Buy,
+        )
+        .unwrap();
         assert_eq!(f.side, Side::Yes);
         assert_eq!(f.action, Action::Buy);
         assert_eq!(f.price.cents(), 42);
@@ -292,14 +299,53 @@ mod tests {
 
     #[test]
     fn fill_to_domain_uses_no_price_for_no_side() {
-        let f = fill_to_domain(&fill_record("no", "sell", "0.4200", "0.5800", "5.00")).unwrap();
+        let f = fill_to_domain(
+            &fill_record("no", "sell", "0.4200", "0.5800", "5.00"),
+            Side::No,
+            Action::Sell,
+        )
+        .unwrap();
         assert_eq!(f.side, Side::No);
         assert_eq!(f.price.cents(), 58);
     }
 
+    /// Real Kalshi V2 fill records arrive with `action: ""` —
+    /// the wire field is unused. The decoder must treat the
+    /// caller-supplied (Side, Action) as authoritative and ignore
+    /// `record.action` entirely.
     #[test]
-    fn fill_to_domain_rejects_unknown_side() {
-        let f = fill_to_domain(&fill_record("maybe", "buy", "0.42", "0.58", "1.00"));
-        assert!(f.is_err());
+    fn fill_to_domain_ignores_empty_wire_action_in_favor_of_caller_supplied() {
+        // Real wire shape captured during the live shake-down on
+        // KXNBASERIES-26LALOKCR2-LAL: action="", side="yes",
+        // yes_price="0.0800". The originating order was (Yes, Buy).
+        let f = fill_to_domain(
+            &fill_record("yes", "", "0.0800", "0.9200", "1.00"),
+            Side::Yes,
+            Action::Buy,
+        )
+        .unwrap();
+        assert_eq!(f.side, Side::Yes);
+        assert_eq!(f.action, Action::Buy);
+        assert_eq!(f.price.cents(), 8);
+        assert_eq!(f.qty.get(), 1);
+    }
+
+    /// (No, *) orders are submitted as wire-YES at the complement
+    /// price. Their fills come back with wire `side: "yes"`. The
+    /// decoder must trust the caller-supplied `Side::No` and pull
+    /// the price from `no_price_dollars` (the correct side from the
+    /// trader's perspective).
+    #[test]
+    fn fill_to_domain_uses_caller_side_when_wire_side_is_post_mapping() {
+        let f = fill_to_domain(
+            &fill_record("yes", "", "0.0800", "0.9200", "3.00"),
+            Side::No,
+            Action::Buy,
+        )
+        .unwrap();
+        assert_eq!(f.side, Side::No);
+        assert_eq!(f.action, Action::Buy);
+        assert_eq!(f.price.cents(), 92);
+        assert_eq!(f.qty.get(), 3);
     }
 }

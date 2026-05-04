@@ -1025,6 +1025,7 @@ dependencies = [
 name = "predigy-kalshi-exec"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "predigy-core",
  "predigy-kalshi-rest",
  "predigy-oms",
@@ -1036,6 +1037,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

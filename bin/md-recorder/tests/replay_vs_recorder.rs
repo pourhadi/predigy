@@ -122,6 +122,29 @@ async fn run_mock_ws_server(listener: TcpListener) {
         .await
         .unwrap();
 
+    // Post-resync delta @ seq 200 (skipping seq numbers entirely after
+    // the REST resync). This must be accepted as the new baseline —
+    // not flagged as another gap. Without `apply_rest_snapshot`
+    // resetting `last_seq` to None, every delta after a resync looped
+    // the recorder into a fresh REST resync per delta. This delta and
+    // the next-seq one below pin that semantics in.
+    let d_post = serde_json::json!({
+        "type":"orderbook_delta",
+        "sid":1,"seq":200,
+        "msg":{"market_ticker":"TEST","price_dollars":"0.42","delta_fp":"-50","side":"yes"}
+    });
+    ws.send(Message::Text(d_post.to_string().into()))
+        .await
+        .unwrap();
+    let d_post2 = serde_json::json!({
+        "type":"orderbook_delta",
+        "sid":1,"seq":201,
+        "msg":{"market_ticker":"TEST","price_dollars":"0.53","delta_fp":"-20","side":"no"}
+    });
+    ws.send(Message::Text(d_post2.to_string().into()))
+        .await
+        .unwrap();
+
     // Drain until the recorder closes.
     while let Some(m) = ws.next().await {
         if matches!(m, Ok(Message::Close(_)) | Err(_)) {
@@ -200,10 +223,16 @@ async fn recorded_ndjson_replays_to_identical_book() -> Result<()> {
         live_seq,
         "replayed last_seq must equal recorder state"
     );
-    // Sanity: the recorder applied the canned resync snapshot, so the
-    // top-of-book should match it (best YES bid = 48¢, best NO = 53¢).
+    // Sanity: after the resync snapshot (YES 42¢×200, 48¢×30; NO
+    // 53¢×80) and the two post-resync deltas (YES 42¢ −50, NO 53¢
+    // −20), best YES bid = 48¢×30 and best NO = 53¢×60.
     assert_eq!(replayed_book.best_yes_bid(), Some((p(48), 30)));
-    assert_eq!(replayed_book.best_no_bid(), Some((p(53), 80)));
+    assert_eq!(replayed_book.best_no_bid(), Some((p(53), 60)));
+    // The resync left `last_seq` empty; the post-resync delta at
+    // seq=200 became the new baseline, then seq=201 followed cleanly.
+    // This is the regression: without `apply_rest_snapshot`, seq=200
+    // would have been reported as a gap.
+    assert_eq!(replayed_book.last_seq(), Some(201));
 
     // 9. Cleanup.
     let _ = server.await;
@@ -244,7 +273,7 @@ async fn replay_ndjson(path: &PathBuf) -> Result<HashMap<String, OrderBook>> {
                 let book = books
                     .entry(market.clone())
                     .or_insert_with(|| OrderBook::new(market));
-                book.apply_snapshot(snapshot);
+                book.apply_rest_snapshot(snapshot);
             }
             _ => {}
         }
