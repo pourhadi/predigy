@@ -21,7 +21,7 @@
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
-| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | 🟡 In progress (REST + book done; WS, recorder, poly-md pending) |
+| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | 🟡 In progress (REST + book + WS done; recorder, poly-md pending) |
 | 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ⬜ Not started |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
@@ -59,14 +59,33 @@ predigy/
     │                                  - sequence-gap detection (last_seq preserved on gap)
     │                                  - best YES bid/ask/no-bid, mid, spread
     │                                  - YES asks derived from NO bids by complement
-    └── kalshi-rest/                   ✅ Phase 1 part 1
+    ├── kalshi-rest/                   ✅ Phase 1 part 1
+    │   ├── src/
+    │   │   ├── lib.rs                 module roots + re-exports
+    │   │   ├── auth.rs                Signer (RSA-PSS-SHA256, PKCS#1 or PKCS#8 PEM)
+    │   │   ├── client.rs              Client (auth-optional, reqwest, rustls-tls)
+    │   │   ├── error.rs               Error enum (Http, Api, Auth, Decode, Url)
+    │   │   └── types.rs               JSON response types (decimal price schema)
+    │   └── examples/smoke.rs          live read-only smoke test
+    └── kalshi-md/                     ✅ Phase 1 part 2
         ├── src/
-        │   ├── lib.rs                 module roots + re-exports
-        │   ├── auth.rs                Signer (RSA-PSS-SHA256, PKCS#1 or PKCS#8 PEM)
-        │   ├── client.rs              Client (auth-optional, reqwest, rustls-tls)
-        │   ├── error.rs               Error enum (Http, Api, Auth, Decode, Url)
-        │   └── types.rs               JSON response types (decimal price schema)
-        └── examples/smoke.rs          live read-only smoke test
+        │   ├── lib.rs                 module roots + re-exports + quick-start
+        │   ├── messages.rs            wire types: Outgoing (Subscribe/Unsubscribe/
+        │   │                          UpdateSubscription) + Incoming envelope
+        │   │                          (snapshot/delta/ticker/trade/subscribed/error/ok)
+        │   ├── decode.rs              "0.0800"→Price, "300.00"→u32, "-54.00"→i32;
+        │   │                          wire snapshot/delta → predigy_book::{Snapshot,Delta}
+        │   ├── backoff.rs             exp backoff w/ full jitter (Brooker 2015)
+        │   ├── client.rs              Client + Connection: auth on upgrade, command
+        │   │                          and event channels, single-task multiplexer,
+        │   │                          reconnect with replay of saved subscriptions
+        │   └── error.rs               Error enum (WebSocket, Upgrade, Server, Decode,
+        │                              OutOfRange, Closed, Invalid, Url)
+        └── tests/
+            ├── loopback_session.rs    end-to-end: subscribe → snapshot → delta →
+            │                          ticker → trade against an in-process mock
+            └── reconnect_replay.rs    server drops, client reconnects, replays the
+                                       saved sub with the original req_id
 ```
 
 ## Test counts
@@ -76,8 +95,11 @@ predigy-core       15 tests   (price 4, side 1, position 2, fees 8)
 predigy-book        6 tests   (snapshot/delta/gap/wrong-market/edge cases)
 predigy-kalshi-rest 6 tests   (auth round-trip, PSS non-determinism, bad PEM,
                                url builder, public client, auth required)
+predigy-kalshi-md  27 tests   (25 unit: backoff, decode, messages, client;
+                                + 2 integration: loopback session, reconnect
+                                replay)
                    ─────────
-                   27 tests
+                   54 tests
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
@@ -103,13 +125,24 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 - Orderbook returns `yes_bids` + `no_bids` only — no asks. YES asks =
   complement of NO bids.
 
-### Kalshi WebSocket (not yet implemented)
+### Kalshi WebSocket
 - URL: `wss://api.elections.kalshi.com/trade-api/ws/v2`
-- Same auth headers as REST on the upgrade request.
-- Subscriptions: `orderbook_delta`, `ticker`, `trade`, `fill` (auth).
-- Snapshots include a sequence number; deltas must be applied in strict order.
-- Repeated subscriptions on the same connection are now no-ops (was an error
-  pre-2026).
+- Same auth headers as REST on the upgrade request (path = WS URL path,
+  method = `GET`).
+- Public channels implemented: `orderbook_delta`, `ticker`, `trade`.
+- Authenticated channels (`fill`, `user_orders`, `market_positions`)
+  deferred to Phase 2.
+- Snapshots include a sequence number; deltas must be applied in strict
+  order. The book emits `Gap { expected, got }` on a sequence break — the
+  caller (md-recorder) re-fetches a REST snapshot to resync.
+- Repeated subscriptions on the same connection are no-ops post-2026, so
+  on reconnect we replay all saved subs unconditionally.
+- Decimal-string fixed-point on the wire: prices are quoted as
+  `"0.0800"`, sizes as `"300.00"`, deltas as `"-54.00"`. Decoded by
+  `predigy_kalshi_md::decode` into the integer-cent / `u32` / `i32` types
+  the book expects.
+- Server sends Ping frames every 10s with body `"heartbeat"`;
+  `tokio-tungstenite` auto-replies with Pongs.
 
 ### Kalshi FIX 4.4 (not yet implemented)
 - Request access via `[email protected]`.
@@ -122,14 +155,12 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Known limitations / open items
 
-- **TLS in this sandbox**: outbound TLS to `api.elections.kalshi.com` failed
-  with `InvalidCertificate(UnknownIssuer)` — the sandbox proxy doesn't trust
-  Kalshi's CA. The code uses `rustls-tls` with `webpki-roots` and works on
-  any real network; verify by running `cargo run -p predigy-kalshi-rest
-  --example smoke` from your laptop or the production VPS.
 - **No live API key tested yet** — `Signer` is unit-test-verified
-  (round-trip with the public key) but has not signed a real Kalshi request
-  end-to-end.
+  (round-trip with the public key) but has not signed a real Kalshi REST or
+  WS request end-to-end. The integration tests in `predigy-kalshi-md` use
+  an in-process loopback WS server with auth disabled, so they validate
+  protocol/decoding/reconnect but not the auth handshake against
+  production.
 - **Bare-metal Chicago VPS not yet ordered** — that's a manual vendor
   process; not blocked on code.
 
@@ -137,18 +168,13 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 Still inside Phase 1:
 
-1. `crates/kalshi-md/` — WebSocket client
-   - tokio-tungstenite + rustls-tls; auth headers on upgrade
-   - decode `orderbook_snapshot`, `orderbook_delta`, `ticker`, `trade`
-   - feed snapshots/deltas into `book::OrderBook`; on `Gap`, fetch a fresh
-     REST snapshot and resync
-   - reconnect with exponential backoff + jitter
-2. `crates/poly-md/` — Polymarket WS client (reference book, no exec)
-3. `bin/md-recorder/` — long-running binary that subscribes to a configured
-   list of markets and writes raw JSON events to disk (NDJSON in Phase 1,
-   parquet rotation in Phase 3)
-4. Integration test: feed a captured WS log into a fresh `OrderBook`,
-   assert it reconstructs identically to a final REST snapshot
+1. `crates/poly-md/` — Polymarket WS client (reference book, no exec).
+2. `bin/md-recorder/` — long-running binary that subscribes to a
+   configured list of markets, writes raw JSON events to disk (NDJSON in
+   Phase 1, parquet rotation in Phase 3), and on `OrderBook::Gap`
+   re-fetches a `predigy_kalshi_rest::orderbook_snapshot` to resync.
+3. Integration test: feed a captured WS log into a fresh `OrderBook`,
+   assert it reconstructs identically to a final REST snapshot.
 
 After that, Phase 1 acceptance: 24h of recorded data, replay-vs-snapshot
 identical book.
@@ -169,8 +195,13 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 ## Recent commits
 
-| SHA | Subject |
+| SHA (short) | Subject |
 |---|---|
+| _pending_ | Add `predigy-kalshi-md` (Kalshi WS client) — Phase 1, part 2 |
+| `c5ed5be` | Merge PR #2: docs + CI workflow |
+| `bdc8019` | Fix `clippy::map_unwrap_or` in `current_unix_ms` |
+| `18dcede` | Add CI workflow and remove "manual setup" docs note |
+| `9fc43cf` | Document plan and current build state in repo |
 | `9884459` | Add `predigy-book` and `predigy-kalshi-rest` crates (Phase 1, part 1) |
 | `1eafd3f` | Scaffold Cargo workspace and `predigy-core` crate (Phase 0) |
 | `b15fc05` | Initial commit (README only) |
