@@ -2,7 +2,10 @@
 
 use crate::auth::Signer;
 use crate::error::Error;
-use crate::types::{MarketDetailResponse, MarketsResponse, OrderbookResponse, PositionsResponse};
+use crate::types::{
+    CancelOrderResponse, CreateOrderRequest, CreateOrderResponse, FillsResponse,
+    MarketDetailResponse, MarketsResponse, OrderbookResponse, PositionsResponse,
+};
 use predigy_book::Snapshot;
 use predigy_core::price::Price;
 use reqwest::Method;
@@ -90,6 +93,46 @@ impl Client {
             .query(query)
             .send()
             .await?;
+        Self::decode_response(resp).await
+    }
+
+    async fn post_json<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        sub_path: &str,
+        body: &B,
+    ) -> Result<T, Error> {
+        let url = self.build_url(sub_path)?;
+        let headers = self.sign_headers(&Method::POST, sub_path)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(body)
+            .send()
+            .await?;
+        Self::decode_response(resp).await
+    }
+
+    async fn delete_json<T: serde::de::DeserializeOwned>(
+        &self,
+        sub_path: &str,
+        query: &[(&str, String)],
+    ) -> Result<T, Error> {
+        let url = self.build_url(sub_path)?;
+        let headers = self.sign_headers(&Method::DELETE, sub_path)?;
+        let resp = self
+            .http
+            .delete(url)
+            .headers(headers)
+            .query(query)
+            .send()
+            .await?;
+        Self::decode_response(resp).await
+    }
+
+    async fn decode_response<T: serde::de::DeserializeOwned>(
+        resp: reqwest::Response,
+    ) -> Result<T, Error> {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -168,6 +211,54 @@ impl Client {
             return Err(Error::Auth("positions endpoint requires a signer".into()));
         }
         self.get_json("/portfolio/positions", &[]).await
+    }
+
+    /// `POST /portfolio/events/orders` (auth required). V2 schema.
+    pub async fn create_order(
+        &self,
+        req: &CreateOrderRequest,
+    ) -> Result<CreateOrderResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("create_order requires a signer".into()));
+        }
+        self.post_json("/portfolio/events/orders", req).await
+    }
+
+    /// `DELETE /portfolio/events/orders/{order_id}` (auth required).
+    pub async fn cancel_order(&self, order_id: &str) -> Result<CancelOrderResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("cancel_order requires a signer".into()));
+        }
+        self.delete_json(&format!("/portfolio/events/orders/{order_id}"), &[])
+            .await
+    }
+
+    /// `GET /portfolio/fills` (auth required). Filter by `order_id`,
+    /// `min_ts` (Unix seconds), and pagination `cursor` as needed.
+    pub async fn list_fills(
+        &self,
+        order_id: Option<&str>,
+        min_ts: Option<i64>,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<FillsResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("list_fills requires a signer".into()));
+        }
+        let mut q = Vec::new();
+        if let Some(o) = order_id {
+            q.push(("order_id", o.to_string()));
+        }
+        if let Some(t) = min_ts {
+            q.push(("min_ts", t.to_string()));
+        }
+        if let Some(l) = limit {
+            q.push(("limit", l.to_string()));
+        }
+        if let Some(c) = cursor {
+            q.push(("cursor", c.to_string()));
+        }
+        self.get_json("/portfolio/fills", &q).await
     }
 }
 

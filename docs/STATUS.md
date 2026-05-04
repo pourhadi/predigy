@@ -22,7 +22,7 @@
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
 | 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
-| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | 🟡 In progress (`risk` + `oms` done; `kalshi-exec`, `arb-trader` pending) |
+| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | 🟡 In progress (`risk` + `oms` + `kalshi-exec` (REST) done; FIX-flavoured exec + `arb-trader` pending) |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ Not started |
@@ -153,13 +153,40 @@ predigy/
 │       │                              fills can't starve under heavy submits.
 │       │                              OmsEvent stream surfaces every state
 │       │                              transition + PositionUpdated.
-│       └── tests/runtime.rs           submit→ack→fill (happy path);
-│                                      risk rejection blocks executor; partial
-│                                      then terminal fill blends VWAP;
-│                                      sell after buy realises P&L; cancel;
-│                                      kill switch blocks/unblocks; reconcile
-│                                      flags mismatches; executor failure
-│                                      doesn't book a phantom order.
+│   │   └── tests/runtime.rs           submit→ack→fill (happy path);
+│   │                                  risk rejection blocks executor; partial
+│   │                                  then terminal fill blends VWAP;
+│   │                                  sell after buy realises P&L; cancel;
+│   │                                  kill switch blocks/unblocks; reconcile
+│   │                                  flags mismatches; executor failure
+│   │                                  doesn't book a phantom order.
+│   └── kalshi-exec/                   ✅ Phase 2 part 3 (REST flavour)
+│       ├── src/
+│       │   ├── lib.rs                 module roots + re-exports + quick-start
+│       │   ├── error.rs               Error enum (Rest, Unsupported, Decode)
+│       │   ├── mapping.rs             Order → Kalshi V2 CreateOrderRequest:
+│       │   │                          (Yes, Buy)→bid, (Yes, Sell)→ask,
+│       │   │                          (No, Buy)→ask at complement,
+│       │   │                          (No, Sell)→bid at complement.
+│       │   │                          PostOnly→GTC + post_only=true.
+│       │   │                          FillRecord → predigy_core::Fill.
+│       │   └── executor.rs            RestExecutor implements oms::Executor.
+│       │                              submit() POSTs and synthesises
+│       │                              Acked / Rejected; cancel() DELETEs and
+│       │                              synthesises Cancelled. Background task
+│       │                              polls /portfolio/fills (jittered
+│       │                              ±10%) and maps each new fill into an
+│       │                              ExecutionReport (PartiallyFilled /
+│       │                              Filled when cumulative reaches target).
+│       │                              Aborted on drop.
+│       └── tests/
+│           ├── http_mock.rs           hand-rolled HTTP/1.1 mock server;
+│           │                          one request per connection,
+│           │                          mutable route table.
+│           └── oms_integration.rs     end-to-end: submit→Acked→polled fill
+│                                      drives Filled+PositionUpdated;
+│                                      cancel emits Cancelled; submit
+│                                      failure (4xx) leaves zero state.
 └── bin/                               ✅ Phase 1 part 4
     └── md-recorder/
         ├── src/
@@ -207,11 +234,18 @@ predigy-oms        25 tests   (17 unit: cid allocator, position_math VWAP +
                                 risk-reject, partial+final fill, sell
                                 realises P&L, cancel, kill switch,
                                 reconcile mismatch, executor-failure path)
+predigy-kalshi-exec 15 tests   (12 unit: Yes/No mapping (4 cases) including
+                                NO-at-complement, post_only as GTC+flag,
+                                Market rejected, FillRecord → domain
+                                with side-aware price, tracking
+                                round-trip, jitter band, jitter-zero;
+                                + 3 integration: submit+polled-fill→Filled,
+                                cancel→Cancelled, 4xx submit→Executor err)
 md-recorder         5 tests   (4 unit: RecordedEvent round-trips for
                                 snapshot/delta/rest_resync + schema tag;
                                 1 integration: Phase 1 acceptance)
                    ─────────
-                  122 tests   (+ 4 doctests)
+                  137 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
@@ -287,21 +321,23 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Next chunk to build
 
-Phase 2 mid-flight. `risk` and `oms` are in; the remaining pieces:
+Phase 2 in flight. `risk`, `oms`, and `kalshi-exec` (REST flavour)
+are in. The remaining pieces:
 
-1. `crates/kalshi-exec/` — implements `oms::Executor` over Kalshi
-   FIX 4.4 (logon / heartbeat / NewOrderSingle / OrderCancelRequest /
-   ExecutionReport / OrderMassCancelRequest). REST fallback behind
-   the same trait for non-order ops. Needs the FIX library decision
-   (quickfix-rs vs hand-rolled per Kalshi's spec).
-2. `bin/arb-trader/` — first live strategy: static intra-venue arb
+1. `bin/arb-trader/` — first live strategy: static intra-venue arb
    (`YES + NO < $1` minus fees). Smallest blast radius for shaking
-   down the OMS+exec+risk path together.
+   down the OMS+exec+risk path together. This is the next chunk.
+2. `crates/kalshi-fix/` (or `kalshi-exec` with a FIX feature flag) —
+   FIX 4.4 variant of the Executor (logon / heartbeat /
+   NewOrderSingle / OrderCancelRequest / ExecutionReport /
+   OrderMassCancelRequest). Needed for market-making (Phase 4) where
+   sub-millisecond fill latency matters; REST is fine for the
+   intra-venue arb strategy that lands first.
 3. Parallel: live shake-down of `md-recorder` against the production
    Kalshi endpoint (Phase 1's last open item).
-4. Phase-2 hardening (after the binary lands):
+4. Phase-2 hardening (after the arb-trader binary lands):
    - Durable cid sequence storage so cids never repeat across restarts.
-   - Mass-cancel wiring on kill-switch arm.
+   - Mass-cancel wiring on kill-switch arm (REST path or FIX `35=q`).
    - Persistent OMS state (`sqlx`/Postgres) per the plan.
    - Order amend (Kalshi `OrderCancelReplaceRequest`).
 
@@ -323,6 +359,7 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
+| _pending_ | Add `predigy-kalshi-exec` (REST executor) — Phase 2, part 3 |
 | _pending_ | Add `predigy-oms` (order management state machine) — Phase 2, part 2 |
 | _pending_ | Add `predigy-risk` (pre-trade limits + breakers) — Phase 2, part 1 |
 | `bb1b072` | Merge PR #4: `predigy-poly-md` (Polymarket WS reference client) |

@@ -943,6 +943,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-kalshi-exec"
+version = "0.1.0"
+dependencies = [
+ "predigy-core",
+ "predigy-kalshi-rest",
+ "predigy-oms",
+ "predigy-risk",
+ "rand 0.8.6",
+ "rsa",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "predigy-kalshi-md"
 version = "0.1.0"
 dependencies = [
