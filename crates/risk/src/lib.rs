@@ -57,4 +57,4 @@ pub mod state;
 
 pub use engine::{Decision, Reason, RiskEngine};
 pub use limits::{AccountLimits, Limits, PerMarketLimits, RateLimits};
-pub use state::AccountState;
+pub use state::{AccountState, PersistedAccountState, PersistedPositionEntry};

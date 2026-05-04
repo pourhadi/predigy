@@ -12,6 +12,7 @@
 
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,37 @@ pub struct AccountState {
     recent_orders: VecDeque<Instant>,
     /// When `true`, every risk check rejects with `KillSwitchActive`.
     kill_switch: bool,
+}
+
+/// Serialisable snapshot of the persistable subset of `AccountState`.
+/// Excludes `recent_orders` (whose `Instant`s aren't meaningful across
+/// restarts — the rate-limit window is allowed to reset on resume).
+/// The OMS calls [`AccountState::to_persisted`] before writing to disk
+/// and [`AccountState::from_persisted`] on restart.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersistedAccountState {
+    /// Schema version of this snapshot. Bump when the on-disk shape
+    /// changes incompatibly.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    pub positions: Vec<PersistedPositionEntry>,
+    #[serde(default)]
+    pub daily_realized_pnl_cents: i64,
+    #[serde(default)]
+    pub kill_switch: bool,
+}
+
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// One row of the persisted positions table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedPositionEntry {
+    pub market: MarketTicker,
+    pub side: Side,
+    pub qty: u32,
+    pub avg_entry_cents: u16,
 }
 
 impl AccountState {
@@ -158,6 +190,58 @@ impl AccountState {
     pub fn reset_for_new_day(&mut self) {
         self.daily_realized_pnl_cents = 0;
         self.recent_orders.clear();
+    }
+
+    /// Snapshot the persistable subset to a [`PersistedAccountState`].
+    /// Does not include the rate-limit sliding window — those `Instant`s
+    /// are meaningless across process restarts and the window is allowed
+    /// to reset on resume (worst case: a few extra orders fire in the
+    /// first second after restart).
+    #[must_use]
+    pub fn to_persisted(&self) -> PersistedAccountState {
+        let mut entries: Vec<PersistedPositionEntry> = self
+            .positions
+            .iter()
+            .map(|((market, side), &qty)| PersistedPositionEntry {
+                market: market.clone(),
+                side: *side,
+                qty,
+                avg_entry_cents: self
+                    .avg_entry_cents
+                    .get(&(market.clone(), *side))
+                    .copied()
+                    .unwrap_or(0),
+            })
+            .collect();
+        // Stable order so successive snapshots that differ in nothing
+        // produce byte-identical files (helps if you `diff` or hash
+        // them).
+        entries.sort_by(|a, b| {
+            a.market
+                .as_str()
+                .cmp(b.market.as_str())
+                .then_with(|| a.side.cmp(&b.side))
+        });
+        PersistedAccountState {
+            schema_version: 1,
+            positions: entries,
+            daily_realized_pnl_cents: self.daily_realized_pnl_cents,
+            kill_switch: self.kill_switch,
+        }
+    }
+
+    /// Rehydrate an `AccountState` from a snapshot produced by
+    /// [`AccountState::to_persisted`]. The rate-limit window is left
+    /// empty.
+    #[must_use]
+    pub fn from_persisted(p: &PersistedAccountState) -> Self {
+        let mut s = Self::new();
+        for e in &p.positions {
+            s.set_position(e.market.clone(), e.side, e.qty, e.avg_entry_cents);
+        }
+        s.daily_realized_pnl_cents = p.daily_realized_pnl_cents;
+        s.kill_switch = p.kill_switch;
+        s
     }
 }
 

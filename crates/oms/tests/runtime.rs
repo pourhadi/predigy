@@ -84,6 +84,7 @@ async fn submit_ack_fill_updates_position() {
         OmsConfig {
             strategy_id: "arb".into(),
             cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
+            state_backing: predigy_oms::StateBacking::InMemory,
         },
         RiskEngine::new(permissive_limits()),
         executor.clone(),
@@ -518,4 +519,107 @@ async fn executor_submit_failure_does_not_record_order() {
         other => panic!("expected Executor err, got {other:?}"),
     }
     oms.close().await;
+}
+
+#[tokio::test]
+async fn persistent_state_survives_restart() {
+    use predigy_oms::StateBacking;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let state_path = tmp.path().join("oms-state.json");
+
+    // ---- First instance: submit, fill, close. State should
+    // persist to disk.
+    let (executor, report_tx, report_rx) = stub_channel(64);
+    let mut oms = Oms::try_spawn(
+        OmsConfig {
+            strategy_id: "persist".into(),
+            cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
+            state_backing: StateBacking::Persistent {
+                path: state_path.clone(),
+            },
+        },
+        RiskEngine::new(permissive_limits()),
+        executor.clone(),
+        report_rx,
+    )
+    .expect("first oms spawn");
+
+    let cid = oms
+        .submit(buy_yes("KX-PERSIST", 42, 5))
+        .await
+        .expect("submit");
+    // Drain Submitted event.
+    assert!(matches!(
+        next_event(&mut oms).await,
+        OmsEvent::Submitted { .. }
+    ));
+    // Stub-side: synthesise Acked + Filled reports keyed off the
+    // cid the submit returned.
+    report_tx
+        .send(ExecutionReport {
+            cid: cid.clone(),
+            ts_ms: 0,
+            kind: ExecutionReportKind::Acked {
+                venue_order_id: "v-1".into(),
+            },
+        })
+        .await
+        .unwrap();
+    report_tx
+        .send(ExecutionReport {
+            cid: cid.clone(),
+            ts_ms: 0,
+            kind: ExecutionReportKind::Filled {
+                fill: fill(42, 5, false),
+                cumulative_qty: 5,
+            },
+        })
+        .await
+        .unwrap();
+    // Drain Acked, Filled, PositionUpdated.
+    assert!(matches!(next_event(&mut oms).await, OmsEvent::Acked { .. }));
+    assert!(matches!(
+        next_event(&mut oms).await,
+        OmsEvent::Filled { .. }
+    ));
+    let pos_event = next_event(&mut oms).await;
+    let OmsEvent::PositionUpdated { new_qty, .. } = pos_event else {
+        panic!("expected PositionUpdated, got {pos_event:?}");
+    };
+    assert_eq!(new_qty, 5);
+    oms.close().await;
+
+    // The snapshot file must exist now.
+    assert!(state_path.exists(), "state file should be written");
+
+    // ---- Second instance: reload from disk and verify the
+    // position carries forward. Submit a sell that depends on
+    // having the position; if the OMS forgot we owned it, the
+    // sell would fail risk (sell-shrinks-only).
+    let (executor2, _tx2, rx2) = stub_channel(64);
+    let oms2 = Oms::try_spawn(
+        OmsConfig {
+            strategy_id: "persist".into(),
+            cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 100 },
+            state_backing: StateBacking::Persistent { path: state_path },
+        },
+        RiskEngine::new(permissive_limits()),
+        executor2,
+        rx2,
+    )
+    .expect("second oms spawn");
+
+    // The reload populated state — the daily-loss breaker and
+    // kill-switch state would also have come back, but those
+    // are zero/false here. The strongest assertion is that the
+    // sell of the resumed position works: stub-side observation
+    // of the submit confirms it passed risk + cid alloc.
+    let _cid = oms2
+        .submit(sell_yes("KX-PERSIST", 50, 5))
+        .await
+        .expect("sell of resumed position passes risk");
+    let _executor_unused = executor; // executor's tracking is process-local; clearer than `let _ =`
+    oms2.close().await;
 }

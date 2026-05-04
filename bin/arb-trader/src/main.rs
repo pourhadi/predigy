@@ -122,6 +122,15 @@ struct Args {
     /// = fewer fsyncs at the cost of more wasted ids on a crash.
     #[arg(long, default_value_t = 1_000)]
     cid_chunk_size: u64,
+
+    /// Path to a JSON file the OMS snapshots its state to (positions,
+    /// daily realised P&L, kill-switch flag, in-flight orders) after
+    /// every mutation. On restart the file is loaded if present so
+    /// the daily-loss breaker, kill-switch, and orders ledger
+    /// survive a crash. Without this, those reset to zero on every
+    /// run.
+    #[arg(long)]
+    oms_state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -188,10 +197,20 @@ async fn main() -> Result<()> {
         );
         CidBacking::InMemory { start_seq: 0 }
     };
+    let state_backing = if let Some(path) = &args.oms_state {
+        predigy_oms::StateBacking::Persistent { path: path.clone() }
+    } else {
+        tracing::warn!(
+            "no --oms-state; positions/daily-pnl/kill-switch/orders reset on every run. \
+             Use --oms-state in production so the daily-loss breaker survives restarts."
+        );
+        predigy_oms::StateBacking::InMemory
+    };
     let oms = Oms::try_spawn(
         OmsConfig {
             strategy_id: args.strategy_id.clone(),
             cid_backing,
+            state_backing,
         },
         RiskEngine::new(limits),
         executor,

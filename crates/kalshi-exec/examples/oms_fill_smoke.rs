@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
         OmsConfig {
             strategy_id: "oms-fill".into(),
             cid_backing: CidBacking::InMemory { start_seq },
+            state_backing: predigy_oms::StateBacking::InMemory,
         },
         RiskEngine::new(limits),
         executor,

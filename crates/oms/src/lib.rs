@@ -35,6 +35,7 @@
 
 pub mod cid;
 pub mod executor;
+pub mod persistence;
 pub mod position_math;
 pub mod record;
 pub mod runtime;
@@ -45,6 +46,7 @@ pub use executor::{
     ExecutionReport, ExecutionReportKind, Executor, ExecutorError,
     stub::{StubCall, StubExecutor, channel as stub_channel},
 };
+pub use persistence::{PersistedOmsState, StateBacking, StateError};
 pub use position_math::{PositionUpdate, apply_fill};
 pub use record::OrderRecord;
 pub use runtime::{CidBacking, Oms, OmsConfig, OmsError, OmsEvent, OmsHandle, PositionMismatch};

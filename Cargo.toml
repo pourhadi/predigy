@@ -74,6 +74,7 @@ rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

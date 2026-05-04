@@ -115,6 +115,7 @@ async fn submit_emits_acked_then_polled_fill_emits_filled_and_position() {
         OmsConfig {
             strategy_id: "arb".into(),
             cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
+            state_backing: predigy_oms::StateBacking::InMemory,
         },
         RiskEngine::new(permissive()),
         executor,
