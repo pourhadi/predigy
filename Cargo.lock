@@ -987,6 +987,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-ext-feeds"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "predigy-kalshi-exec"
 version = "0.1.0"
 dependencies = [
@@ -1089,6 +1101,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "predigy-signals"
+version = "0.1.0"
+dependencies = [
+ "predigy-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
