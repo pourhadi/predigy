@@ -21,7 +21,7 @@
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
-| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | 🟡 In progress (REST + book + WS done; recorder, poly-md pending) |
+| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | 🟡 In progress (REST + book + WS + md-recorder done; poly-md tracked separately in PR #4) |
 | 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ⬜ Not started |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
@@ -81,11 +81,33 @@ predigy/
         │   │                          reconnect with replay of saved subscriptions
         │   └── error.rs               Error enum (WebSocket, Upgrade, Server, Decode,
         │                              OutOfRange, Closed, Invalid, Url)
-        └── tests/
-            ├── loopback_session.rs    end-to-end: subscribe → snapshot → delta →
-            │                          ticker → trade against an in-process mock
-            └── reconnect_replay.rs    server drops, client reconnects, replays the
-                                       saved sub with the original req_id
+    │   └── tests/
+    │       ├── loopback_session.rs    end-to-end: subscribe → snapshot → delta →
+    │       │                          ticker → trade against an in-process mock
+    │       └── reconnect_replay.rs    server drops, client reconnects, replays the
+    │                                  saved sub with the original req_id
+    └── ../bin/                        ✅ Phase 1 part 4 (bin/md-recorder)
+        └── md-recorder/
+            ├── src/
+            │   ├── lib.rs             module roots + re-exports
+            │   ├── recorded.rs        on-disk NDJSON schema (versioned), with a
+            │   │                      synthetic RestResync event the recorder
+            │   │                      injects after a Gap-triggered REST fetch
+            │   ├── recorder.rs        Recorder<P: SnapshotProvider> — drains the
+            │   │                      kalshi-md Connection, writes one NDJSON
+            │   │                      line per event, applies snapshot/delta to
+            │   │                      a per-market OrderBook, on Gap pulls a
+            │   │                      fresh snapshot via P and emits RestResync,
+            │   │                      on Reconnected forces a resync per market
+            │   └── main.rs            CLI (clap): --output, --market…,
+            │                          --kalshi-key-id, --kalshi-pem; SIGINT for
+            │                          graceful shutdown; tracing-subscriber logs
+            └── tests/
+                └── replay_vs_recorder.rs   Phase 1 acceptance: drive recorder
+                                            through subscribe→snapshot→delta→
+                                            gap-induced resync; replay the
+                                            NDJSON; assert replayed book ≡
+                                            recorder's in-memory book
 ```
 
 ## Test counts
@@ -98,9 +120,15 @@ predigy-kalshi-rest 6 tests   (auth round-trip, PSS non-determinism, bad PEM,
 predigy-kalshi-md  27 tests   (25 unit: backoff, decode, messages, client;
                                 + 2 integration: loopback session, reconnect
                                 replay)
+md-recorder         5 tests   (4 unit: RecordedEvent round-trips for snapshot/
+                                delta/rest_resync + schema-version tag;
+                                + 1 integration: Phase 1 acceptance —
+                                replay-vs-recorder identical book)
                    ─────────
-                   54 tests
+                   59 tests
 ```
+
+(predigy-poly-md adds 14 more in PR #4 — 73 once both PRs land.)
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 `claude/**` and on every PR against `main`):
@@ -168,16 +196,15 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 Still inside Phase 1:
 
-1. `crates/poly-md/` — Polymarket WS client (reference book, no exec).
-2. `bin/md-recorder/` — long-running binary that subscribes to a
-   configured list of markets, writes raw JSON events to disk (NDJSON in
-   Phase 1, parquet rotation in Phase 3), and on `OrderBook::Gap`
-   re-fetches a `predigy_kalshi_rest::orderbook_snapshot` to resync.
-3. Integration test: feed a captured WS log into a fresh `OrderBook`,
-   assert it reconstructs identically to a final REST snapshot.
-
-After that, Phase 1 acceptance: 24h of recorded data, replay-vs-snapshot
-identical book.
+1. (PR #4 in flight) `crates/poly-md/` — Polymarket WS reference client.
+2. **Live shake-down on a real Kalshi key**: run `md-recorder` against
+   the production WS+REST endpoints from a workstation with public CA
+   roots, capture an hour or two of data, replay it, confirm
+   replay-vs-recorder identical. This is what closes the Phase 1
+   acceptance criterion in practice; the integration test only proves
+   the logic.
+3. Parquet rotation (Phase 3 work, but the schema is stable enough
+   today that it can be added incrementally).
 
 ## Build / run
 
@@ -197,7 +224,8 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
-| _pending_ | Add `predigy-kalshi-md` (Kalshi WS client) — Phase 1, part 2 |
+| _pending_ | Add `bin/md-recorder` (NDJSON recorder w/ REST resync) — Phase 1, part 4 |
+| `df6bb53` | Merge PR #3: `predigy-kalshi-md` (Kalshi WS client) |
 | `c5ed5be` | Merge PR #2: docs + CI workflow |
 | `bdc8019` | Fix `clippy::map_unwrap_or` in `current_unix_ms` |
 | `18dcede` | Add CI workflow and remove "manual setup" docs note |

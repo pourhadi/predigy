@@ -176,7 +176,10 @@ pub struct OrderbookDeltaBody {
 
 /// Ticker fields are mostly informational; we keep the raw decoded shape
 /// rather than re-modelling each numeric field into a domain type.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Serialize` is provided so `md-recorder` can archive ticker events
+/// (and replay them by deserialising back into the same shape).
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TickerBody {
     pub market_ticker: String,
     #[serde(default)]
@@ -201,7 +204,7 @@ pub struct TickerBody {
     pub ts_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TradeBody {
     pub trade_id: String,
     pub market_ticker: String,
