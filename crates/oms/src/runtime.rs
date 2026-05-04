@@ -53,6 +53,12 @@ pub struct OmsConfig {
     /// and [`CidBacking::Persistent`] in production so cids survive
     /// restarts (see [`crate::cid::CidStore`]).
     pub cid_backing: CidBacking,
+    /// Account-state + orders-map persistence. Use
+    /// [`StateBacking::Persistent`] in production so a process crash
+    /// doesn't lose the daily-loss breaker, kill-switch state, or
+    /// the in-flight orders ledger. Default is `InMemory` for tests
+    /// and one-shot scripts.
+    pub state_backing: crate::persistence::StateBacking,
 }
 
 #[derive(Debug, Clone)]
@@ -74,8 +80,20 @@ impl Default for OmsConfig {
         Self {
             strategy_id: "default".into(),
             cid_backing: CidBacking::InMemory { start_seq: 0 },
+            state_backing: crate::persistence::StateBacking::InMemory,
         }
     }
+}
+
+/// Failure modes when spawning an OMS task. The cid store and the
+/// state snapshot can each fail independently — keeping them as
+/// separate variants lets the operator tell which one to fix.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("cid store: {0}")]
+    Cid(#[from] crate::cid::CidError),
+    #[error("state snapshot: {0}")]
+    State(#[from] crate::persistence::StateError),
 }
 
 /// One-shot handle returned by [`Oms::spawn`]. Drop or call
@@ -302,15 +320,15 @@ impl<E: Executor + 'static> Oms<E> {
             .expect("OmsConfig::cid_backing initialisation; use try_spawn for fallible variant")
     }
 
-    /// Fallible spawn — reports cid-store I/O errors instead of
-    /// panicking. Production binaries should call this and surface
-    /// the error in their startup path.
+    /// Fallible spawn — reports cid-store and state-snapshot I/O
+    /// errors instead of panicking. Production binaries should call
+    /// this and surface the error in their startup path.
     pub fn try_spawn(
         config: OmsConfig,
         risk: RiskEngine,
         executor: E,
         reports: mpsc::Receiver<ExecutionReport>,
-    ) -> Result<OmsHandle, crate::cid::CidError> {
+    ) -> Result<OmsHandle, SpawnError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         let cid_alloc = match &config.cid_backing {
@@ -324,14 +342,36 @@ impl<E: Executor + 'static> Oms<E> {
                 &config.strategy_id,
                 crate::cid::CidStore::new(store_path.clone()),
                 *chunk_size,
-            )?,
+            )
+            .map_err(SpawnError::Cid)?,
         };
+
+        // Rehydrate prior persisted state, if any. Missing file =
+        // first run = empty state. Schema mismatch / parse failure =
+        // bail loudly so the operator notices rather than the OMS
+        // silently restarting from zero (would re-arm the daily-loss
+        // breaker, lose track of in-flight orders).
+        let (state, orders) = if let crate::persistence::StateBacking::Persistent { path } =
+            &config.state_backing
+        {
+            if let Some(snap) = crate::persistence::load(path).map_err(SpawnError::State)? {
+                let count = snap.orders.len();
+                info!(?path, orders = count, "oms state loaded from snapshot");
+                crate::persistence::rehydrate(snap, std::time::Instant::now())
+            } else {
+                info!(?path, "oms state path empty; starting fresh");
+                (AccountState::new(), HashMap::new())
+            }
+        } else {
+            (AccountState::new(), HashMap::new())
+        };
+
         let oms = Self {
             config,
             risk,
             executor,
-            state: AccountState::new(),
-            orders: HashMap::new(),
+            state,
+            orders,
             cid_alloc,
         };
         let task = tokio::spawn(run_task(oms, cmd_rx, reports, event_tx));
@@ -365,6 +405,7 @@ async fn run_task<E: Executor>(
                 if oms.handle_report(report, &event_tx).await.is_err() {
                     break;
                 }
+                oms.persist_state();
             }
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else {
@@ -377,6 +418,7 @@ async fn run_task<E: Executor>(
                         if oms.handle_command(other, &event_tx).await.is_err() {
                             break;
                         }
+                        oms.persist_state();
                     }
                 }
             }
@@ -388,6 +430,29 @@ async fn run_task<E: Executor>(
 /// Sentinel: event channel was closed by the consumer. Shut down rather
 /// than spin against `event_tx.send()`.
 struct EventChannelClosed;
+
+impl<E: Executor> Oms<E> {
+    /// Snapshot account + orders to disk if `state_backing` is
+    /// configured for persistence. Called after every mutation
+    /// (submit, ack, fill, cancel, kill-switch arm, reconcile).
+    ///
+    /// IO failures are logged but don't propagate — the in-memory
+    /// state is the live source of truth, and a write that fails
+    /// once is likely to fail again on the next mutation, so
+    /// surfacing it noisily without crashing the OMS task is the
+    /// right trade-off. Production deploys should monitor for the
+    /// `state snapshot save failed` warning.
+    fn persist_state(&self) {
+        let crate::persistence::StateBacking::Persistent { path } = &self.config.state_backing
+        else {
+            return;
+        };
+        let snap = crate::persistence::snapshot(&self.state, &self.orders);
+        if let Err(e) = crate::persistence::save(path, &snap) {
+            warn!(error = %e, ?path, "state snapshot save failed; in-memory state still authoritative");
+        }
+    }
+}
 
 impl<E: Executor> Oms<E> {
     async fn handle_command(

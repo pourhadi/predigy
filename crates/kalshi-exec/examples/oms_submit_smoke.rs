@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
         OmsConfig {
             strategy_id: "oms-smoke".into(),
             cid_backing: CidBacking::InMemory { start_seq: 0 },
+            state_backing: predigy_oms::StateBacking::InMemory,
         },
         RiskEngine::new(limits),
         executor,

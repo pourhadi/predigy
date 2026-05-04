@@ -97,6 +97,7 @@ fn build_pipeline() -> (
         OmsConfig {
             strategy_id: "arb".into(),
             cid_backing: predigy_oms::CidBacking::InMemory { start_seq: 0 },
+            state_backing: predigy_oms::StateBacking::InMemory,
         },
         RiskEngine::new(permissive_limits()),
         executor,

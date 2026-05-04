@@ -91,6 +91,11 @@ struct Args {
 
     #[arg(long)]
     cid_store: Option<PathBuf>,
+
+    /// Path to a JSON file the OMS snapshots its state to. See
+    /// `arb-trader --help` for details.
+    #[arg(long)]
+    oms_state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -152,6 +157,12 @@ async fn main() -> Result<()> {
         warn!("no --cid-store; cids reset on every run");
         CidBacking::InMemory { start_seq: 0 }
     };
+    let state_backing = if let Some(path) = &args.oms_state {
+        predigy_oms::StateBacking::Persistent { path: path.clone() }
+    } else {
+        warn!("no --oms-state; daily-pnl + kill-switch + orders reset on every run");
+        predigy_oms::StateBacking::InMemory
+    };
 
     let (executor, reports) = RestExecutor::spawn(
         rest,
@@ -165,6 +176,7 @@ async fn main() -> Result<()> {
         OmsConfig {
             strategy_id: args.strategy_id.clone(),
             cid_backing,
+            state_backing,
         },
         RiskEngine::new(limits),
         executor,
