@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "crates/core",
+    "crates/book",
+    "crates/kalshi-rest",
 ]
 
 [workspace.package]
@@ -26,10 +28,20 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 
 [workspace.dependencies]
+predigy-core = { path = "crates/core" }
+predigy-book = { path = "crates/book" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "gzip"] }
+url = "2"
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [profile.release]
 opt-level = 3
