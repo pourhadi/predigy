@@ -22,7 +22,7 @@
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
 | 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
-| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | 🟡 In progress (`risk` + `oms` + `kalshi-exec` (REST) done; FIX-flavoured exec + `arb-trader` pending) |
+| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ✅ Done (logic): `risk` + `oms` + `kalshi-exec` (REST) + `arb-trader`. Live shake-down with real capital is the open item. FIX-flavoured exec deferred to MM phase. |
 | 3 | Backtester + sim | ⬜ Not started |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k) |
 | 5 | Cross-venue signal arb (primary engine) | ⬜ Not started |
@@ -187,28 +187,51 @@ predigy/
 │                                      drives Filled+PositionUpdated;
 │                                      cancel emits Cancelled; submit
 │                                      failure (4xx) leaves zero state.
-└── bin/                               ✅ Phase 1 part 4
-    └── md-recorder/
-        ├── src/
-        │   ├── lib.rs                 module roots + re-exports
-        │   ├── recorded.rs            on-disk NDJSON schema (versioned), with a
-        │   │                          synthetic RestResync event the recorder
-        │   │                          injects after a Gap-triggered REST fetch
-        │   ├── recorder.rs            Recorder<P: SnapshotProvider> — drains the
-        │   │                          kalshi-md Connection, writes one NDJSON
-        │   │                          line per event, applies snapshot/delta to
-        │   │                          a per-market OrderBook, on Gap pulls a
-        │   │                          fresh snapshot via P and emits RestResync,
-        │   │                          on Reconnected forces a resync per market
-        │   └── main.rs                CLI (clap): --output, --market…,
-        │                              --kalshi-key-id, --kalshi-pem; SIGINT for
-        │                              graceful shutdown; tracing-subscriber logs
-        └── tests/
-            └── replay_vs_recorder.rs  Phase 1 acceptance: drive recorder
-                                       through subscribe→snapshot→delta→
-                                       gap-induced resync; replay the NDJSON;
-                                       assert replayed book ≡ recorder's
-                                       in-memory book
+└── bin/
+    ├── md-recorder/                   ✅ Phase 1 part 4
+    │   ├── src/
+    │   │   ├── lib.rs                 module roots + re-exports
+    │   │   ├── recorded.rs            on-disk NDJSON schema (versioned), with a
+    │   │   │                          synthetic RestResync event the recorder
+    │   │   │                          injects after a Gap-triggered REST fetch
+    │   │   ├── recorder.rs            Recorder<P: SnapshotProvider> — drains the
+    │   │   │                          kalshi-md Connection, writes one NDJSON
+    │   │   │                          line per event, applies snapshot/delta to
+    │   │   │                          a per-market OrderBook, on Gap pulls a
+    │   │   │                          fresh snapshot via P and emits RestResync,
+    │   │   │                          on Reconnected forces a resync per market
+    │   │   └── main.rs                CLI (clap): --output, --market…,
+    │   │                              --kalshi-key-id, --kalshi-pem; SIGINT for
+    │   │                              graceful shutdown; tracing-subscriber logs
+    │   └── tests/
+    │       └── replay_vs_recorder.rs  Phase 1 acceptance: drive recorder
+    │                                  through subscribe→snapshot→delta→
+    │                                  gap-induced resync; replay the NDJSON;
+    │                                  assert replayed book ≡ recorder's
+    │                                  in-memory book
+    └── arb-trader/                    ✅ Phase 2 part 4
+        └── src/
+            ├── lib.rs                 module roots + re-exports
+            ├── strategy.rs            ArbStrategy + ArbConfig:
+            │                          detects when 100¢ - yes_ask - no_ask
+            │                          - taker_fee(both) >= min_edge_cents,
+            │                          caps size at thinnest leg's touch qty,
+            │                          enforces a per-market cooldown.
+            │                          ArbOpportunity carries the per-pair
+            │                          and total edge for logging even when
+            │                          the strategy chooses not to fire.
+            ├── runner.rs              Runner: single tokio task, single
+            │                          select! over md.next_event +
+            │                          oms.next_event + stop. Submits IOC
+            │                          pairs; logs OMS lifecycle events
+            │                          (Acked/Filled/PositionUpdated/...).
+            │                          Drops the local book on WS sequence
+            │                          gap and waits for a fresh snapshot.
+            └── main.rs                CLI (clap): --market…,
+                                       --kalshi-key-id, --kalshi-pem,
+                                       per-market + account risk caps,
+                                       --min-edge-cents, --size-per-pair,
+                                       --cooldown-ms, --dry-run.
 ```
 
 ## Test counts
@@ -244,8 +267,16 @@ predigy-kalshi-exec 15 tests   (12 unit: Yes/No mapping (4 cases) including
 md-recorder         5 tests   (4 unit: RecordedEvent round-trips for
                                 snapshot/delta/rest_resync + schema tag;
                                 1 integration: Phase 1 acceptance)
+arb-trader          8 tests   (strategy: balanced market → no arb;
+                                meaningful edge detected w/ correct math;
+                                intents are Buy YES + Buy NO at the
+                                derived asks; size capped by thinnest
+                                leg; cooldown blocks repeat then expires;
+                                marginal opportunity blocked by fees;
+                                empty book side → no arb;
+                                reset_cooldown clears throttle)
                    ─────────
-                  137 tests   (+ 4 doctests)
+                  145 tests   (+ 4 doctests)
 ```
 
 CI gates (run by `.github/workflows/ci.yml` on push to `main` /
@@ -321,25 +352,31 @@ CI gates (run by `.github/workflows/ci.yml` on push to `main` /
 
 ## Next chunk to build
 
-Phase 2 in flight. `risk`, `oms`, and `kalshi-exec` (REST flavour)
-are in. The remaining pieces:
+Phase 2 logic is complete. Remaining items before declaring Phase 2
+"done in production":
 
-1. `bin/arb-trader/` — first live strategy: static intra-venue arb
-   (`YES + NO < $1` minus fees). Smallest blast radius for shaking
-   down the OMS+exec+risk path together. This is the next chunk.
-2. `crates/kalshi-fix/` (or `kalshi-exec` with a FIX feature flag) —
-   FIX 4.4 variant of the Executor (logon / heartbeat /
-   NewOrderSingle / OrderCancelRequest / ExecutionReport /
-   OrderMassCancelRequest). Needed for market-making (Phase 4) where
-   sub-millisecond fill latency matters; REST is fine for the
-   intra-venue arb strategy that lands first.
-3. Parallel: live shake-down of `md-recorder` against the production
-   Kalshi endpoint (Phase 1's last open item).
-4. Phase-2 hardening (after the arb-trader binary lands):
+1. **Live shake-down of `arb-trader`** with a real Kalshi key and a
+   small capital cap (per the plan: $500). Verify OMS reconciles to
+   $0.00, no orphan orders, positive-or-flat PnL after fees over a
+   one-week window.
+2. **Live shake-down of `md-recorder`** against the production
+   endpoints (Phase 1's open item — same blocker, same shake-down).
+3. **Phase-2 hardening** (do these after a clean week of live trading
+   so the priorities are informed by what actually breaks):
    - Durable cid sequence storage so cids never repeat across restarts.
-   - Mass-cancel wiring on kill-switch arm (REST path or FIX `35=q`).
+   - Mass-cancel wiring on kill-switch arm. REST batch-cancel exists
+     today; the FIX `OrderMassCancelRequest` (35=q) lands with the
+     FIX exec.
    - Persistent OMS state (`sqlx`/Postgres) per the plan.
-   - Order amend (Kalshi `OrderCancelReplaceRequest`).
+   - Order amend (`OrderCancelReplaceRequest`).
+4. **`crates/kalshi-fix`** (or `kalshi-exec` with a FIX feature flag)
+   — FIX 4.4 variant of the `oms::Executor`. Required before the
+   Phase 4 market-making strategy where fill latency matters.
+   `arb-trader` does not need it.
+
+After that, Phase 3: `crates/sim` — event-driven replay of recorded
+parquet, naïve queue-position model. Strategies must run unchanged
+in sim and live (same `Strategy` interface, same `Intent` outputs).
 
 ## Build / run
 
@@ -359,9 +396,10 @@ cargo run -p predigy-kalshi-rest --example smoke
 
 | SHA (short) | Subject |
 |---|---|
-| _pending_ | Add `predigy-kalshi-exec` (REST executor) — Phase 2, part 3 |
-| _pending_ | Add `predigy-oms` (order management state machine) — Phase 2, part 2 |
-| _pending_ | Add `predigy-risk` (pre-trade limits + breakers) — Phase 2, part 1 |
+| _pending_ | Add `bin/arb-trader` (intra-venue arb, first live strategy) — Phase 2, part 4 |
+| `b931435` | Merge PR #8: `predigy-kalshi-exec` (REST executor) — Phase 2, part 3 |
+| `07a48d7` | Merge PR #7: `predigy-oms` (order management state machine) — Phase 2, part 2 |
+| `1c1e848` | Merge PR #6: `predigy-risk` (pre-trade limits + breakers) — Phase 2, part 1 |
 | `bb1b072` | Merge PR #4: `predigy-poly-md` (Polymarket WS reference client) |
 | `efe0c1f` | Merge PR #5: `bin/md-recorder` (NDJSON recorder w/ REST resync) — Phase 1, part 4 |
 | `df6bb53` | Merge PR #3: `predigy-kalshi-md` (Kalshi WS client) |
