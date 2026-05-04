@@ -11,6 +11,8 @@ members = [
     "crates/kalshi-exec",
     "crates/kalshi-fix",
     "crates/sim",
+    "crates/ext-feeds",
+    "crates/signals",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -48,6 +50,8 @@ predigy-oms = { path = "crates/oms" }
 predigy-kalshi-exec = { path = "crates/kalshi-exec" }
 predigy-sim = { path = "crates/sim" }
 predigy-poly-md = { path = "crates/poly-md" }
+predigy-ext-feeds = { path = "crates/ext-feeds" }
+predigy-signals = { path = "crates/signals" }
 predigy-kalshi-fix = { path = "crates/kalshi-fix" }
 md-recorder = { path = "bin/md-recorder" }
 

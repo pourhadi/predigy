@@ -26,8 +26,8 @@
 | 3 | Backtester + sim | ✅ (logic): `predigy-sim` with IOC SimExecutor + NDJSON Replay + queue-position module for resting orders + `bin/sim-runner` CLI. Queue model integration into SimExecutor pending. |
 | 4 | Market making + rebate capture | ⬜ Deferred (≥$25k). FIX exec ready when MM lands. |
 | 5 | Cross-venue signal arb (primary engine) | ✅ (logic): `bin/cross-arb-trader`. Stat-arb on Kalshi vs Polymarket reference; live shake-down pending. |
-| 6 | News/data latency (free feeds first) | ⬜ Not started |
-| 7 | Statistical / model alpha | ⬜ Not started |
+| 6 | News/data latency (free feeds first) | 🟡 In progress (`predigy-ext-feeds` with NWS active-alerts polling client + Feed-trait scaffolding; `latency-trader` binary pending) |
+| 7 | Statistical / model alpha | 🟡 In progress (`predigy-signals` with Beta-Binomial Bayes posterior, Elo rating, Kelly-fraction sizing; `stat-trader` binary pending) |
 | 8 | Hardening & scaling | ⬜ Ongoing |
 
 ## What's in the repo right now
