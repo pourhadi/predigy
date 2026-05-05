@@ -96,6 +96,16 @@ struct Args {
     /// `arb-trader --help` for details.
     #[arg(long)]
     oms_state: Option<PathBuf>,
+
+    /// Path to a JSON file storing the NWS seen-alert-id set.
+    /// Required for any 24/7 deployment that restarts: without
+    /// it, a restart re-emits every currently-active NWS alert
+    /// to the strategy, which then re-fires every rule that
+    /// matched in the prior session. With it, alert ids persist
+    /// across restarts and the strategy only sees genuinely-new
+    /// alerts.
+    #[arg(long)]
+    nws_seen: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -191,11 +201,18 @@ async fn main() -> Result<()> {
     // book state at fire time.
     let _ = (&args.kalshi_ws_endpoint, std::any::type_name::<MdClient>());
 
+    if args.nws_seen.is_none() {
+        warn!(
+            "no --nws-seen; restarts will re-emit every active alert and re-fire any rule \
+             that already fired in the prior session"
+        );
+    }
     let nws_config = NwsAlertsConfig {
         states: args.nws_states.clone(),
         poll_interval: Duration::from_millis(args.nws_poll_ms).max(MIN_POLL_INTERVAL),
         user_agent: args.nws_user_agent.clone(),
         base_url: None,
+        seen_path: args.nws_seen.clone(),
     };
     let (mut nws_rx, _nws_task) = spawn_nws(nws_config).map_err(|e| anyhow!("nws spawn: {e}"))?;
     info!(states = ?args.nws_states, dry_run = args.dry_run, "latency-trader: nws subscribed");
