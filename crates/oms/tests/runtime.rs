@@ -620,6 +620,6 @@ async fn persistent_state_survives_restart() {
         .submit(sell_yes("KX-PERSIST", 50, 5))
         .await
         .expect("sell of resumed position passes risk");
-    let _executor_unused = executor; // executor's tracking is process-local; clearer than `let _ =`
+    drop(executor); // explicit drop — first executor's tracking is process-local
     oms2.close().await;
 }

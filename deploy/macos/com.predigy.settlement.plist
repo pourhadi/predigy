@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Settlement-time strategy daemon. Long-running. KeepAlive on
+         crash. ThrottleInterval 30 s.
+         Disabled by default — `Disabled=true` until you author
+         ~/.config/predigy/settlement-markets.txt. -->
+    <key>Label</key>
+    <string>com.predigy.settlement</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/settlement-run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Disabled until you write the markets file. To enable:
+         write $HOME/.config/predigy/settlement-markets.txt with one
+         Kalshi ticker per line, then re-run install-launchd.sh and
+         remove this Disabled key. -->
+    <key>Disabled</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/settlement.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/settlement.stderr.log</string>
+</dict>
+</plist>
