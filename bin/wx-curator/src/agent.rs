@@ -50,6 +50,13 @@ pub struct CuratedRule {
     pub event_substring: String,
     #[serde(default)]
     pub area_substring: Option<String>,
+    /// 2-letter state codes the alert must be in for this rule to
+    /// fire. For state-bound markets (city temperature markets,
+    /// hurricane-hits-X markets), Claude emits a single-element
+    /// list. Multi-state markets (regional hurricane paths) get a
+    /// multi-element list. National markets leave it empty.
+    #[serde(default)]
+    pub required_states: Vec<String>,
     pub min_severity: String,
     pub side: String,
     pub max_price_cents: u8,
@@ -148,9 +155,17 @@ impl CuratedRule {
         if self.event_substring.is_empty() {
             return Err("event_substring empty".into());
         }
+        // Defensive: drop any non-2-uppercase state codes Claude
+        // might have hallucinated (`"USA"`, `"All"`, etc.).
+        let required_states: Vec<String> = self
+            .required_states
+            .into_iter()
+            .filter(|s| s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase()))
+            .collect();
         Ok(LatencyRule {
             event_substring: self.event_substring,
             area_substring: self.area_substring,
+            required_states,
             min_severity,
             kalshi_market: MarketTicker::new(&self.market_ticker),
             side,
@@ -279,7 +294,8 @@ mod tests {
             market_ticker: "KX-T".into(),
             reasoning: "test".into(),
             event_substring: "Tornado".into(),
-            area_substring: Some("TX".into()),
+            area_substring: None,
+            required_states: vec!["TX".into()],
             min_severity: severity.into(),
             side: side.into(),
             max_price_cents: price,
@@ -317,7 +333,8 @@ mod tests {
             market_ticker: market.into(),
             reasoning: "test".into(),
             event_substring: event.into(),
-            area_substring: Some("TX".into()),
+            area_substring: None,
+            required_states: vec!["TX".into()],
             min_severity: "Severe".into(),
             side: side.into(),
             max_price_cents: 30,

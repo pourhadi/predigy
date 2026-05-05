@@ -229,6 +229,17 @@ async fn main() -> Result<()> {
                             Err(e) => warn!(%e, "latency-trader: submit rejected"),
                         }
                     }
+                } else {
+                    // Visibility for dry-run shake-downs: knowing
+                    // *what* arrived even when nothing fired tells
+                    // the operator whether the rule set is too
+                    // narrow vs the feed is dry.
+                    info!(
+                        event = %alert.event_type,
+                        area = %alert.area_desc,
+                        severity = %alert.severity,
+                        "latency-trader: alert ignored (no matching rule)"
+                    );
                 }
             }
             ev = oms.next_event() => {

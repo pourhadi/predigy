@@ -86,6 +86,14 @@ pub struct NwsAlert {
     pub urgency: String,
     /// Free-text human-readable area (e.g. `"Travis, TX; Hays, TX"`).
     pub area_desc: String,
+    /// 2-letter state codes (`"TX"`, `"CO"`) extracted from the
+    /// alert's `geocode.UGC` entries — each UGC code is
+    /// `<ST><Z|C><digits>`, e.g. `"NMZ028"` (New Mexico Zone 028)
+    /// or `"TXC013"` (Texas County 013). Sorted, deduped.
+    /// Structurally reliable: every NWS alert has at least one UGC.
+    /// Use this for state-level rule filtering — `area_desc` is a
+    /// human-readable list with inconsistent state-code suffixes.
+    pub states: Vec<String>,
     /// ISO-8601 timestamp when the alert was issued.
     pub effective: Option<String>,
     /// ISO-8601 timestamp when the event begins (may equal `effective`).
@@ -122,6 +130,10 @@ pub struct AlertProperties {
     pub urgency: Option<String>,
     #[serde(default, rename = "areaDesc")]
     pub area_desc: Option<String>,
+    /// `geocode` block — UGC and SAME codes for affected zones /
+    /// counties. We pull state codes out of UGC (`<ST><Z|C>...`).
+    #[serde(default)]
+    pub geocode: AlertGeocode,
     #[serde(default)]
     pub effective: Option<String>,
     #[serde(default)]
@@ -132,24 +144,131 @@ pub struct AlertProperties {
     pub headline: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct AlertGeocode {
+    /// e.g. `["NMZ028", "TXC013"]`. First 2 chars = state code.
+    #[serde(default, rename = "UGC")]
+    pub ugc: Vec<String>,
+    /// FIPS 6-digit codes; first 2 = state FIPS. Backup source if
+    /// UGC is empty.
+    #[serde(default, rename = "SAME")]
+    pub same: Vec<String>,
+}
+
 impl AlertFeature {
     fn into_alert(self) -> Option<NwsAlert> {
         let id = self.properties.id.clone().unwrap_or(self.id);
         if id.is_empty() {
             return None;
         }
+        let states = extract_states(&self.properties.geocode);
         Some(NwsAlert {
             id,
             event_type: self.properties.event.unwrap_or_else(|| "Unknown".into()),
             severity: self.properties.severity.unwrap_or_else(|| "Unknown".into()),
             urgency: self.properties.urgency.unwrap_or_else(|| "Unknown".into()),
             area_desc: self.properties.area_desc.unwrap_or_default(),
+            states,
             effective: self.properties.effective,
             onset: self.properties.onset,
             expires: self.properties.expires,
             headline: self.properties.headline,
         })
     }
+}
+
+/// Extract sorted, deduped 2-letter state codes from a `geocode`
+/// block. Prefers UGC (alphabetic prefix); falls back to SAME if
+/// UGC is empty (numeric FIPS, mapped via [`fips_to_state`]).
+pub fn extract_states(g: &AlertGeocode) -> Vec<String> {
+    let mut states: std::collections::BTreeSet<String> = g
+        .ugc
+        .iter()
+        .filter_map(|c| {
+            let s = c.get(..2)?;
+            if s.bytes().all(|b| b.is_ascii_uppercase()) {
+                Some(s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if states.is_empty() {
+        // SAME format is `PSSCCC` — a 1-char prefix (0 for civil,
+        // 1 for marine) followed by 2-digit state FIPS and 3-digit
+        // county. Read positions 1..3 to skip the prefix.
+        states.extend(g.same.iter().filter_map(|c| {
+            if c.len() != 6 {
+                return None;
+            }
+            fips_to_state(&c[1..3]).map(str::to_string)
+        }));
+    }
+    states.into_iter().collect()
+}
+
+/// FIPS state codes → 2-letter postal codes. Covers the 50 states
+/// + DC + the 5 territories NWS routinely emits alerts for.
+fn fips_to_state(fips: &str) -> Option<&'static str> {
+    Some(match fips {
+        "01" => "AL",
+        "02" => "AK",
+        "04" => "AZ",
+        "05" => "AR",
+        "06" => "CA",
+        "08" => "CO",
+        "09" => "CT",
+        "10" => "DE",
+        "11" => "DC",
+        "12" => "FL",
+        "13" => "GA",
+        "15" => "HI",
+        "16" => "ID",
+        "17" => "IL",
+        "18" => "IN",
+        "19" => "IA",
+        "20" => "KS",
+        "21" => "KY",
+        "22" => "LA",
+        "23" => "ME",
+        "24" => "MD",
+        "25" => "MA",
+        "26" => "MI",
+        "27" => "MN",
+        "28" => "MS",
+        "29" => "MO",
+        "30" => "MT",
+        "31" => "NE",
+        "32" => "NV",
+        "33" => "NH",
+        "34" => "NJ",
+        "35" => "NM",
+        "36" => "NY",
+        "37" => "NC",
+        "38" => "ND",
+        "39" => "OH",
+        "40" => "OK",
+        "41" => "OR",
+        "42" => "PA",
+        "44" => "RI",
+        "45" => "SC",
+        "46" => "SD",
+        "47" => "TN",
+        "48" => "TX",
+        "49" => "UT",
+        "50" => "VT",
+        "51" => "VA",
+        "53" => "WA",
+        "54" => "WV",
+        "55" => "WI",
+        "56" => "WY",
+        "60" => "AS",
+        "66" => "GU",
+        "69" => "MP",
+        "72" => "PR",
+        "78" => "VI",
+        _ => return None,
+    })
 }
 
 /// Spawn the polling task. Returns the receiver half of an
@@ -181,11 +300,30 @@ async fn run(client: reqwest::Client, config: NwsAlertsConfig, tx: mpsc::Sender<
         }
         match fetch_alerts(&client, &url).await {
             Ok(alerts) => {
+                let total = alerts.len();
+                let mut new_count = 0u32;
                 for alert in alerts {
-                    if seen.insert(alert.id.clone()) && tx.send(alert).await.is_err() {
-                        debug!("nws-alerts: receiver dropped mid-batch; exiting");
-                        return;
+                    if seen.insert(alert.id.clone()) {
+                        new_count += 1;
+                        debug!(
+                            id = %alert.id, event = %alert.event_type,
+                            severity = %alert.severity,
+                            area = %alert.area_desc,
+                            "nws-alerts: new alert"
+                        );
+                        if tx.send(alert).await.is_err() {
+                            debug!("nws-alerts: receiver dropped mid-batch; exiting");
+                            return;
+                        }
                     }
+                }
+                if new_count > 0 || total > 0 {
+                    info!(
+                        new = new_count,
+                        total_active = total,
+                        seen_lifetime = seen.len(),
+                        "nws-alerts: poll"
+                    );
                 }
             }
             Err(e) => {
@@ -200,9 +338,11 @@ fn build_url(config: &NwsAlertsConfig) -> String {
     if config.states.is_empty() {
         base.to_string()
     } else {
-        // NWS accepts repeated `area=XX` query params for multiple states.
-        let params: Vec<String> = config.states.iter().map(|s| format!("area={s}")).collect();
-        format!("{base}?{}", params.join("&"))
+        // NWS expects a single comma-separated `area` param for
+        // multiple states, not repeated query params. (Repeated
+        // `?area=A&area=B` syntax silently drops everything but
+        // one of them — empirically returns many fewer alerts.)
+        format!("{base}?area={}", config.states.join(","))
     }
 }
 
@@ -254,6 +394,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_states_pulls_2letter_prefix_from_ugc() {
+        let g = AlertGeocode {
+            ugc: vec!["NMZ028".into(), "TXC013".into(), "NMZ029".into()],
+            same: vec![],
+        };
+        let s = extract_states(&g);
+        assert_eq!(s, vec!["NM".to_string(), "TX".to_string()]); // sorted, deduped
+    }
+
+    #[test]
+    fn extract_states_falls_back_to_same_when_ugc_empty() {
+        let g = AlertGeocode {
+            ugc: vec![],
+            same: vec!["048109".into(), "017013".into()], // TX, IL
+        };
+        let s = extract_states(&g);
+        assert_eq!(s, vec!["IL".to_string(), "TX".to_string()]);
+    }
+
+    #[test]
+    fn extract_states_drops_garbled_codes() {
+        let g = AlertGeocode {
+            ugc: vec!["12X034".into(), "ZZZ".into(), "OKZ123".into()],
+            same: vec![],
+        };
+        let s = extract_states(&g);
+        // "12X" rejected (digits in prefix), "ZZ" accepted (valid
+        // postal-style 2-uppercase prefix even if not real), "OK"
+        // accepted.
+        assert!(s.contains(&"OK".to_string()));
+        assert!(!s.contains(&"12".to_string()));
+    }
+
+    #[test]
     fn validate_rejects_empty_user_agent() {
         let mut c = cfg();
         c.user_agent = String::new();
@@ -296,10 +470,19 @@ mod tests {
     }
 
     #[test]
-    fn build_url_repeats_area_per_state() {
+    fn build_url_uses_comma_separated_areas() {
         let mut c = cfg();
         c.states = vec!["TX".into(), "CA".into()];
-        assert_eq!(build_url(&c), format!("{DEFAULT_BASE}?area=TX&area=CA"));
+        // NWS treats `?area=TX&area=CA` as a single area (last
+        // wins), so we must use comma-separated form.
+        assert_eq!(build_url(&c), format!("{DEFAULT_BASE}?area=TX,CA"));
+    }
+
+    #[test]
+    fn build_url_single_state_uses_simple_form() {
+        let mut c = cfg();
+        c.states = vec!["TX".into()];
+        assert_eq!(build_url(&c), format!("{DEFAULT_BASE}?area=TX"));
     }
 
     #[test]
