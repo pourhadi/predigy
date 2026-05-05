@@ -351,20 +351,19 @@ impl<E: Executor + 'static> Oms<E> {
         // bail loudly so the operator notices rather than the OMS
         // silently restarting from zero (would re-arm the daily-loss
         // breaker, lose track of in-flight orders).
-        let (state, orders) = if let crate::persistence::StateBacking::Persistent { path } =
-            &config.state_backing
-        {
-            if let Some(snap) = crate::persistence::load(path).map_err(SpawnError::State)? {
-                let count = snap.orders.len();
-                info!(?path, orders = count, "oms state loaded from snapshot");
-                crate::persistence::rehydrate(snap, std::time::Instant::now())
+        let (state, orders) =
+            if let crate::persistence::StateBacking::Persistent { path } = &config.state_backing {
+                if let Some(snap) = crate::persistence::load(path).map_err(SpawnError::State)? {
+                    let count = snap.orders.len();
+                    info!(?path, orders = count, "oms state loaded from snapshot");
+                    crate::persistence::rehydrate(snap, std::time::Instant::now())
+                } else {
+                    info!(?path, "oms state path empty; starting fresh");
+                    (AccountState::new(), HashMap::new())
+                }
             } else {
-                info!(?path, "oms state path empty; starting fresh");
                 (AccountState::new(), HashMap::new())
-            }
-        } else {
-            (AccountState::new(), HashMap::new())
-        };
+            };
 
         let oms = Self {
             config,

@@ -46,6 +46,19 @@ pub struct NwsAlertsConfig {
     pub user_agent: String,
     /// Override the base URL (testing / sandbox).
     pub base_url: Option<String>,
+    /// Optional path for persisting the seen-alert-id set across
+    /// process restarts. Without this, every restart re-emits all
+    /// currently-active alerts as "new", causing the strategy
+    /// layer to re-fire any rule that already fired in the prior
+    /// session. Required for any 24/7 deployment that restarts
+    /// (e.g. daily for fresh rules from `wx-curator`).
+    ///
+    /// Format: a single JSON file `{"ids": ["urn:oid:...", ...]}`
+    /// rewritten via tmp + `rename` after each poll cycle that
+    /// observed new alerts. Bounded by NWS retention — alerts
+    /// drop out of the active feed when they expire, so the file
+    /// is also pruned to alerts still active at write time.
+    pub seen_path: Option<std::path::PathBuf>,
 }
 
 impl NwsAlertsConfig {
@@ -271,6 +284,41 @@ fn fips_to_state(fips: &str) -> Option<&'static str> {
     })
 }
 
+/// On-disk shape of the seen-id set.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+struct SeenFile {
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
+fn load_seen(path: &std::path::Path) -> Result<HashSet<String>, std::io::Error> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(e),
+    };
+    let f: SeenFile = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(f.ids.into_iter().collect())
+}
+
+fn save_seen(path: &std::path::Path, seen: &HashSet<String>) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut ids: Vec<&str> = seen.iter().map(String::as_str).collect();
+    ids.sort_unstable(); // byte-stable file
+    let f = SeenFile {
+        ids: ids.into_iter().map(str::to_string).collect(),
+    };
+    let bytes = serde_json::to_vec(&f)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Spawn the polling task. Returns the receiver half of an
 /// `mpsc::channel`; the task aborts on drop of the returned
 /// `JoinHandle`.
@@ -287,7 +335,20 @@ pub fn spawn(config: NwsAlertsConfig) -> Result<(mpsc::Receiver<NwsAlert>, JoinH
 
 async fn run(client: reqwest::Client, config: NwsAlertsConfig, tx: mpsc::Sender<NwsAlert>) {
     let url = build_url(&config);
-    let mut seen: HashSet<String> = HashSet::new();
+    let seen_path = config.seen_path.clone();
+    let mut seen: HashSet<String> = match seen_path.as_ref() {
+        Some(p) => match load_seen(p) {
+            Ok(s) => {
+                info!(?p, count = s.len(), "nws-alerts: seen-set loaded");
+                s
+            }
+            Err(e) => {
+                warn!(?p, error = %e, "nws-alerts: seen-set load failed; starting empty");
+                HashSet::new()
+            }
+        },
+        None => HashSet::new(),
+    };
     info!(url = %url, ?config.poll_interval, "nws-alerts: polling");
     let mut tick = tokio::time::interval(config.poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -302,6 +363,8 @@ async fn run(client: reqwest::Client, config: NwsAlertsConfig, tx: mpsc::Sender<
             Ok(alerts) => {
                 let total = alerts.len();
                 let mut new_count = 0u32;
+                // Snapshot the active alert ids for prune-on-save.
+                let active_ids: HashSet<String> = alerts.iter().map(|a| a.id.clone()).collect();
                 for alert in alerts {
                     if seen.insert(alert.id.clone()) {
                         new_count += 1;
@@ -324,6 +387,26 @@ async fn run(client: reqwest::Client, config: NwsAlertsConfig, tx: mpsc::Sender<
                         seen_lifetime = seen.len(),
                         "nws-alerts: poll"
                     );
+                }
+                // Prune expired ids and persist after each poll
+                // that observed something. Keeping only currently-
+                // active ids bounds the file size to whatever the
+                // active feed holds (typically 100s, never 1000s).
+                if let Some(path) = seen_path.as_ref() {
+                    let before = seen.len();
+                    seen.retain(|id| active_ids.contains(id));
+                    let pruned = before - seen.len();
+                    if let Err(e) = save_seen(path, &seen) {
+                        warn!(?path, error = %e, "nws-alerts: seen-set save failed");
+                    } else if pruned > 0 || new_count > 0 {
+                        debug!(
+                            pruned,
+                            new = new_count,
+                            kept = seen.len(),
+                            ?path,
+                            "nws-alerts: seen-set saved"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -390,7 +473,36 @@ mod tests {
             poll_interval: Duration::from_mins(1),
             user_agent: "test/1.0 (test@example.com)".into(),
             base_url: None,
+            seen_path: None,
         }
+    }
+
+    #[test]
+    fn seen_save_load_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("seen.json");
+        let mut s: HashSet<String> = HashSet::new();
+        s.insert("urn:oid:abc".into());
+        s.insert("urn:oid:def".into());
+        save_seen(&path, &s).unwrap();
+        let back = load_seen(&path).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn seen_load_returns_empty_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("never-written.json");
+        let s = load_seen(&path).unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn seen_load_propagates_corrupt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("corrupt.json");
+        std::fs::write(&path, b"\x00not-json").unwrap();
+        assert!(load_seen(&path).is_err());
     }
 
     #[test]
