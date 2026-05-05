@@ -21,6 +21,7 @@ members = [
     "bin/stat-trader",
     "bin/wx-curator",
     "bin/dashboard",
+    "bin/settlement-trader",
 ]
 
 [workspace.package]

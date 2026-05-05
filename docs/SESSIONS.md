@@ -167,14 +167,21 @@ In rough order of leverage:
    The pairing is `--pair KALSHI_TICKER=POLYMARKET_ASSET_ID`. Run
    in dry-run for a session, look for divergences > 3¢.
 
-3. **Settlement-time sports strategy.** Not built. Design:
-   - Watch sports markets within 5-10 min of `close_time`.
-   - When `yes_bid_size_qty >> yes_ask_size_qty` AND `yes_ask in [90, 97]`
-     AND time-to-close < 5 min → buy YES IOC at touch.
-   - Thesis: liquidity asymmetry near settlement signals the price
-     will move up; lift before it does.
-   - ~400 LOC in `bin/settlement-trader/`. Same OMS/risk wiring
-     as other traders. New strategy_id (e.g. "sett").
+3. **Settlement-time sports strategy.** ✅ Built (PR #24).
+   `bin/settlement-trader` watches sports markets near `close_time`,
+   fires when `yes_ask in [88,96]` AND
+   `bid_stack_qty >= 5 × ask_stack_qty` (book-asymmetry tell).
+   12 unit tests covering all gates + cooldown.
+   Deployment scaffold ready (`com.predigy.settlement.plist`,
+   `Disabled=true`). Activate by:
+   1. Author `~/.config/predigy/settlement-markets.txt` —
+      one Kalshi ticker per line, sports preferred.
+   2. `cargo build --release -p settlement-trader`.
+   3. Edit `Disabled` key out of the plist + run install script.
+   **Live shake-down pending** — try a calm Saturday with NBA
+   playoffs in the final minutes. Dry-run a few sessions before
+   flipping to live; settlement-time strategies are loss-tail-heavy
+   and need real-data validation.
 
 4. **Latency push** — us-east-1 VPS + FIX exec.
    - VPS (Lightsail / Linode $5-15/mo): drops Kalshi RTT from
