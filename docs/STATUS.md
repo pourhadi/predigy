@@ -13,22 +13,40 @@
 | Active strategies (when live) | Cross-venue arb (primary), intra-venue static arb, stat-arb on long-tail |
 | Deferred until ≥$25k | Market making + Kalshi MM designation |
 | Deferred until ≥$50k | AWS Tier B, paid sports/news feeds |
-| Branch | `claude/hft-prediction-market-system-s0rcz` |
+| Branch | `main` |
 | Rust toolchain | stable, edition 2024 |
+| Hosting | macOS laptop (us-east-1 VPS in plan, not yet) |
+| Account funded | Yes — $50 USD, ~$49.85 remaining |
+| Live strategies | `latency-trader` (weather, NWS-driven) |
+| Capital cap (deployed) | $5 account-wide, $2 per side, $2 daily-loss breaker |
 
 ## Phase status
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Plumbing (workspace, core types, fees, lints) | ✅ Done |
-| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done (logic). Live shake-down on a real Kalshi key still open. |
-| 2 | OMS + risk + FIX exec + first live strategy (intra-venue arb) | ✅ Done (logic): `risk` + `oms` (with durable cid + mass-cancel-on-kill) + `kalshi-exec` (REST) + `kalshi-fix` (FIX 4.4) + `arb-trader`. Live shake-down with real capital is the open item. |
-| 3 | Backtester + sim | ✅ (logic): `predigy-sim` with IOC SimExecutor + NDJSON Replay + queue-position module for resting orders + `bin/sim-runner` CLI. Queue model integration into SimExecutor pending. |
-| 4 | Market making + rebate capture | ⬜ Deferred (≥$25k). FIX exec ready when MM lands. |
-| 5 | Cross-venue signal arb (primary engine) | ✅ (logic): `bin/cross-arb-trader`. Stat-arb on Kalshi vs Polymarket reference; live shake-down pending. |
-| 6 | News/data latency (free feeds first) | ✅ (logic): `predigy-ext-feeds` (NWS active-alerts) + `bin/latency-trader` wired through OMS. Live shake-down pending. |
-| 7 | Statistical / model alpha | ✅ (logic): `predigy-signals` (Beta-Binomial / Elo / Kelly) + `bin/stat-trader` wired through OMS. Live shake-down pending. |
-| 8 | Hardening & scaling | ⬜ Ongoing |
+| 1 | Read-only stack: `kalshi-rest`, `book`, `kalshi-md` (WS), `md-recorder`, `poly-md` | ✅ Done + live-shaken (PR #15) |
+| 2 | OMS + risk + FIX exec + first live strategy | ✅ OMS/risk/REST exec live-shaken (PR #15). Persistent OMS state (PR #17). FIX wiring to prod NOT done. |
+| 3 | Backtester + sim | ✅ (logic). Queue-model integration into SimExecutor still pending. |
+| 4 | Market making + rebate capture | ⬜ Deferred (≥$25k). |
+| 5 | Cross-venue signal arb | ✅ (logic): `bin/cross-arb-trader`. Live shake-down still pending. |
+| 6 | News/data latency (free feeds first) | ✅ **LIVE in production**: `predigy-ext-feeds` + `bin/latency-trader` + `bin/wx-curator` (Claude-powered rule curation). NWS seen-set persistence (PR #21). State-filter (PR #19). Daily curate cron via launchd. |
+| 7 | Statistical / model alpha | ✅ (logic). No model rules curated for live use yet. |
+| 8 | Hardening & scaling | 🟡 In progress: macOS launchd deployment (PR #21), mobile dashboard (PR #22), persistent state for OMS + cids + NWS seen-set. Linux/systemd not done. |
+
+## Operational state (today)
+
+Three launchd jobs running on the user's macOS laptop:
+
+| Job | Purpose | Mode |
+|---|---|---|
+| `com.predigy.latency-trader` | NWS → Kalshi weather strategy | **LIVE** |
+| `com.predigy.wx-curate` | Daily 06:30 rule re-curation | scheduled |
+| `com.predigy.dashboard` | HTTP dashboard, port 8080 | running |
+
+Dashboard live at `http://localhost:8080` (or LAN/Tailscale IP for
+mobile). See `docs/RUNBOOK.md` for ops procedures and
+`docs/SESSIONS.md` for the session-handoff orientation.
 
 ## What's in the repo right now
 
@@ -299,6 +317,41 @@ predigy/
                                        per-market + account risk caps,
                                        --min-edge-cents, --size-per-pair,
                                        --cooldown-ms, --dry-run.
+
+# Operational tooling (Phase 8)
+bin/wx-curator/                        ✅ Phase 6 helper
+    src/{lib.rs,main.rs}               clap CLI: scan Kalshi weather series,
+    src/kalshi_scan.rs                 batch markets to Anthropic Messages API
+    src/agent.rs                         (Sonnet 4.6), validate proposed rules
+    src/prompt.rs                        (incl. temperature-direction sanity
+                                       check), atomic-rename JSON output for
+                                       latency-trader's --rule-file.
+                                       Used as a daily 06:30 launchd cron.
+bin/dashboard/                         ✅ Phase 8
+    Cargo.toml                         predigy-dashboard binary
+    src/main.rs                        axum HTTP server on :8080. Reads
+    static/index.html                  Kalshi REST (balance + positions),
+                                       OMS state JSON, latency-trader log.
+                                       Mobile-first dark UI, vanilla CSS+JS,
+                                       /api/state JSON for programmatic use.
+                                       Health pill green if log <90s old.
+
+# Deployment (Phase 8)
+deploy/macos/
+    com.predigy.latency-trader.plist   long-running daemon, KeepAlive on crash
+    com.predigy.wx-curate.plist        StartCalendarInterval 06:30
+    com.predigy.dashboard.plist        long-running, bound 0.0.0.0:8080
+deploy/scripts/
+    install-launchd.sh                 preflight + idempotent install
+    wx-curate.sh                       daily curator wrapper
+    latency-trader-run.sh              trader launcher with persistence
+deploy/README.md                       full operational doc
+
+# Documentation (read these first in a new session)
+docs/SESSIONS.md                       session-handoff orientation
+docs/RUNBOOK.md                        operational procedures
+docs/STATUS.md                         (this file)
+docs/PLAN.md                           full architecture plan
 ```
 
 ## Test counts

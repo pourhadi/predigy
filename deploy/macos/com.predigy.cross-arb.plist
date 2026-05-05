@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Cross-venue arb daemon (Kalshi vs Polymarket reference).
+         Long-running. KeepAlive on crash. ThrottleInterval 30 s.
+         Disabled by default — `Disabled=true` until you author
+         ~/.config/predigy/cross-arb-pairs.txt and run install. -->
+    <key>Label</key>
+    <string>com.predigy.cross-arb</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/cross-arb-run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Disabled until you write the pairs file. The wrapper
+         script will exit non-zero on missing pairs and launchd
+         will log it but not retry indefinitely thanks to
+         ThrottleInterval. To enable: write the pairs file, then
+         install via deploy/scripts/install-launchd.sh (uncomment
+         the cross-arb label there). -->
+    <key>Disabled</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/cross-arb.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/cross-arb.stderr.log</string>
+</dict>
+</plist>
