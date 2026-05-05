@@ -68,9 +68,20 @@ pub struct LatencyRule {
     /// Case.
     pub event_substring: String,
     /// Optional substring matched against `NwsAlert::area_desc`.
-    /// `None` means "any area." NWS area codes look like
-    /// `"Travis, TX; Hays, TX"`.
+    /// `None` means "no substring filter." Use sparingly — NWS
+    /// `area_desc` is human-readable text with inconsistent
+    /// state-code suffixes; structural filtering should go through
+    /// [`required_states`](Self::required_states) instead.
+    #[serde(default)]
     pub area_substring: Option<String>,
+    /// 2-letter state codes the alert must be in for this rule to
+    /// fire. Empty = no state filter (rule fires on alerts in any
+    /// state the operator subscribes to). Matches against
+    /// `NwsAlert::states` via set-intersection: rule fires if at
+    /// least one of `required_states` is in the alert's states.
+    /// Reliable: every NWS alert has a UGC-derived state list.
+    #[serde(default)]
+    pub required_states: Vec<String>,
     /// Minimum severity that triggers this rule.
     pub min_severity: Severity,
     pub kalshi_market: MarketTicker,
@@ -143,6 +154,17 @@ impl LatencyStrategy {
             if !alert.event_type.contains(&rule.event_substring) {
                 continue;
             }
+            // Required-state set intersection: rule fires if any
+            // of its `required_states` is in the alert's states.
+            // Empty `required_states` = no filter.
+            if !rule.required_states.is_empty()
+                && !rule
+                    .required_states
+                    .iter()
+                    .any(|s| alert.states.iter().any(|a| a == s))
+            {
+                continue;
+            }
             if let Some(area_filter) = &rule.area_substring
                 && !alert.area_desc.contains(area_filter)
             {
@@ -178,12 +200,17 @@ mod tests {
     use super::*;
 
     fn alert(event: &str, area: &str, severity: &str) -> NwsAlert {
+        alert_in(event, area, severity, &["TX"])
+    }
+
+    fn alert_in(event: &str, area: &str, severity: &str, states: &[&str]) -> NwsAlert {
         NwsAlert {
             id: "test".into(),
             event_type: event.into(),
             severity: severity.into(),
             urgency: "Immediate".into(),
             area_desc: area.into(),
+            states: states.iter().map(|s| (*s).to_string()).collect(),
             effective: None,
             onset: None,
             expires: None,
@@ -195,6 +222,7 @@ mod tests {
         LatencyRule {
             event_substring: event.into(),
             area_substring: area.map(String::from),
+            required_states: Vec::new(),
             min_severity: sev,
             kalshi_market: MarketTicker::new("WX-TX"),
             side: Side::Yes,
@@ -250,6 +278,52 @@ mod tests {
     }
 
     #[test]
+    fn required_states_blocks_alert_in_other_state() {
+        let mut r = rule("Tornado", None, Severity::Moderate);
+        r.required_states = vec!["TX".into()];
+        let mut s = LatencyStrategy::new(vec![r]);
+        // Alert is in IL (Severe Thunderstorm), our rule wants TX.
+        assert!(
+            s.evaluate(&alert_in(
+                "Tornado Warning",
+                "Macoupin, IL; Madison, IL",
+                "Severe",
+                &["IL"]
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn required_states_fires_when_alert_overlaps() {
+        let mut r = rule("Tornado", None, Severity::Moderate);
+        r.required_states = vec!["TX".into(), "OK".into()];
+        let mut s = LatencyStrategy::new(vec![r]);
+        // Multi-state alert spanning TX and KS — TX overlaps the
+        // rule's required set.
+        assert!(
+            s.evaluate(&alert_in(
+                "Tornado Warning",
+                "Travis, TX; Bell, TX; Cherokee, KS",
+                "Severe",
+                &["TX", "KS"]
+            ))
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn required_states_empty_means_no_filter() {
+        // Default behaviour: rules built via `rule()` have empty
+        // required_states; an alert in any state should fire.
+        let mut s = LatencyStrategy::new(vec![rule("Tornado", None, Severity::Moderate)]);
+        assert!(
+            s.evaluate(&alert_in("Tornado Warning", "Polk, IA", "Severe", &["IA"]))
+                .is_some()
+        );
+    }
+
+    #[test]
     fn min_severity_blocks_under_threshold_alert() {
         let mut s = LatencyStrategy::new(vec![rule("Tornado", None, Severity::Severe)]);
         assert!(
@@ -263,6 +337,7 @@ mod tests {
         let r1 = LatencyRule {
             event_substring: "Tornado".into(),
             area_substring: None,
+            required_states: Vec::new(),
             min_severity: Severity::Moderate,
             kalshi_market: MarketTicker::new("FIRST"),
             side: Side::Yes,
@@ -273,6 +348,7 @@ mod tests {
         let r2 = LatencyRule {
             event_substring: "Tornado".into(),
             area_substring: None,
+            required_states: Vec::new(),
             min_severity: Severity::Moderate,
             kalshi_market: MarketTicker::new("SECOND"),
             side: Side::Yes,

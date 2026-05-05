@@ -36,7 +36,8 @@ Rule shape:
   "market_ticker":      "KXHURCATFL-26",
   "reasoning":          "NWS Hurricane Warnings for FL precede landfall by ~36h; market resolves YES on landfall.",
   "event_substring":    "Hurricane Warning",
-  "area_substring":     "FL",
+  "required_states":    ["FL"],
+  "area_substring":     null,
   "min_severity":       "Severe",
   "side":               "yes",
   "max_price_cents":    35,
@@ -50,10 +51,24 @@ Field guidance:
 - `reasoning`: one sentence on alert→resolution correlation.
 - `event_substring`: substring in NWS `event_type`. Pick from the
   list above when possible; case-sensitive match.
-- `area_substring`: optional substring in NWS `area_desc`. Most useful
-  forms are 2-letter state codes ('TX', 'FL'), city names ('Miami'),
-  or county/region names. Omit (`null`) for markets with no
-  geographic constraint.
+- `required_states`: **the geographic filter — use this for every
+  state-bound market**. Two-letter postal state codes the alert
+  must overlap. The strategy parses NWS `geocode.UGC` codes (which
+  always carry a 2-letter state prefix) on every alert, so this
+  filter is structurally reliable. Examples:
+   * Houston market → `["TX"]`
+   * NYC rain market → `["NY"]`
+   * Seattle snowfall → `["WA"]`
+   * Hurricane-hits-Carolinas market → `["NC", "SC"]`
+   * National-aggregate market (e.g. nationwide tornado count)
+     → `[]` (no filter)
+  Always prefer this over `area_substring` for any geographic gate.
+- `area_substring`: **almost always `null`**. NWS `area_desc` is a
+  semicolon-list of county/zone names with inconsistent state-code
+  suffixes; city names ("Denver", "Miami") almost never appear.
+  Use only when you need to narrow within a single state — e.g. a
+  Florida-Coast-only market when even the broad FL state filter is
+  too loose. When in doubt, leave `null`.
 - `min_severity`: 'Unknown' | 'Minor' | 'Moderate' | 'Severe' | 'Extreme'.
   'Severe' is the conservative default; 'Moderate' for advisories.
 - `side`: which side to **BUY** when the alert fires. The strategy
