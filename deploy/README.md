@@ -148,3 +148,42 @@ inspect / cancel via `kalshi.com/portfolio` if you want them gone.
 Not yet shipped. Same architecture (one daemon + one timer), just
 unit files instead of plists. Open as a follow-up when migrating to
 a us-east-1 VPS for latency.
+
+## Adding a second strategy daemon
+
+Each new strategy daemon needs its own launchd plist + persistence
+files. The pattern (using `cross-arb-trader` as the example, since
+its binary is built but no plist exists yet):
+
+1. **Build the release binary** —
+   `cargo build --release -p cross-arb-trader`.
+2. **Pick a `--strategy-id`** unique per process (e.g. `cross-arb`).
+   This is the cid prefix; if two daemons share a prefix and either
+   restarts at start_seq=0, you'll hit Kalshi's 409
+   `order_already_exists`.
+3. **Allocate persistence paths** under `~/.config/predigy/`:
+   `oms-cids-cross-arb`, `oms-state-cross-arb.json`. Distinct from
+   the latency-trader's files.
+4. **Copy the trader plist** as a template:
+   `cp deploy/macos/com.predigy.latency-trader.plist
+       deploy/macos/com.predigy.cross-arb.plist`.
+   Edit the `Label`, `ProgramArguments` (point to a
+   cross-arb-specific launcher script), and `Standard{Out,Error}Path`.
+5. **Add to `install-launchd.sh`**: include the new label in the
+   plist install loop and the preflight binary check.
+6. **Risk caps**: pass `PREDIGY_*` env vars or hard-code in the
+   launcher. **Do not let two daemons share the same daily-loss
+   breaker** — each must enforce its own.
+7. **First-run pairs file** (cross-arb specifically): you need
+   `--pair KALSHI_TICKER=POLYMARKET_ASSET_ID` for each pair you
+   want to trade. Curate the list manually; there's no automated
+   pairing yet. See `docs/SESSIONS.md` for hints on what pairs to
+   try first (election / FOMC markets are the obvious ones).
+8. **Always start in dry-run** — flip `PREDIGY_LIVE=1` only after a
+   session of dry-run validates the strategy fires sensibly.
+
+Once any new daemon is loaded, the dashboard's `/api/state` won't
+automatically include its log — the dashboard currently parses
+only `latency-trader.stderr.log`. Extending it to multiplex
+multiple log paths is a small change in
+`bin/dashboard/src/main.rs::parse_recent_fires`.

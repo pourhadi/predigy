@@ -7,38 +7,45 @@ making with rebate capture.
 
 ## Status
 
-**Phases 1-2 complete (logic). Phase 3 in flight.** Risk gate, OMS
-state machine, Kalshi REST executor, and the intra-venue arb
-strategy (`bin/arb-trader`) are all in place — pending live
-shake-down with real capital. Phase 3 has the backtester runtime
-(`predigy-sim`): an `Executor` impl that matches IOC orders against
-a `BookStore`, plus a `Replay` engine that streams `md-recorder`
-NDJSON through the same OMS path strategies use in production —
-so an `ArbStrategy` runs unchanged in sim and live.
+**Live in production.** The weather strategy (`bin/latency-trader`)
+runs 24/7 under macOS launchd, submitting real orders against
+Kalshi capped at $5 account-wide. A daily Claude-powered curator
+(`bin/wx-curator`) refreshes its rules at 06:30; a mobile-friendly
+dashboard (`bin/dashboard`) on port 8080 surfaces cash, positions,
+fires, and daemon health.
 
 | Phase | Description | Status |
 |---|---|---|
 | 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
-| 1 | Read-only stack (REST + WS + book + recorder) | ✅ (logic) |
-| 2 | OMS + risk + FIX exec + first live strategy | ✅ (logic — `risk` + `oms` + `kalshi-exec` (REST) + `arb-trader` done; FIX flavour deferred to MM) |
-| 3 | Backtester / sim | 🟡 in progress (`sim`: BookStore + IOC SimExecutor + NDJSON Replay + arb integration done) |
-| 4 | Market making (deferred until $25k account) | ⬜ |
-| 5 | Cross-venue signal arb (primary engine) | ⬜ |
-| 6 | News/data latency (free feeds first) | ⬜ |
-| 7 | Statistical / model alpha | ⬜ |
-| 8 | Hardening & scaling | ⬜ |
+| 1 | Read-only stack (REST + WS + book + recorder) | ✅ live-shaken |
+| 2 | OMS + risk + REST exec + persistent state | ✅ live-shaken (FIX flavour deferred to MM) |
+| 3 | Backtester / sim | ✅ logic; queue-model integration pending |
+| 4 | Market making (≥$25k) | ⬜ deferred |
+| 5 | Cross-venue signal arb | ✅ logic (`bin/cross-arb-trader`); live shake-down pending |
+| 6 | News/data latency | ✅ **live in production** (`latency-trader` + `wx-curator` + Claude rule curation) |
+| 7 | Statistical / model alpha | ✅ logic (`bin/stat-trader`); no live rules curated yet |
+| 8 | Hardening & scaling | 🟡 macOS launchd deploy + dashboard done; Linux/systemd + VPS pending |
 
-Capital: **$5k**. Infra budget: **~$80-150/mo**. Hosting target: single
-Chicago VPS (Kalshi's matching engine is in Chicago — AWS us-east-1 is
-~25-40ms away and disqualifying).
+Capital: **$50** funded today (target: $5k). Infra: laptop today,
+us-east-1 VPS planned for the latency push.
+
+**For new operators or new Claude Code sessions:** start with
+[`docs/SESSIONS.md`](./docs/SESSIONS.md) — orientation on what's
+running, where the money is, and what to touch carefully.
 
 ## Documentation
 
+- **[`docs/SESSIONS.md`](./docs/SESSIONS.md)** — handoff orientation
+  for any new Claude Code session: what's deployed, what's running,
+  where the money is, what's next. Read first.
+- **[`docs/RUNBOOK.md`](./docs/RUNBOOK.md)** — operational procedures:
+  health checks, common interventions, debugging recipes, kill switch.
+- **[`docs/STATUS.md`](./docs/STATUS.md)** — living snapshot of what's
+  implemented, test counts, confirmed API contracts, file tree.
 - **[`docs/PLAN.md`](./docs/PLAN.md)** — full architectural / strategy /
   infrastructure plan. Source of truth for design decisions.
-- **[`docs/STATUS.md`](./docs/STATUS.md)** — living snapshot of what's
-  implemented, test counts, confirmed API contracts, known limitations,
-  next steps.
+- **[`deploy/README.md`](./deploy/README.md)** — install + ops layout
+  for the macOS launchd deployment.
 
 ## Layout
 
