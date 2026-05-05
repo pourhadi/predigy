@@ -41,6 +41,20 @@ pub struct MarketsResponse {
     pub cursor: Option<String>,
 }
 
+/// `GET /portfolio/balance` response. All monetary fields are
+/// integer cents.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BalanceResponse {
+    /// Settled cash, in cents.
+    pub balance: i64,
+    /// Mark-to-market value of open positions, in cents.
+    #[serde(default)]
+    pub portfolio_value: i64,
+    /// Unix-seconds timestamp of the last venue-side update.
+    #[serde(default)]
+    pub updated_ts: Option<i64>,
+}
+
 /// `GET /series?category=...` response. The `series` field can be
 /// `null` (not just empty) when the category matches nothing —
 /// `serde(default)` handles both.

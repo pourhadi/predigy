@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d10">
+  <title>predigy · wx</title>
+  <style>
+    /* Mobile-first dark UI. Vanilla CSS — no framework, so no
+       extra HTTP fetch or layout-shift on first paint. */
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d10;
+      --panel: #14181d;
+      --border: #232a31;
+      --text: #d8dce0;
+      --muted: #888f95;
+      --accent: #5eead4;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --good: #34d399;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      font-size: 16px;
+      line-height: 1.4;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+    main { max-width: 720px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: 0.02em; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+         color: var(--muted); font-weight: 500; margin: 24px 0 8px; }
+
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .card .label { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .card .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .num-pos { color: var(--good); }
+    .num-neg { color: var(--bad); }
+
+    table {
+      width: 100%; border-collapse: collapse; font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase;
+         letter-spacing: 0.04em; }
+    tbody tr:last-child td { border-bottom: none; }
+
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+            font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill.good { background: rgba(52, 211, 153, 0.15); color: var(--good); }
+    .pill.warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+    .pill.bad  { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+    .pill.muted { background: rgba(136, 143, 149, 0.15); color: var(--muted); }
+
+    header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    header .updated { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+    .market { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+              font-size: 12px; word-break: break-all; }
+    .ev { font-size: 13px; color: var(--text); }
+    .ev .meta { color: var(--muted); font-size: 11px; }
+
+    .empty { color: var(--muted); font-style: italic; padding: 12px 4px; }
+
+    /* On wider screens, give summary cards a 4-up grid. */
+    @media (min-width: 640px) {
+      .summary > .card { flex: 1 1 22%; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>predigy · weather strategy</h1>
+      <div id="status-line" class="updated">loading …</div>
+    </div>
+    <span id="health-pill" class="pill muted">—</span>
+  </header>
+
+  <h2>account</h2>
+  <div class="row summary">
+    <div class="card">
+      <div class="label">cash</div>
+      <div class="value" id="m-cash">—</div>
+    </div>
+    <div class="card">
+      <div class="label">portfolio</div>
+      <div class="value" id="m-portfolio">—</div>
+    </div>
+    <div class="card">
+      <div class="label">today's P&amp;L</div>
+      <div class="value" id="m-pnl">—</div>
+    </div>
+    <div class="card">
+      <div class="label">open orders</div>
+      <div class="value" id="m-inflight">—</div>
+    </div>
+  </div>
+
+  <h2>positions</h2>
+  <div id="pos-wrap"></div>
+
+  <h2>recent fires</h2>
+  <div id="fires-wrap"></div>
+
+  <h2>diagnostics</h2>
+  <div class="card">
+    <table>
+      <tr><th>kill switch</th><td id="d-kill">—</td></tr>
+      <tr><th>last refresh err</th><td id="d-err">—</td></tr>
+    </table>
+  </div>
+</main>
+
+<script>
+const fmtCents = (c, signed = false) => {
+    if (c === undefined || c === null) return "—";
+    const sign = signed && c > 0 ? "+" : "";
+    const dollars = (c / 100).toFixed(2);
+    return `${sign}$${dollars}`;
+};
+const fmtUnixAge = (ts) => {
+    if (!ts) return "never";
+    const d = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (d < 60) return `${d}s ago`;
+    if (d < 3600) return `${Math.round(d / 60)}m ago`;
+    if (d < 86400) return `${Math.round(d / 3600)}h ago`;
+    return `${Math.round(d / 86400)}d ago`;
+};
+const setText = (id, v) => { document.getElementById(id).textContent = v; };
+const setHTML = (id, v) => { document.getElementById(id).innerHTML = v; };
+const setNumClass = (el, signedCents) => {
+    el.classList.remove("num-pos", "num-neg");
+    if (signedCents > 0) el.classList.add("num-pos");
+    if (signedCents < 0) el.classList.add("num-neg");
+};
+
+function render(s) {
+    const cash = s.balance_cents | 0;
+    const port = s.portfolio_cents | 0;
+    const pnl  = s.oms_daily_realized_pnl_cents | 0;
+    setText("m-cash", fmtCents(cash));
+    setText("m-portfolio", fmtCents(port));
+    const pnlEl = document.getElementById("m-pnl");
+    pnlEl.textContent = fmtCents(pnl, true);
+    setNumClass(pnlEl, pnl);
+    setText("m-inflight", s.oms_in_flight_orders ?? 0);
+
+    // health pill — green if log file written in last 90s.
+    const pill = document.getElementById("health-pill");
+    pill.classList.remove("good", "warn", "bad", "muted");
+    let pillText = "—";
+    if (s.log_age_secs == null) {
+        pill.classList.add("warn");
+        pillText = "no log";
+    } else if (s.log_age_secs < 90) {
+        pill.classList.add("good");
+        pillText = `live · ${s.log_age_secs}s`;
+    } else if (s.log_age_secs < 600) {
+        pill.classList.add("warn");
+        pillText = `stale · ${Math.round(s.log_age_secs / 60)}m`;
+    } else {
+        pill.classList.add("bad");
+        pillText = `down · ${Math.round(s.log_age_secs / 60)}m`;
+    }
+    pill.textContent = pillText;
+
+    setText("status-line", `refreshed ${fmtUnixAge(s.refreshed_at)}`);
+    setText("d-kill", s.oms_kill_switch ? "ARMED" : "off");
+    setText("d-err", s.last_refresh_error || "ok");
+
+    // positions
+    const positions = s.open_positions || [];
+    if (positions.length === 0) {
+        setHTML("pos-wrap", `<div class="card"><div class="empty">no open positions</div></div>`);
+    } else {
+        const rows = positions.map(p => `
+          <tr>
+            <td class="market">${p.ticker}</td>
+            <td>${p.contracts.toFixed(0)}</td>
+            <td>$${p.exposure_dollars.toFixed(2)}</td>
+            <td class="${p.realized_pnl_dollars >= 0 ? 'num-pos' : 'num-neg'}">$${p.realized_pnl_dollars.toFixed(2)}</td>
+            <td>$${p.fees_paid_dollars.toFixed(2)}</td>
+          </tr>`).join("");
+        setHTML("pos-wrap", `
+          <div class="card" style="padding: 0;">
+            <table>
+              <thead><tr><th>market</th><th>qty</th><th>exp</th><th>P&amp;L</th><th>fees</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>`);
+    }
+
+    // recent fires
+    const fires = s.recent_fires || [];
+    if (fires.length === 0) {
+        setHTML("fires-wrap", `<div class="card"><div class="empty">no fires recorded yet</div></div>`);
+    } else {
+        const cards = fires.slice(0, 12).map(f => {
+            const drypill = f.dry_run ? `<span class="pill muted">DRY</span>` : `<span class="pill good">LIVE</span>`;
+            const sevpill = f.severity === "Extreme" ? "bad" : (f.severity === "Severe" ? "warn" : "muted");
+            return `
+              <div class="card" style="margin-bottom: 8px;">
+                <div class="ev">
+                  <span class="market">${f.market}</span>
+                  ${drypill}
+                  <span class="pill ${sevpill}">${f.severity || '?'}</span>
+                </div>
+                <div class="ev meta">
+                  ${f.event} · ${f.side} @ ${f.price_cents}¢ × ${f.size} · ${fmtUnixAge(f.ts)}
+                </div>
+              </div>`;
+        }).join("");
+        setHTML("fires-wrap", cards);
+    }
+}
+
+async function tick() {
+    try {
+        const r = await fetch("/api/state", {cache: "no-cache"});
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const s = await r.json();
+        render(s);
+    } catch (e) {
+        document.getElementById("status-line").textContent = `fetch error: ${e}`;
+        const pill = document.getElementById("health-pill");
+        pill.classList.remove("good", "warn", "bad");
+        pill.classList.add("bad");
+        pill.textContent = "offline";
+    }
+}
+
+tick();
+setInterval(tick, 15000);
+</script>
+</body>
+</html>

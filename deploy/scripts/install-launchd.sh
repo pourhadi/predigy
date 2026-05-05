@@ -49,11 +49,13 @@ require_file "${PREDIGY_HOME}/target/release/wx-curator" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p wx-curator)"
 require_file "${PREDIGY_HOME}/target/release/latency-trader" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p latency-trader)"
+require_file "${PREDIGY_HOME}/target/release/predigy-dashboard" \
+    "build with: (cd $PREDIGY_HOME && cargo build --release -p predigy-dashboard)"
 [[ "$fail" -eq 0 ]] || { echo ""; echo "preflight failed; fix the FAILs above"; exit 1; }
 
 echo ""
 echo "=== installing plists ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard; do
     src="${PLIST_SRC}/${name}.plist"
     dst="${LAUNCH_AGENTS}/${name}.plist"
     cp "$src" "$dst"
@@ -66,7 +68,7 @@ done
 
 echo ""
 echo "=== status ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard; do
     if launchctl print "gui/$(id -u)/${name}" >/dev/null 2>&1; then
         state=$(launchctl print "gui/$(id -u)/${name}" | grep -E "state\s*=" | head -1 | xargs || true)
         echo "  ${name}: ${state:-loaded}"
@@ -77,10 +79,14 @@ done
 
 echo ""
 echo "=== next steps ==="
-echo "  Logs:        tail -f $LOG_DIR/latency-trader.stderr.log"
+echo "  Trader logs: tail -f $LOG_DIR/latency-trader.stderr.log"
 echo "  Force run:   launchctl kickstart -k gui/$(id -u)/com.predigy.wx-curate"
 echo "  Stop one:    launchctl bootout gui/$(id -u)/com.predigy.latency-trader"
 echo "  Go LIVE:     export PREDIGY_LIVE=1 in ~/.zprofile + restart latency-trader"
 echo ""
-echo "  Default state: dry-run (PREDIGY_LIVE != 1). Watch logs for"
-echo "  'rule fired' entries before flipping the live switch."
+echo "  Dashboard:   open http://$(ipconfig getifaddr en0 2>/dev/null || echo 127.0.0.1):8080"
+echo "               (LAN IP works on your phone if on the same wifi;"
+echo "                or use Tailscale to hit it from anywhere)"
+echo ""
+echo "  Default trader state: dry-run (PREDIGY_LIVE != 1). Watch logs"
+echo "  for 'rule fired' entries before flipping the live switch."

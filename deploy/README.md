@@ -5,7 +5,7 @@ strategy 24/7 on macOS using launchd.
 
 ## What runs
 
-Two launchd jobs:
+Three launchd jobs:
 
 1. **`com.predigy.latency-trader`** — long-running daemon. Subscribes
    to NWS, evaluates each alert against the curated rule file,
@@ -16,6 +16,12 @@ Two launchd jobs:
    `StartCalendarInterval`). Re-curates `wx-rules.json` against
    current Kalshi weather markets via Claude, then kickstarts the
    trader so it picks up fresh rules.
+3. **`com.predigy.dashboard`** — HTTP server on `:8080`, mobile-
+   friendly view of cash, P&L, open positions, recent fires, and
+   daemon health. Bound to `0.0.0.0` so a phone on the same wifi
+   (or via Tailscale) can hit it. Open
+   `http://<laptop-LAN-IP>:8080` from your phone — currently read-
+   only (no kill-switch button; use launchctl from a shell).
 
 ## Persistence layout
 
