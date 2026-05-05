@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Long-running latency-trader process. KeepAlive restarts on
+         non-zero exit; ThrottleInterval avoids tight crash loops. -->
+    <key>Label</key>
+    <string>com.predigy.latency-trader</string>
+
+    <!-- Run via zsh -lc so ~/.zprofile is sourced and KALSHI_KEY_ID,
+         ANTHROPIC_API_KEY, NWS_USER_AGENT come from there. Substitute
+         the absolute path to your repo checkout below. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/latency-trader-run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Wait at least 30 s between restarts so a misconfigured run
+         doesn't burn through the cid space or hammer Kalshi. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/latency-trader.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/latency-trader.stderr.log</string>
+
+    <!-- Don't let the process pile up CPU time if it goes
+         pathological. 90 % of one core averaged over 60 s is a
+         loose ceiling — well above what the dry-run baseline
+         observes. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Daily Kalshi-weather rule re-curation via Claude. Runs once
+         a day at 06:30 local. After writing fresh rules, kicks the
+         latency-trader plist so it picks them up on restart. -->
+    <key>Label</key>
+    <string>com.predigy.wx-curate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/wx-curate.sh</string>
+    </array>
+
+    <!-- 06:30 local. Catches up if the laptop was asleep at the
+         scheduled time (StartCalendarInterval is missed-only when
+         the box is off; launchd runs on next wake). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/wx-curate.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/wx-curate.stderr.log</string>
+</dict>
+</plist>
