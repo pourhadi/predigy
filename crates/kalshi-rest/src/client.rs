@@ -3,9 +3,9 @@
 use crate::auth::Signer;
 use crate::error::Error;
 use crate::types::{
-    BatchCancelOrdersRequest, BatchCancelOrdersResponse, CancelOrderResponse, CreateOrderRequest,
-    CreateOrderResponse, FillsResponse, MarketDetailResponse, MarketsResponse, OrderbookResponse,
-    PositionsResponse, SeriesListResponse,
+    BalanceResponse, BatchCancelOrdersRequest, BatchCancelOrdersResponse, CancelOrderResponse,
+    CreateOrderRequest, CreateOrderResponse, FillsResponse, MarketDetailResponse, MarketsResponse,
+    OrderbookResponse, PositionsResponse, SeriesListResponse,
 };
 use predigy_book::Snapshot;
 use predigy_core::price::Price;
@@ -272,6 +272,16 @@ impl Client {
             return Err(Error::Auth("positions endpoint requires a signer".into()));
         }
         self.get_json("/portfolio/positions", &[]).await
+    }
+
+    /// `GET /portfolio/balance` (auth required). Returns cash balance,
+    /// portfolio mark-to-market value, and the venue's last update
+    /// timestamp. Both monetary fields are integer cents.
+    pub async fn balance(&self) -> Result<BalanceResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("balance endpoint requires a signer".into()));
+        }
+        self.get_json("/portfolio/balance", &[]).await
     }
 
     /// `POST /portfolio/events/orders` (auth required). V2 schema.

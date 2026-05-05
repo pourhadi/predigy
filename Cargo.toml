@@ -20,6 +20,7 @@ members = [
     "bin/latency-trader",
     "bin/stat-trader",
     "bin/wx-curator",
+    "bin/dashboard",
 ]
 
 [workspace.package]
@@ -77,6 +78,7 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 tempfile = "3"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "matched-path", "query", "tracing"] }
 
 [profile.release]
 opt-level = 3
