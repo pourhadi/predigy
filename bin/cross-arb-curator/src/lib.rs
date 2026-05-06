@@ -17,7 +17,9 @@ pub mod prompt;
 pub mod state;
 
 pub use agent::{CuratedPair, CuratorError, propose_pairs};
-pub use kalshi_scan::{KalshiMarket, scan_political_markets};
+pub use kalshi_scan::{
+    DEFAULT_CATEGORIES, KalshiMarket, scan_open_markets, scan_political_markets,
+};
 pub use keyword_filter::filter_for_batch;
 pub use poly_scan::{PolyError, PolyMarket, scan_top_markets};
 pub use state::{CuratorState, StoredPair};
