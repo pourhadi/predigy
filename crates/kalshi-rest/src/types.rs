@@ -166,22 +166,38 @@ pub struct MarketPosition {
 
 // -------------------------------------------------------------- Orders
 
-/// Body posted to `POST /portfolio/events/orders` (V2). Kalshi's
-/// `side` field encodes a direction on the **YES** book only:
-/// `"bid"` = buy YES, `"ask"` = sell YES. NO orders are sent as their
-/// YES equivalent at the complement price (callers are expected to
-/// handle the mapping; the executor crate does this).
+/// Body posted to `POST /trade-api/v2/portfolio/orders`. Production
+/// wire shape verified empirically against the live API May 2026 by
+/// reading back Kalshi's error details on rejected probe submits:
 ///
-/// Numeric fields are decimal strings ("0.4200", "100.00") matching
-/// the post-Mar-2026 fixed-point schema.
+/// - `side` is `"bid" | "ask"` — Kalshi explicitly errors with
+///   `"side must be bid or ask"` when sent `"yes" | "no"`. (The web
+///   docs are misleading on this point.) `bid` is the YES book bid
+///   side; `ask` is the YES book ask side.
+/// - `action` is `"buy" | "sell"` (separate required field)
+/// - `count` is a decimal-string ("1.00"). Kalshi's Go struct uses
+///   string here despite the docs claiming integer — verified by the
+///   error `cannot unmarshal number into ... field count of type
+///   string`.
+/// - Limit price rides the leg matching the ECONOMIC side: a YES
+///   intent (whether buy or sell) sets `yes_price`; a NO intent sets
+///   `no_price`. Both are integer cents 1..=99.
+///
+/// The (Side, Action) → (side, action, price-leg) mapping is in
+/// `kalshi-exec/src/mapping.rs`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateOrderRequest {
     pub ticker: String,
     pub client_order_id: String,
     pub side: OrderSideV2,
-    /// Contract count, decimal-string fixed-point ("100.00").
+    pub action: OrderAction,
+    /// Whole-contract count, decimal-string fixed-point ("1.00").
     pub count: String,
-    /// Limit price in dollars, decimal-string fixed-point ("0.4200").
+    /// Limit price as decimal-string dollars ("0.0100" .. "0.9900").
+    /// Single field, regardless of which side the order is on. The
+    /// `yes_price`/`no_price`/`_dollars` variants documented in the
+    /// public docs all returned "empty decimal string" errors when
+    /// probed live; only this `price` field is accepted.
     pub price: String,
     pub time_in_force: TimeInForceV2,
     pub self_trade_prevention_type: SelfTradePreventionV2,
@@ -191,13 +207,20 @@ pub struct CreateOrderRequest {
     pub reduce_only: Option<bool>,
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderSideV2 {
-    /// Buy YES (or, by complement, sell NO).
+    /// YES book bid side: matches a buy-YES intent or sell-NO.
     Bid,
-    /// Sell YES (or, by complement, buy NO).
+    /// YES book ask side: matches a sell-YES intent or buy-NO.
     Ask,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderAction {
+    Buy,
+    Sell,
 }
 
 #[derive(Debug, Copy, Clone, Serialize)]
