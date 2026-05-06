@@ -102,7 +102,21 @@ pub struct MarketDetail {
     pub event_ticker: String,
     pub title: String,
     pub status: String,
+    /// Calendar close time of the auction. For per-event markets
+    /// (sports games) this is often weeks past the actual settlement
+    /// window — Kalshi keeps the order book legally open until then
+    /// for late corrections. Use `effective_close_unix()` instead of
+    /// reading this directly when scheduling.
     pub close_time: String,
+    /// Expected per-event settlement time (RFC3339). Set for markets
+    /// with `can_close_early=true` — sports, occurrence markets,
+    /// anything that resolves on a real-world event before the
+    /// calendar `close_time`. Often lands hours/days before
+    /// `close_time` for sports.
+    #[serde(default)]
+    pub expected_expiration_time: Option<String>,
+    #[serde(default)]
+    pub can_close_early: Option<bool>,
     #[serde(default, deserialize_with = "de_dollars::opt")]
     pub yes_bid_dollars: Option<f64>,
     #[serde(default, deserialize_with = "de_dollars::opt")]

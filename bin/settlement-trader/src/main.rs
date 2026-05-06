@@ -144,20 +144,39 @@ async fn main() -> Result<()> {
     for ticker in &args.markets {
         match rest.market_detail(ticker).await {
             Ok(detail) => {
-                let Some(close_unix) = parse_iso8601_to_unix(&detail.market.close_time) else {
-                    warn!(market = %ticker, close_time = %detail.market.close_time,
-                        "couldn't parse close_time; skipping");
-                    continue;
+                // Prefer expected_expiration_time over close_time
+                // when both are present and the expected time is
+                // earlier. Per-event sports markets have close_time
+                // weeks past actual game settlement (the auction
+                // window) — keying off close_time means the strategy
+                // never fires near the real settlement.
+                let close_str = &detail.market.close_time;
+                let expected_str = detail.market.expected_expiration_time.as_deref();
+                let close_parsed = parse_iso8601_to_unix(close_str);
+                let expected_parsed = expected_str.and_then(parse_iso8601_to_unix);
+                let (settle_unix, source) = match (expected_parsed, close_parsed) {
+                    (Some(e), Some(c)) if e < c => (e, "expected_expiration_time"),
+                    (Some(e), None) => (e, "expected_expiration_time"),
+                    (_, Some(c)) => (c, "close_time"),
+                    (None, None) => {
+                        warn!(market = %ticker, close_time = %close_str,
+                            "couldn't parse settlement time; skipping");
+                        continue;
+                    }
                 };
-                if close_unix <= now_unix {
-                    warn!(market = %ticker, close_time = %detail.market.close_time,
-                        "market already closed; skipping");
+                if settle_unix <= now_unix {
+                    warn!(market = %ticker, source, settle_unix,
+                        "market already past settlement; skipping");
                     continue;
                 }
-                strategy.set_close_time(MarketTicker::new(ticker), close_unix);
+                strategy.set_close_time(MarketTicker::new(ticker), settle_unix);
                 subscribe_markets.push(ticker.clone());
-                info!(market = %ticker, secs_to_close = close_unix - now_unix,
-                    "settlement-trader: armed");
+                info!(
+                    market = %ticker,
+                    source,
+                    secs_to_settle = settle_unix - now_unix,
+                    "settlement-trader: armed"
+                );
             }
             Err(e) => {
                 warn!(market = %ticker, error = %e, "couldn't fetch market_detail; skipping");
