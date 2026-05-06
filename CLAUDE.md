@@ -70,3 +70,21 @@ Then latency push (us-east-1 VPS + FIX exec).
 
 Ask only when the user's goal is genuinely unclear; otherwise pick
 and execute.
+
+## Cross-platform context
+
+This project is one of two automated-trading platforms the operator
+runs.  The other is `~/code/tradegy` — a Python-based platform for
+equity-index options + futures, with a live IBKR paper-trading daemon
+running a 0DTE iron condor on MES futures options as of 2026-05-06.
+tradegy harvests the variance risk premium (selling vol on equity
+indices) — a categorically different return source than predigy's
+prediction-market arbitrage / latency / statistical alpha lanes.
+
+The two platforms harvest **uncorrelated** return streams.  Running
+both is real diversification of mechanism, not just instrument.
+
+The joint strategic plan — capital projections at each tier, what's
+reusable between the platforms, and the priority sequence for extending
+each — lives at `~/code/MOONSHOT_PLAN.md`.  Read that doc when planning
+cross-platform work or evaluating where to allocate operator time.
