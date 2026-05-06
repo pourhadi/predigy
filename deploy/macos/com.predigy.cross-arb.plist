@@ -30,15 +30,6 @@
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
-    <!-- Disabled until you write the pairs file. The wrapper
-         script will exit non-zero on missing pairs and launchd
-         will log it but not retry indefinitely thanks to
-         ThrottleInterval. To enable: write the pairs file, then
-         install via deploy/scripts/install-launchd.sh (uncomment
-         the cross-arb label there). -->
-    <key>Disabled</key>
-    <true/>
-
     <key>StandardOutPath</key>
     <string>/Users/dan/Library/Logs/predigy/cross-arb.stdout.log</string>
     <key>StandardErrorPath</key>
