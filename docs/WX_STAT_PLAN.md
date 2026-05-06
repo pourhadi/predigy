@@ -102,14 +102,27 @@ yet probabilistic. This is enough to validate the plumbing.
 ### Phase 2 — Probabilistic forecast + calibration
 
 NBM gridded data gives `P(temp_max > threshold)` directly per grid
-point per forecast hour. Two sub-steps:
+point per forecast hour. **Detailed plan with reconnaissance findings
+in [WX_STAT_NBM_PHASE2.md](WX_STAT_NBM_PHASE2.md).** Summary:
 
-2a. **NBM ingestion.** NWS publishes NBM as gridded NetCDF/GRIB on
-S3 (`noaa-nbm-grib2-pds`). For our use we only need the
-station-point timeseries. Plan: pull GRIB2 files via S3, extract
-the point timeseries with eccodes, cache locally.
+2a. **NBM ingest.** Public S3 bucket `noaa-nbm-grib2-pds` (no auth);
+HTTP range requests work; `.grib2.idx` sidecars give per-message
+byte offsets. The `qmd/` subtree carries probabilistic quantile
+data (21 levels: 0%, 5%, …, 100%) at 2m above ground.
 
-2b. **Calibration.** Track forecast-vs-outcome over a rolling
+2b. **GRIB2 decode.** Use the `grib` crate (0.15.x, pure Rust + C
+deps for JPEG2000 compression).
+
+2c. **Airport → grid sampling + cache.** Per-airport quantile vector
+cached under `data/nbm_cache/`; ~84 bytes per (airport × fcst hour),
+trivial size.
+
+2d. **CDF interpolation → model_p.** Bracketing two adjacent
+quantile values for the Kalshi threshold lets us read
+`P(T ≤ threshold)` directly. Drops the Phase 1 conviction-zone
+gate entirely.
+
+2e. **Calibration.** Track forecast-vs-outcome over a rolling
 window. If NBM systematically overstates `P(>80F)` at LAX in May,
 shift accordingly via Platt scaling. Persisted per
 (airport, threshold-band, lead-time) bucket.
