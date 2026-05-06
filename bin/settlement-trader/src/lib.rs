@@ -3,6 +3,8 @@
 //!
 //! See [`strategy`] for the rule mechanics + the thesis.
 
+pub mod discovery;
 pub mod strategy;
 
+pub use discovery::{DEFAULT_SERIES, DiscoveryConfig, DiscoveryDelta};
 pub use strategy::{SettlementConfig, SettlementStrategy};

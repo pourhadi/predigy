@@ -117,6 +117,8 @@ mod tests {
             yes_ask_dollars: Some(ya),
             last_price_dollars: None,
             close_time: "2026-06-01T00:00:00Z".into(),
+            expected_expiration_time: None,
+            can_close_early: None,
         }
     }
 
