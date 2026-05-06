@@ -52,11 +52,11 @@ exec "./target/release/settlement-trader" \
     --bid-to-ask-ratio             "${PREDIGY_SETT_BID_RATIO:-5}" \
     --size                         "${PREDIGY_SETT_SIZE:-1}" \
     --cooldown-ms                  "${PREDIGY_SETT_COOLDOWN_MS:-60000}" \
-    --max-contracts-per-side       "${PREDIGY_SETT_MAX_CONTRACTS:-3}" \
-    --max-notional-cents-per-side  "${PREDIGY_SETT_MAX_NOTIONAL_PER_SIDE:-300}" \
-    --max-account-notional-cents   "${PREDIGY_SETT_MAX_ACCOUNT_NOTIONAL:-300}" \
-    --max-daily-loss-cents         "${PREDIGY_SETT_MAX_DAILY_LOSS:-200}" \
-    --max-orders-per-window        "${PREDIGY_SETT_MAX_ORDERS:-5}" \
+    --max-contracts-per-side       "${PREDIGY_SETT_MAX_CONTRACTS:-5}" \
+    --max-notional-cents-per-side  "${PREDIGY_SETT_MAX_NOTIONAL_PER_SIDE:-500}" \
+    --max-account-notional-cents   "${PREDIGY_SETT_MAX_ACCOUNT_NOTIONAL:-1500}" \
+    --max-daily-loss-cents         "${PREDIGY_SETT_MAX_DAILY_LOSS:-500}" \
+    --max-orders-per-window        "${PREDIGY_SETT_MAX_ORDERS:-10}" \
     --rate-window-ms               "${PREDIGY_SETT_RATE_WINDOW_MS:-1000}" \
     --cid-store     "${CONFIG_DIR}/oms-cids-settlement" \
     --oms-state     "${CONFIG_DIR}/oms-state-settlement.json" \

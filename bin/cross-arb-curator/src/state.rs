@@ -95,6 +95,21 @@ impl CuratorState {
         dropped
     }
 
+    /// Drop pairs failing `keep`. Returns the dropped tickers.
+    /// Used for the settlement-horizon audit.
+    pub fn retain_pairs<F: Fn(&StoredPair) -> bool>(&mut self, keep: F) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.pairs.retain(|p| {
+            if keep(p) {
+                true
+            } else {
+                dropped.push(p.kalshi_ticker.clone());
+                false
+            }
+        });
+        dropped
+    }
+
     pub fn record_seen<I: IntoIterator<Item = String>>(&mut self, ids: I) {
         let mut set: HashSet<String> = self.seen_poly_ids.drain(..).collect();
         for id in ids {

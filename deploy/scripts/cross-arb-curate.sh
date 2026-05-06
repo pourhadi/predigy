@@ -34,9 +34,10 @@ exec "./target/release/cross-arb-curator" \
     --kalshi-pem    "$KALSHI_PEM" \
     --output        "${CONFIG_DIR}/cross-arb-pairs.txt" \
     --state         "${CONFIG_DIR}/cross-arb-state.json" \
-    --max-poly      "${PREDIGY_CURATE_MAX_POLY:-100}" \
-    --batch-size    "${PREDIGY_CURATE_BATCH:-25}" \
-    --max-batches   "${PREDIGY_CURATE_MAX_BATCHES:-4}" \
+    --max-poly          "${PREDIGY_CURATE_MAX_POLY:-100}" \
+    --batch-size        "${PREDIGY_CURATE_BATCH:-25}" \
+    --max-batches       "${PREDIGY_CURATE_MAX_BATCHES:-4}" \
     --min-poly-liquidity "${PREDIGY_CURATE_MIN_LIQUIDITY:-5000}" \
-    --restart-job   "com.predigy.cross-arb" \
+    --max-days-to-settle "${PREDIGY_CURATE_MAX_DAYS:-60}" \
+    --restart-job       "com.predigy.cross-arb" \
     --write

@@ -87,6 +87,17 @@ struct Args {
     #[arg(long, default_value_t = 5_000.0)]
     min_poly_liquidity: f64,
 
+    /// Settlement-horizon cap (days). Cross-arb is a convergence
+    /// strategy — capturing short-term price divergences that
+    /// resolve when both venues see the same data. Multi-month
+    /// event contracts (e.g. annual macro markets) lock capital
+    /// for months without giving the strategy room to capture an
+    /// edge, so we filter them out at the curator. Default 60 d.
+    /// Existing pairs whose Polymarket market is over the horizon
+    /// (or no longer listed) are dropped from state on each tick.
+    #[arg(long, default_value_t = 60)]
+    max_days_to_settle: i64,
+
     /// Long-running mode: tick every `--interval-secs`, only call
     /// Claude on new Polymarket candidates each tick.
     #[arg(long, default_value_t = false)]
@@ -200,6 +211,42 @@ async fn run_tick(rest: &RestClient, args: &Args, state_path: Option<&Path>) -> 
         found = poly.len(),
         min_liquidity_usd = args.min_poly_liquidity,
         "polymarket markets discovered"
+    );
+
+    // Apply settlement-horizon filter: cross-arb is a convergence
+    // strategy and shouldn't be holding multi-month event contracts.
+    let now_unix = current_unix();
+    let cutoff_unix = now_unix.saturating_add(args.max_days_to_settle * 86_400);
+    let in_horizon: std::collections::HashMap<String, bool> = poly
+        .iter()
+        .map(|p| {
+            let ok = poly_in_horizon(p, now_unix, cutoff_unix);
+            (p.id.clone(), ok)
+        })
+        .collect();
+    let dropped_horizon = state.retain_pairs(|p| {
+        in_horizon
+            .get(p.poly_market_id.as_str())
+            .copied()
+            .unwrap_or(false)
+    });
+    if !dropped_horizon.is_empty() {
+        info!(
+            dropped = dropped_horizon.len(),
+            tickers = ?dropped_horizon,
+            max_days_to_settle = args.max_days_to_settle,
+            "dropped pairs out of settlement horizon (or no longer listed)"
+        );
+    }
+
+    let poly: Vec<PolyMarket> = poly
+        .into_iter()
+        .filter(|p| in_horizon.get(p.id.as_str()).copied().unwrap_or(false))
+        .collect();
+    info!(
+        in_horizon = poly.len(),
+        max_days_to_settle = args.max_days_to_settle,
+        "polymarket markets in settlement horizon"
     );
 
     // The whole point of incremental: only feed NEW Polymarket
@@ -424,6 +471,63 @@ fn current_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+}
+
+/// Settlement-horizon predicate: in-horizon iff Polymarket reports
+/// an `endDateIso` within `[now, now + max_days]`. Markets without
+/// an end date are conservatively dropped — we'd rather skip a
+/// good pair than load up on something we can't reason about.
+fn poly_in_horizon(p: &PolyMarket, now_unix: i64, cutoff_unix: i64) -> bool {
+    let Some(iso) = p.end_date_iso.as_deref() else {
+        return false;
+    };
+    let Some(t) = parse_iso8601_to_unix(iso) else {
+        return false;
+    };
+    t > now_unix && t <= cutoff_unix
+}
+
+/// Minimal RFC3339 parser. Accepts both `YYYY-MM-DD` and
+/// `YYYY-MM-DDTHH:MM:SS[.fff]Z` (Polymarket's `endDateIso` is
+/// usually the date-only form; some markets include a time).
+fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    let year: i32 = std::str::from_utf8(bytes.get(0..4)?).ok()?.parse().ok()?;
+    let month: u32 = std::str::from_utf8(bytes.get(5..7)?).ok()?.parse().ok()?;
+    let day: u32 = std::str::from_utf8(bytes.get(8..10)?).ok()?.parse().ok()?;
+    let (hour, min, sec) = if bytes.len() >= 19 && bytes[10] == b'T' {
+        (
+            std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?,
+            std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?,
+            std::str::from_utf8(&bytes[17..19]).ok()?.parse().ok()?,
+        )
+    } else {
+        (0u32, 0u32, 0u32)
+    };
+    if !(1970..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + i64::from(hour) * 3_600 + i64::from(min) * 60 + i64::from(sec))
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as u32;
+    let m_signed = m as i32;
+    let mp = if m_signed > 2 {
+        m_signed - 3
+    } else {
+        m_signed + 9
+    };
+    let doy = (153 * mp + 2) as u32 / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    i64::from(era) * 146_097 + i64::from(doe) - 719_468
 }
 
 async fn wait_for_ctrl_c() {
