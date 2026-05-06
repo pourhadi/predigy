@@ -24,6 +24,7 @@ members = [
     "bin/settlement-trader",
     "bin/cross-arb-curator",
     "bin/stat-curator",
+    "bin/wx-stat-curator",
 ]
 
 [workspace.package]

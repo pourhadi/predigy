@@ -248,6 +248,10 @@ mod tests {
             close_time: close.into(),
             expected_expiration_time: None,
             can_close_early: None,
+            floor_strike: None,
+            cap_strike: None,
+            strike_type: None,
+            occurrence_datetime: None,
         }
     }
 

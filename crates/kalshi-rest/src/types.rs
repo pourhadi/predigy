@@ -96,6 +96,28 @@ pub struct MarketSummary {
     pub expected_expiration_time: Option<String>,
     #[serde(default)]
     pub can_close_early: Option<bool>,
+    /// Numeric lower bound of the YES condition. For threshold
+    /// markets like `KXHIGHDEN-26MAY07-T68` (>68°), this is `68`.
+    /// For range markets (`Bxx.5`) this is the lower bound of the
+    /// range. Absent for non-numeric markets.
+    #[serde(default)]
+    pub floor_strike: Option<f64>,
+    /// Numeric upper bound of the YES condition. Set for range
+    /// markets and "less-than" markets. Absent for `greater`-type
+    /// open-ended threshold markets.
+    #[serde(default)]
+    pub cap_strike: Option<f64>,
+    /// `"greater"`, `"less"`, `"between"`, or `"functional"` —
+    /// describes how the YES side resolves vs the strike(s).
+    /// Authoritative; do NOT infer from the ticker letter prefix.
+    #[serde(default)]
+    pub strike_type: Option<String>,
+    /// RFC3339 timestamp the market settles AGAINST — for daily
+    /// weather markets this is the noon-UTC of the day in question.
+    /// Use this (not `close_time`) to know which calendar day to
+    /// pull the forecast for.
+    #[serde(default)]
+    pub occurrence_datetime: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

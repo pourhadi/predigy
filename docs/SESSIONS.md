@@ -198,6 +198,48 @@ $2 per-side, $2 daily-loss breaker, max 3 contracts per fire,
 output tokens per batch = ~$0.02/batch.  Default 4 batches/run, 4
 runs/day = ~$0.32/day = ~$10/month.
 
+## wx-stat lane scaffolded 2026-05-06 (Phase 1 — not yet deployed)
+
+Forecast-driven cousin of stat-curator: same `StatRule[]` output, but
+`model_p` comes from the NWS hourly point forecast instead of an LLM.
+Targets Kalshi daily-temperature markets (`KXHIGH*` / `KXLOW*`).
+
+**What's in (Phase 1):**
+
+- `crates/ext-feeds/src/nws_forecast.rs` — `NwsForecastClient` with
+  `lookup_point(lat, lon) → GridPoint` and `fetch_hourly(GridPoint) →
+  HourlyForecast`. Handles both scalar and gridded NWS response
+  shapes.
+- `bin/wx-stat-curator/` — full curator. Modules: `airports.rs`
+  (30 hand-curated airport→lat/lon), `ticker_parse.rs` (event
+  ticker + Kalshi `floor_strike`/`strike_type`/`occurrence_datetime`
+  → structured spec), `kalshi_scan.rs` (Climate-and-Weather → temp
+  markets only), `forecast_to_p.rs` (forecast aggregate → conviction
+  zone gate → 0.97/0.03 model_p).
+- `crates/kalshi-rest` extended `MarketSummary` with optional
+  `floor_strike` / `cap_strike` / `strike_type` /
+  `occurrence_datetime` fields. Non-breaking via `#[serde(default)]`.
+- `docs/WX_STAT_PLAN.md` — full Phase 1 / 2 / 3 plan, edge thesis,
+  risk register.
+
+**Live shake-down 2026-05-06:** scanned 285 actionable temp markets
+across 13 airports, emitted 21 rules, 263 skipped (most inside the
+5°F conviction zone). Audit log shows forecast values, hours
+considered, model_p, side, and yes_ask side-by-side. One example
+candidate: `KXLOWTOKC-26MAY07-T43` (>43F low) — NWS forecast 53F low
+→ model_p=0.97, market yes_ask=50¢. Real ~47¢ pre-fee apparent edge.
+
+**NOT yet deployed.** No launchd plist; no live run. Rules file
+written only to `/tmp/wx-stat-rules.json` for inspection. Phase 2
+work (NBM probabilistic forecast, per-airport calibration) and
+Phase 3 (production deploy + launchd) are described in
+`docs/WX_STAT_PLAN.md`.
+
+**Phase 1 conviction-zone gate**: rules only emit when forecast
+margin to the threshold is ≥ 5°F. This compensates for NWS hourly
+being a point forecast rather than a distribution. Phase 2 replaces
+this with calibrated probabilities from NBM gridded data.
+
 ## Open work / next session priorities
 
 In rough order of leverage:

@@ -1785,6 +1785,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stat-curator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "predigy-core",
+ "predigy-kalshi-rest",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "stat-trader",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "stat-trader"
 version = "0.1.0"
 dependencies = [
@@ -2462,6 +2480,24 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "wx-stat-curator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "predigy-core",
+ "predigy-ext-feeds",
+ "predigy-kalshi-rest",
+ "serde",
+ "serde_json",
+ "stat-trader",
  "thiserror",
  "tokio",
  "tracing",

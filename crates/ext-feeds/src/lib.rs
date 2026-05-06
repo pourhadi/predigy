@@ -12,6 +12,9 @@
 //! - [`nws`]: NWS active-alerts (free, polled). Tornado/severe
 //!   warnings, heat advisories, etc. Useful for Kalshi weather
 //!   markets.
+//! - [`nws_forecast`]: NWS hourly point forecast (free, pull-on-
+//!   demand). Used by `wx-stat-curator` to compute model_p for
+//!   Kalshi temperature markets.
 //!
 //! ## Roadmap
 //!
@@ -32,6 +35,10 @@
 
 pub mod error;
 pub mod nws;
+pub mod nws_forecast;
 
 pub use error::Error;
 pub use nws::{MIN_POLL_INTERVAL, NwsAlert, NwsAlertsConfig, parse_collection, spawn as spawn_nws};
+pub use nws_forecast::{
+    GridPoint, HourlyForecast, HourlyForecastEntry, NwsForecastClient, parse_hourly_response,
+};
