@@ -19,7 +19,9 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use cross_arb_curator::{propose_pairs, scan_political_markets, scan_top_markets};
+use cross_arb_curator::{
+    filter_for_batch, propose_pairs, scan_political_markets, scan_top_markets,
+};
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -131,13 +133,22 @@ async fn main() -> Result<()> {
             );
             break;
         }
+        let kalshi_filtered = filter_for_batch(&kalshi, batch);
+        if kalshi_filtered.is_empty() {
+            info!(
+                batch = i,
+                "no Kalshi markets share keywords with this Polymarket batch; skipping"
+            );
+            continue;
+        }
         info!(
             batch = i,
-            kalshi = kalshi.len(),
+            kalshi_total = kalshi.len(),
+            kalshi_filtered = kalshi_filtered.len(),
             poly = batch.len(),
             "calling claude on batch"
         );
-        let raw = match propose_pairs(&kalshi, batch).await {
+        let raw = match propose_pairs(&kalshi_filtered, batch).await {
             Ok(r) => r,
             Err(e) => {
                 warn!(batch = i, error = %e, "batch failed; continuing");
