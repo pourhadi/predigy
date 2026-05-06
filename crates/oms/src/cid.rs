@@ -151,13 +151,22 @@ impl CidAllocator {
     /// `{strategy_id}:{market_ticker}:{seq:08}` — short enough to fit
     /// in the FIX `ClOrdID` (tag 11) limit, structured enough to grep
     /// in log files.
+    ///
+    /// Periods in the market ticker are stripped because Kalshi's
+    /// `events/orders` REST endpoint rejects `client_order_id`
+    /// values containing `.` with a generic `invalid_parameters`
+    /// (verified live May 2026 — half-bracket weather tickers like
+    /// `KXLOWTDEN-26MAY06-B31.5` would otherwise produce cids the
+    /// venue refuses). Strip rather than substitute so we don't
+    /// collide a `B31.5` with a hypothetical `B315`.
     pub fn next(&mut self, market: &MarketTicker) -> OrderId {
         if self.next_seq == self.high_water {
             self.refill();
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        OrderId::new(format!("{}:{}:{:08}", self.strategy_id, market, seq))
+        let safe_market: String = market.as_str().chars().filter(|c| *c != '.').collect();
+        OrderId::new(format!("{}:{}:{:08}", self.strategy_id, safe_market, seq))
     }
 
     fn refill(&mut self) {
@@ -190,6 +199,17 @@ mod tests {
         assert_eq!(a.as_str(), "arb:X:00000000");
         assert_eq!(b.as_str(), "arb:X:00000001");
         assert_eq!(alloc.current_seq(), 2);
+    }
+
+    #[test]
+    fn next_strips_periods_from_market_ticker() {
+        // Kalshi rejects client_order_id values with periods, and the
+        // weather-strategy half-bracket markets (e.g. `B52.5`) have
+        // them — strip in the cid generator so the wire stays clean.
+        let mut alloc = CidAllocator::new("wx", 0);
+        let id = alloc.next(&MarketTicker::new("KXLOWTDEN-26MAY06-B31.5"));
+        assert!(!id.as_str().contains('.'), "cid still has period: {id}");
+        assert_eq!(id.as_str(), "wx:KXLOWTDEN-26MAY06-B315:00000000");
     }
 
     #[test]
