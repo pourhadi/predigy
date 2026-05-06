@@ -265,6 +265,50 @@ margin to the threshold is ≥ 5°F. This compensates for NWS hourly
 being a point forecast rather than a distribution. Phase 2 replaces
 this with calibrated probabilities from NBM gridded data.
 
+## Polymarket WS keepalive flag added 2026-05-06 (opt-in)
+
+`cross-arb.stderr.log` shows the Polymarket CLOB WS connection
+disconnecting on a ~2-minute cadence (69 disconnects in 21h, all
+with "Connection reset without closing handshake"). The trader's
+reconnect path handles them cleanly — each reconnect succeeds in
+under 500ms and re-subscribes — but every disconnect triggers an
+"awaiting fresh book" pause where spreads against Polymarket are
+unavailable until the snapshot replay completes. Estimated
+~0.5%-1% downtime on Polymarket-side data; cross-arb still made
+6 fills today, so degraded but not broken.
+
+**Root cause hypothesis**: Polymarket's CLOB WS server requires
+application-level keepalive (text frame `"PING"` → text frame
+`"PONG"`). tokio-tungstenite handles protocol-level Pings
+automatically, but Polymarket appears to ignore those for idle
+detection.
+
+**Fix shipped opt-in**: `Client::with_text_ping_interval(d)` on
+`predigy-poly-md::Client`. Sends a `"PING"` text frame every `d`;
+`handle_text` recognises `"PONG"` and drops it silently. Default
+behavior (no ping interval) is unchanged — current cross-arb
+deploy keeps running with the existing reconnect cadence.
+
+**To validate the fix**:
+1. In `bin/cross-arb-trader/src/main.rs`, find the
+   `predigy_poly_md::Client::new()` construction and add
+   `.with_text_ping_interval(Duration::from_secs(10))`.
+2. Rebuild + redeploy: `cargo build --release -p cross-arb-trader`
+   then `launchctl kickstart -k gui/$(id -u)/com.predigy.cross-arb`.
+3. Watch `cross-arb.stderr.log` for the disconnect rate. If the
+   2-min disconnects stop, the fix works. If they don't (or get
+   worse), revert.
+
+If the validation goes well, make the ping cadence a default in
+`Client::new()` rather than opt-in.
+
+Test coverage: 2 new loopback tests in
+`crates/poly-md/tests/loopback_session.rs` —
+`text_ping_keepalive_sends_ping_on_interval` (verifies a "PING"
+text frame is emitted on the configured cadence) and
+`pong_response_is_silently_dropped` (verifies `"PONG"` doesn't
+surface as a Malformed event).
+
 ## Open work / next session priorities
 
 In rough order of leverage:

@@ -22,6 +22,7 @@ use crate::messages::{
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use std::collections::BTreeSet;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
@@ -40,6 +41,21 @@ const EVENT_CAPACITY: usize = 4096;
 pub struct Client {
     endpoint: Url,
     backoff: Backoff,
+    /// If `Some(d)`, send a text-frame `"PING"` message every `d` to
+    /// keep the connection alive.  `None` (the default) preserves
+    /// the original behavior of relying on protocol-level keepalive
+    /// only.
+    ///
+    /// Why opt-in: Polymarket's CLOB WS endpoint observed in
+    /// production drops connections every ~2 minutes without
+    /// application-level traffic, even though tokio-tungstenite
+    /// auto-responds to protocol-level Pings.  Setting this to
+    /// ~10s appears (per Polymarket's docs and third-party
+    /// clients) to keep the connection alive indefinitely; left
+    /// opt-in until validated against their live server, since
+    /// pushing the wrong wire format could trigger immediate
+    /// disconnects instead of the steady 2-min cadence.
+    text_ping_interval: Option<Duration>,
 }
 
 impl Client {
@@ -48,6 +64,7 @@ impl Client {
         Ok(Self {
             endpoint: Url::parse(DEFAULT_ENDPOINT)?,
             backoff: Backoff::default_const(),
+            text_ping_interval: None,
         })
     }
 
@@ -56,12 +73,23 @@ impl Client {
         Self {
             endpoint,
             backoff: Backoff::default_const(),
+            text_ping_interval: None,
         }
     }
 
     #[must_use]
     pub fn with_backoff(mut self, backoff: Backoff) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// Enable text-frame `"PING"` keepalive at the given cadence.
+    /// 10 seconds is the conservative default we'd pick if/when
+    /// validated; 30 seconds matches Polymarket's documented
+    /// minimum.  See [`text_ping_interval`](Self::text_ping_interval).
+    #[must_use]
+    pub fn with_text_ping_interval(mut self, interval: Duration) -> Self {
+        self.text_ping_interval = Some(interval);
         self
     }
 
@@ -74,6 +102,7 @@ impl Client {
         let task = tokio::spawn(run_task(RunCtx {
             endpoint: self.endpoint.clone(),
             backoff: self.backoff,
+            text_ping_interval: self.text_ping_interval,
             cmd_rx,
             event_tx,
         }));
@@ -157,6 +186,8 @@ enum TaskCmd {
 struct RunCtx {
     endpoint: Url,
     backoff: Backoff,
+    /// See [`Client::text_ping_interval`].
+    text_ping_interval: Option<Duration>,
     cmd_rx: mpsc::Receiver<TaskCmd>,
     event_tx: mpsc::Sender<Event>,
 }
@@ -247,8 +278,39 @@ where
         return SessionOutcome::Disconnected(format!("send subscribe: {e}"));
     }
 
+    // Optional text-PING keepalive.  When `text_ping_interval` is
+    // None, we still construct an Interval but with a long-enough
+    // period that it won't fire during any realistic session — and
+    // in that case the select branch is gated off by the
+    // `if ctx.text_ping_interval.is_some()` guard.  Using a finite
+    // duration here (7 days) avoids the `Instant::now() + Duration`
+    // overflow that `Duration::MAX` triggers.
+    //
+    // When Some(d), we tick every `d` and push a "PING" text frame.
+    // Polymarket's documented response is "PONG", which
+    // `handle_text` recognises and drops without parsing.
+    let ping_period = ctx
+        .text_ping_interval
+        .unwrap_or(Duration::from_hours(168));
+    let mut ping_tick = tokio::time::interval(ping_period);
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick so we don't double-send a PING
+    // alongside the initial subscribe.
+    ping_tick.reset();
+
     loop {
         tokio::select! {
+            _ = ping_tick.tick(), if ctx.text_ping_interval.is_some() => {
+                // Polymarket-compatible app-level keepalive.  Wire format:
+                // a single text frame containing the ASCII string "PING".
+                // The server replies with "PONG", which `handle_text`
+                // recognises and drops.  Any send error here means the
+                // socket is gone; bubble up the disconnect so the outer
+                // loop can reconnect.
+                if let Err(e) = sink.send(Message::Text("PING".into())).await {
+                    return SessionOutcome::Disconnected(format!("ping: {e}"));
+                }
+            }
             maybe_cmd = ctx.cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { return SessionOutcome::Shutdown };
                 match cmd {
@@ -311,6 +373,13 @@ async fn handle_text(raw: &str, event_tx: &mpsc::Sender<Event>) -> Result<(), Ev
     // first non-whitespace character and dispatch accordingly so a single
     // incoming frame can produce multiple events.
     let trimmed = raw.trim_start();
+    // App-level PING/PONG keepalive: when we send "PING" the server
+    // responds with "PONG"; drop it silently so it doesn't surface
+    // as a Malformed event.  Match exactly — anything else routes
+    // through the normal JSON-decoding path.
+    if trimmed == "PONG" || trimmed.eq_ignore_ascii_case("pong") {
+        return Ok(());
+    }
     let parse_result = if trimmed.starts_with('[') {
         serde_json::from_str::<Vec<Incoming>>(raw).map(EventBatch::Many)
     } else {
