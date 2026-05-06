@@ -218,6 +218,99 @@ pub const AIRPORTS: &[Airport] = &[
         lat: 35.0424,
         lon: -89.9767,
     },
+    // Kalshi uses these multi-letter codes:
+    Airport {
+        code: "PHIL",
+        city: "Philadelphia, PA",
+        lat: 39.8744,
+        lon: -75.2424,
+    }, // KPHL — same coords as PHL alias above
+    Airport {
+        code: "NOLA",
+        city: "New Orleans, LA",
+        lat: 29.9934,
+        lon: -90.2580,
+    }, // KMSY
+    Airport {
+        code: "JFK",
+        city: "New York City, NY (JFK)",
+        lat: 40.6398,
+        lon: -73.7789,
+    },
+    Airport {
+        code: "BUF",
+        city: "Buffalo, NY",
+        lat: 42.9405,
+        lon: -78.7322,
+    },
+    Airport {
+        code: "PIT",
+        city: "Pittsburgh, PA",
+        lat: 40.4914,
+        lon: -80.2330,
+    },
+    Airport {
+        code: "IND",
+        city: "Indianapolis, IN",
+        lat: 39.7173,
+        lon: -86.2944,
+    },
+    Airport {
+        code: "ORL",
+        city: "Orlando, FL",
+        lat: 28.4312,
+        lon: -81.3081,
+    },
+    Airport {
+        code: "JAX",
+        city: "Jacksonville, FL",
+        lat: 30.4941,
+        lon: -81.6879,
+    },
+    Airport {
+        code: "ABQ",
+        city: "Albuquerque, NM",
+        lat: 35.0402,
+        lon: -106.6093,
+    },
+    Airport {
+        code: "SLC",
+        city: "Salt Lake City, UT",
+        lat: 40.7884,
+        lon: -111.9778,
+    },
+    // Aliases for codes Kalshi actually uses (often shorter or
+    // different from the standard FAA 3-letter):
+    Airport {
+        code: "NY",
+        city: "New York City, NY (LGA)",
+        lat: 40.7794,
+        lon: -73.8803,
+    }, // alias for NYC
+    Airport {
+        code: "HOU",
+        city: "Houston, TX (HOU/Hobby)",
+        lat: 29.6454,
+        lon: -95.2789,
+    }, // KHOU
+    Airport {
+        code: "LV",
+        city: "Las Vegas, NV",
+        lat: 36.0840,
+        lon: -115.1537,
+    }, // alias for LAS
+    Airport {
+        code: "MIN",
+        city: "Minneapolis, MN",
+        lat: 44.8848,
+        lon: -93.2223,
+    }, // alias for MSP
+    Airport {
+        code: "SATX",
+        city: "San Antonio, TX",
+        lat: 29.5337,
+        lon: -98.4698,
+    }, // KSAT
 ];
 
 #[cfg(test)]

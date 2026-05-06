@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
     > = HashMap::new();
     let mut rules: Vec<StatRule> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut skip_counts: HashMap<&'static str, u32> = HashMap::new();
 
     for m in &markets {
         match curate_one(&nws, m, &cfg, &mut grid_cache, &mut forecast_cache).await {
@@ -135,16 +136,30 @@ async fn main() -> Result<()> {
             }
             CurateOutcome::Skip(reason) => {
                 debug!(market = %m.ticker, reason = %reason, "skip");
+                *skip_counts.entry(skip_category(&reason)).or_insert(0) += 1;
                 skipped.push((m.ticker.clone(), reason));
             }
             CurateOutcome::Error(reason) => {
                 warn!(market = %m.ticker, reason = %reason, "curate failed");
+                *skip_counts.entry("error").or_insert(0) += 1;
                 skipped.push((m.ticker.clone(), reason));
             }
         }
     }
 
     info!(kept = rules.len(), skipped = skipped.len(), "synthesis done");
+    // Surface skip-category histogram so the operator can see at a
+    // glance whether the conviction-zone gate is the dominant reason
+    // (expected) or whether something more concerning is happening
+    // (e.g. unmapped airports / unsupported strike kinds dominating
+    // the skips → coverage gap that needs filling).
+    if !skip_counts.is_empty() {
+        let mut categories: Vec<(&&str, &u32)> = skip_counts.iter().collect();
+        categories.sort_by(|a, b| b.1.cmp(a.1));
+        for (cat, n) in categories {
+            info!(category = *cat, count = *n, "skip");
+        }
+    }
 
     if args.write {
         write_rules(&rules, &args.output).await?;
@@ -161,6 +176,14 @@ async fn main() -> Result<()> {
             skipped.len(),
             args.output.display()
         );
+        if !skip_counts.is_empty() {
+            let mut categories: Vec<(&&str, &u32)> = skip_counts.iter().collect();
+            categories.sort_by(|a, b| b.1.cmp(a.1));
+            eprintln!("skip categories:");
+            for (cat, n) in categories {
+                eprintln!("  {n:>4}  {cat}");
+            }
+        }
     }
     Ok(())
 }
@@ -326,6 +349,30 @@ fn current_uid() -> Option<u32> {
     let out = std::process::Command::new("id").arg("-u").output().ok()?;
     let s = std::str::from_utf8(&out.stdout).ok()?.trim();
     s.parse().ok()
+}
+
+/// Bucket a skip reason string into a coarse category label for
+/// the per-run histogram. The reason strings are produced by
+/// `curate_one` — keep this categorizer in lockstep with the
+/// match arms there. When a new skip path is added, return a new
+/// category name here so the operator-facing histogram surfaces
+/// it.
+fn skip_category(reason: &str) -> &'static str {
+    if reason.contains("InsideConvictionZone") {
+        "inside_conviction_zone"
+    } else if reason.contains("NoOverlappingHours") {
+        "no_overlapping_forecast_hours"
+    } else if reason.contains("UnsupportedStrikeKind") {
+        "unsupported_strike_kind_between"
+    } else if reason.contains("NonFahrenheitForecast") {
+        "non_fahrenheit_forecast"
+    } else if reason.starts_with("unmapped airport") {
+        "unmapped_airport"
+    } else if reason.starts_with("parse:") {
+        "parse_error"
+    } else {
+        "other"
+    }
 }
 
 fn init_tracing() {

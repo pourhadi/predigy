@@ -136,10 +136,12 @@ fn parse_event_ticker(event_ticker: &str) -> Option<(TempMeasurement, String)> {
     let series = event_ticker.split('-').next()?;
     for (prefix, measurement) in PREFIXES.iter() {
         if let Some(rest) = series.strip_prefix(prefix) {
-            // Airport code is the trailing 3 letters (most series),
-            // sometimes 2 (e.g. KXLOWNY for NYC).
+            // Airport code is variable-length: 2 letters for some
+            // (KXLOWNY = NYC), 3 for most (KXHIGHDEN = DEN), 4 for
+            // a few (KXHIGHPHIL = Philadelphia, KXLOWTNOLA = New
+            // Orleans). Cap at 5 to bound exotic cases.
             let n = rest.len();
-            if n == 3 || n == 2 {
+            if (2..=5).contains(&n) {
                 let code = rest.to_ascii_uppercase();
                 if code.chars().all(|c| c.is_ascii_alphabetic()) {
                     return Some((*measurement, code));
@@ -340,6 +342,36 @@ mod tests {
         )
         .unwrap_err();
         matches!(err, ParseError::NoSettlementDate { .. });
+    }
+
+    #[test]
+    fn parses_4_letter_location_codes() {
+        // Kalshi uses 4-letter codes for some cities
+        // (KXHIGHPHIL → Philadelphia, KXLOWTNOLA → New Orleans).
+        // Regression: the original 2-or-3 length cap silently
+        // skipped these as parse errors instead of letting the
+        // airport-lookup decide.
+        let spec = parse_temp_market(
+            "KXHIGHPHIL-26MAY07",
+            Some("greater"),
+            Some(75.0),
+            None,
+            Some("2026-05-07T14:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(spec.airport_code, "PHIL");
+        assert_eq!(spec.measurement, TempMeasurement::DailyHigh);
+
+        let spec2 = parse_temp_market(
+            "KXLOWTNOLA-26MAY07",
+            Some("less"),
+            Some(72.0),
+            None,
+            Some("2026-05-07T14:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(spec2.airport_code, "NOLA");
+        assert_eq!(spec2.measurement, TempMeasurement::DailyLow);
     }
 
     #[test]
