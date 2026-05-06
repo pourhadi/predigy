@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Forecast-driven curator for Kalshi temperature markets.
+         Pulls the NWS hourly point forecast for each market's airport
+         and emits a StatRule when the forecast clears the threshold
+         by the conviction-zone margin (default 5°F).
+
+         DISABLED BY DEFAULT — Phase 1 is inspection-only.  The
+         output file (~/.config/predigy/wx-stat-rules.json) is NOT
+         consumed by the running stat-trader; the operator reviews
+         the rules and decides whether to merge them in by hand
+         (or to wait for Phase 2 NBM probabilistic + calibration).
+
+         Cadence: every 3h.  NWS hourly forecasts refresh on ~6h
+         intervals (the GFS / NBM model cycles), so 3h captures
+         each refresh shortly after it lands without thrashing.
+         Daily temperature markets settle on the daily high/low at
+         a specific airport — small intra-day forecast updates
+         can flip a marginal market across the conviction threshold.
+
+         Pre-flight: the script refuses to start if NWS_USER_AGENT
+         isn't set in ~/.zprofile (NWS rejects anonymous traffic).
+    -->
+    <key>Label</key>
+    <string>com.predigy.wx-stat-curate</string>
+
+    <key>Disabled</key>
+    <true/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/wx-stat-curate.sh</string>
+    </array>
+
+    <!-- Every 3h: 03/06/09/12/15/18/21/00 local. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <!-- Re-curate immediately on enable so the rule file is fresh
+         the moment the operator flips Disabled=false. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/wx-stat-curate.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/wx-stat-curate.stderr.log</string>
+</dict>
+</plist>

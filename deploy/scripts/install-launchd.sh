@@ -59,11 +59,13 @@ require_file "${PREDIGY_HOME}/target/release/cross-arb-curator" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p cross-arb-curator)"
 require_file "${PREDIGY_HOME}/target/release/settlement-trader" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p settlement-trader)"
+require_file "${PREDIGY_HOME}/target/release/wx-stat-curator" \
+    "build with: (cd $PREDIGY_HOME && cargo build --release -p wx-stat-curator)"
 [[ "$fail" -eq 0 ]] || { echo ""; echo "preflight failed; fix the FAILs above"; exit 1; }
 
 echo ""
 echo "=== installing plists ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader com.predigy.wx-stat-curate; do
     src="${PLIST_SRC}/${name}.plist"
     dst="${LAUNCH_AGENTS}/${name}.plist"
     cp "$src" "$dst"
@@ -76,7 +78,7 @@ done
 
 echo ""
 echo "=== status ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader com.predigy.wx-stat-curate; do
     if launchctl print "gui/$(id -u)/${name}" >/dev/null 2>&1; then
         state=$(launchctl print "gui/$(id -u)/${name}" | grep -E "state\s*=" | head -1 | xargs || true)
         echo "  ${name}: ${state:-loaded}"

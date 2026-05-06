@@ -229,11 +229,36 @@ considered, model_p, side, and yes_ask side-by-side. One example
 candidate: `KXLOWTOKC-26MAY07-T43` (>43F low) — NWS forecast 53F low
 → model_p=0.97, market yes_ask=50¢. Real ~47¢ pre-fee apparent edge.
 
-**NOT yet deployed.** No launchd plist; no live run. Rules file
-written only to `/tmp/wx-stat-rules.json` for inspection. Phase 2
-work (NBM probabilistic forecast, per-airport calibration) and
-Phase 3 (production deploy + launchd) are described in
-`docs/WX_STAT_PLAN.md`.
+**Deploy scaffolding shipped (Disabled=true), not yet enabled:**
+
+- `deploy/scripts/wx-stat-curate.sh` — wrapper. Writes to
+  `~/.config/predigy/wx-stat-rules.json` (separate from
+  stat-rules.json — the wx-stat output is intentionally
+  quarantined for review in Phase 1).
+- `deploy/macos/com.predigy.wx-stat-curate.plist` — every 3h:
+  00/03/06/09/12/15/18/21 local. **Disabled=true by default.**
+- `deploy/scripts/install-launchd.sh` updated to add the new job.
+- Smoke-tested 2026-05-06: wrapper produces 20 valid rules in
+  `~/.config/predigy/wx-stat-rules.json`.
+
+**To enable Phase 1 inspection-only runs:**
+1. Build: `cargo build --release -p wx-stat-curator`
+2. Edit `deploy/macos/com.predigy.wx-stat-curate.plist` →
+   `<key>Disabled</key><false/>`
+3. Re-run `deploy/scripts/install-launchd.sh`
+4. Watch the rule file refresh every 3h:
+   `tail -f ~/Library/Logs/predigy/wx-stat-curate.stderr.log`
+
+**To promote rules to live trading:** wx-stat-rules.json is NOT
+yet read by stat-trader. To put weight on these rules, copy the
+ones you trust into `~/.config/predigy/stat-rules.json` and let
+stat-trader pick them up on its own poll cadence. The deliberate
+two-file split keeps the LLM-curated stat rules and the
+forecast-derived wx-stat rules from racing.
+
+Phase 2 (NBM probabilistic + per-airport calibration) and Phase 3
+(auto-merge into stat-rules.json + bigger-cap deploy) are
+described in `docs/WX_STAT_PLAN.md`.
 
 **Phase 1 conviction-zone gate**: rules only emit when forecast
 margin to the threshold is ≥ 5°F. This compensates for NWS hourly
