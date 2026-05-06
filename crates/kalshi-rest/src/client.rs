@@ -17,6 +17,15 @@ use url::Url;
 const DEFAULT_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
+// Retry budget for 429 rate-limit responses. The fleet of strategies
+// (latency, cross-arb, settlement) shares one Kalshi account quota,
+// so bursty REST traffic from the discovery loops periodically
+// triggers 429. Auto-retry-with-backoff respects Retry-After when
+// present and falls back to capped exponential.
+const MAX_RETRIES_429: u32 = 5;
+const INITIAL_BACKOFF_MS: u64 = 500;
+const MAX_BACKOFF_MS: u64 = 8_000;
+
 // HeaderName::from_static requires lowercase ASCII.
 const H_KEY: HeaderName = HeaderName::from_static("kalshi-access-key");
 const H_TS: HeaderName = HeaderName::from_static("kalshi-access-timestamp");
@@ -86,13 +95,11 @@ impl Client {
         query: &[(&str, String)],
     ) -> Result<T, Error> {
         let url = self.build_url(sub_path)?;
-        let headers = self.sign_headers(&Method::GET, sub_path)?;
         let resp = self
-            .http
-            .get(url)
-            .headers(headers)
-            .query(query)
-            .send()
+            .send_with_retry(|| {
+                let headers = self.sign_headers(&Method::GET, sub_path)?;
+                Ok(self.http.get(url.clone()).headers(headers).query(query))
+            })
             .await?;
         Self::decode_response(resp).await
     }
@@ -103,13 +110,11 @@ impl Client {
         body: &B,
     ) -> Result<T, Error> {
         let url = self.build_url(sub_path)?;
-        let headers = self.sign_headers(&Method::POST, sub_path)?;
         let resp = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(body)
-            .send()
+            .send_with_retry(|| {
+                let headers = self.sign_headers(&Method::POST, sub_path)?;
+                Ok(self.http.post(url.clone()).headers(headers).json(body))
+            })
             .await?;
         Self::decode_response(resp).await
     }
@@ -120,13 +125,11 @@ impl Client {
         query: &[(&str, String)],
     ) -> Result<T, Error> {
         let url = self.build_url(sub_path)?;
-        let headers = self.sign_headers(&Method::DELETE, sub_path)?;
         let resp = self
-            .http
-            .delete(url)
-            .headers(headers)
-            .query(query)
-            .send()
+            .send_with_retry(|| {
+                let headers = self.sign_headers(&Method::DELETE, sub_path)?;
+                Ok(self.http.delete(url.clone()).headers(headers).query(query))
+            })
             .await?;
         Self::decode_response(resp).await
     }
@@ -140,17 +143,49 @@ impl Client {
         body: &B,
     ) -> Result<T, Error> {
         let url = self.build_url(sub_path)?;
-        let headers = self.sign_headers(&Method::DELETE, sub_path)?;
         let resp = self
-            .http
-            .delete(url)
-            .headers(headers)
-            .json(body)
-            .send()
+            .send_with_retry(|| {
+                let headers = self.sign_headers(&Method::DELETE, sub_path)?;
+                Ok(self.http.delete(url.clone()).headers(headers).json(body))
+            })
             .await?;
         Self::decode_response(resp).await
     }
 
+    /// Build a request via the supplied closure and send it,
+    /// retrying with backoff on HTTP 429 responses. Each retry
+    /// rebuilds the request via the closure so a fresh signature
+    /// (and timestamp) is computed each attempt — Kalshi rejects
+    /// signatures whose timestamp is stale.
+    async fn send_with_retry<F>(&self, mut build: F) -> Result<reqwest::Response, Error>
+    where
+        F: FnMut() -> Result<reqwest::RequestBuilder, Error>,
+    {
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+        for attempt in 0..=MAX_RETRIES_429 {
+            let req = build()?;
+            let resp = req.send().await?;
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(resp);
+            }
+            if attempt == MAX_RETRIES_429 {
+                return Ok(resp);
+            }
+            let wait_ms = retry_after_ms(&resp).unwrap_or(backoff_ms);
+            tracing::warn!(attempt = attempt + 1, wait_ms, "kalshi 429; backing off");
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+        }
+        unreachable!("loop returns on the last attempt")
+    }
+}
+
+fn retry_after_ms(resp: &reqwest::Response) -> Option<u64> {
+    let h = resp.headers().get("retry-after")?.to_str().ok()?;
+    h.trim().parse::<u64>().ok().map(|s| s * 1000)
+}
+
+impl Client {
     async fn decode_response<T: serde::de::DeserializeOwned>(
         resp: reqwest::Response,
     ) -> Result<T, Error> {

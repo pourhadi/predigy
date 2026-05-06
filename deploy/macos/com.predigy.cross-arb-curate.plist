@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Cross-arb pair curator. Cron-style: launchd kicks the
+         binary every StartInterval seconds; each tick loads state,
+         scans Kalshi+Polymarket, only calls Claude on NEW
+         candidates, writes the pair file + state file, and
+         kickstarts com.predigy.cross-arb if the pair set changed
+         so the trader picks up new pairs. ThrottleInterval gives
+         launchd a backstop against the binary spinning. -->
+    <key>Label</key>
+    <string>com.predigy.cross-arb-curate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/cross-arb-curate.sh</string>
+    </array>
+
+    <!-- Run once 30 s after load (catches up after a reboot) and
+         then every 10 min. The seen-set keeps the LLM call free
+         when nothing new surfaces. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/cross-arb-curate.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/cross-arb-curate.stderr.log</string>
+</dict>
+</plist>
