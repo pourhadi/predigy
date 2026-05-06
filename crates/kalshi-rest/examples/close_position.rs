@@ -1,17 +1,16 @@
-//! One-shot REST close: sell 1 YES contract IOC on a market we have
-//! a long position on. Uses the raw REST client (no OMS / no
-//! tracking) so it's safe to run even when the OMS thinks there's no
-//! position. Used during the live shake-down to flatten an
-//! orphaned position.
+//! One-shot REST order submit. Used to flatten orphan positions and
+//! to smoke-test the V2 wire shape during live shake-down without
+//! the OMS in the loop.
 //!
 //!     KALSHI_KEY_ID=... KALSHI_PEM=/path/to/key.pem \
 //!       cargo run -p predigy-kalshi-rest --example close_position -- \
-//!       KXNBASERIES-26LALOKCR2-LAL 7 1
+//!       <market> <price_cents> <qty> [buy|sell]
 //!
-//! Args: <market> <price_cents> <qty>
+//! `action` defaults to `sell` (close-position semantics). Pass `buy`
+//! at a stub price (e.g. 1¢) to verify wire shape without filling.
 
 use predigy_kalshi_rest::types::{
-    CreateOrderRequest, OrderSideV2, SelfTradePreventionV2, TimeInForceV2,
+    CreateOrderRequest, OrderAction, OrderSideV2, SelfTradePreventionV2, TimeInForceV2,
 };
 use predigy_kalshi_rest::{Client, Signer};
 use std::env;
@@ -27,6 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("usage: close_position <market> <price_cents> <qty>");
     let price_cents: u8 = env::args().nth(2).expect("price").parse()?;
     let qty: u32 = env::args().nth(3).expect("qty").parse()?;
+    let action = match env::args().nth(4).as_deref() {
+        Some("buy") => OrderAction::Buy,
+        _ => OrderAction::Sell,
+    };
 
     let signer = Signer::from_pem(&key_id, &pem)?;
     let client = Client::authed(signer)?;
@@ -36,7 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let req = CreateOrderRequest {
         ticker: market.clone(),
         client_order_id: cid.clone(),
-        side: OrderSideV2::Ask, // SELL YES
+        // Sell YES → ask side; Buy YES → bid side (matches the
+        // mapping in kalshi-exec).
+        side: match action {
+            OrderAction::Buy => OrderSideV2::Bid,
+            OrderAction::Sell => OrderSideV2::Ask,
+        },
+        action,
         count: format!("{qty}.00"),
         price: format!("{:.4}", f64::from(price_cents) / 100.0),
         time_in_force: TimeInForceV2::ImmediateOrCancel,

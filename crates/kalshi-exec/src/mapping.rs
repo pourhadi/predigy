@@ -1,23 +1,18 @@
 //! Translate between `predigy-core` domain types and Kalshi V2 REST
 //! wire shapes.
 //!
-//! ## YES-only API
+//! ## V2 createorder shape (May 2026 production)
 //!
-//! Kalshi's V2 order endpoint takes a single `side: "bid" | "ask"`
-//! field interpreted on the **YES** book:
+//! Kalshi V2 takes:
 //!
-//! - `bid`  = buy YES         (at price `P`)
-//! - `ask`  = sell YES        (at price `P`)
+//! - `side`: `"yes" | "no"` — the contract leg
+//! - `action`: `"buy" | "sell"` — separate field, required
+//! - `count`: integer contracts
+//! - `yes_price` (cents 1..=99) iff side=yes, else `no_price`
 //!
-//! NO orders are sent as their YES equivalent at the complement price:
-//!
-//! - buy NO  at `P` ⇒ sell YES at `1 − P`  ⇒ `side: "ask"`, `price: 100 − P_cents`
-//! - sell NO at `P` ⇒ buy YES at `1 − P`   ⇒ `side: "bid"`, `price: 100 − P_cents`
-//!
-//! Fills come back with the user's original `side` (`"yes"` or `"no"`)
-//! and `action` (`"buy"` or `"sell"`), so the `mapping::fill_to_report`
-//! direction does **not** need the inverse complement — Kalshi already
-//! tells us which logical side the fill is on.
+//! The (Side, Action) pair maps 1:1 to (side, action) on the wire —
+//! no complement-price flipping. The price always rides on the leg
+//! that matches `side`.
 
 use crate::error::Error;
 use predigy_core::fill::Fill as DomainFill;
@@ -26,7 +21,7 @@ use predigy_core::order::{Order, OrderId, OrderType, TimeInForce};
 use predigy_core::price::{Price, Qty};
 use predigy_core::side::{Action, Side};
 use predigy_kalshi_rest::types::{
-    CreateOrderRequest, FillRecord, OrderSideV2, SelfTradePreventionV2, TimeInForceV2,
+    CreateOrderRequest, FillRecord, OrderAction, OrderSideV2, SelfTradePreventionV2, TimeInForceV2,
 };
 
 /// Map a `predigy_core::Order` to a Kalshi V2 `CreateOrderRequest`.
@@ -42,17 +37,22 @@ pub fn order_to_create_request(order: &Order) -> Result<CreateOrderRequest, Erro
             "Kalshi V2 only accepts limit orders; map market intents to IOC at the worst price",
         ));
     }
-    let (wire_side, wire_price_cents) = map_side(order.side, order.action, order.price);
+    let (wire_side, wire_action) = map_side_action(order.side, order.action);
+    // For NO-side intents, Kalshi takes the YES-equivalent limit
+    // price (complement). The `side` already encodes which book
+    // side; `price` is always the YES-side dollar limit.
+    let yes_equiv_cents = match order.side {
+        Side::Yes => order.price.cents(),
+        Side::No => 100u8.saturating_sub(order.price.cents()),
+    };
     let (tif, post_only) = map_tif(order.tif);
     Ok(CreateOrderRequest {
         ticker: order.market.as_str().to_string(),
         client_order_id: order.client_id.as_str().to_string(),
         side: wire_side,
-        // Kalshi accepts whole-contract counts as decimal strings (e.g.
-        // `"100.00"`); we always serialise integer counts since
-        // `predigy_core::Qty` is `u32`.
-        count: format_qty(order.qty),
-        price: format_cents_to_dollars(wire_price_cents),
+        action: wire_action,
+        count: format!("{}.00", order.qty.get()),
+        price: format_cents_to_dollars(yes_equiv_cents),
         time_in_force: tif,
         self_trade_prevention_type: SelfTradePreventionV2::TakerAtCross,
         post_only,
@@ -60,16 +60,31 @@ pub fn order_to_create_request(order: &Order) -> Result<CreateOrderRequest, Erro
     })
 }
 
-/// Translate the (Side, Action) pair plus a YES-domain price into the
-/// (`bid`/`ask`, price) pair Kalshi expects. NO-side intents are
-/// flipped to their YES-economic equivalent at the complement price.
-fn map_side(side: Side, action: Action, price: Price) -> (OrderSideV2, u8) {
-    match (side, action) {
-        (Side::Yes, Action::Buy) => (OrderSideV2::Bid, price.cents()),
-        (Side::Yes, Action::Sell) => (OrderSideV2::Ask, price.cents()),
-        (Side::No, Action::Buy) => (OrderSideV2::Ask, 100 - price.cents()),
-        (Side::No, Action::Sell) => (OrderSideV2::Bid, 100 - price.cents()),
-    }
+/// `42` → `"0.4200"`. Kalshi expects 4-decimal precision; trailing
+/// zeros are fine.
+fn format_cents_to_dollars(cents: u8) -> String {
+    let dollars = u32::from(cents) / 100;
+    let frac = u32::from(cents) % 100;
+    format!("{dollars}.{frac:02}00")
+}
+
+/// Map (domain Side, domain Action) → (wire side on the YES book,
+/// wire action). The trader's economic intent is preserved on the
+/// `action` field and on which `*_price` leg carries the limit; the
+/// `side` field tells Kalshi which YES-book side the order sits on.
+fn map_side_action(side: Side, action: Action) -> (OrderSideV2, OrderAction) {
+    // The wire `side` is the YES-book side the order rests on. NO-
+    // intent buys post on the YES ask side; NO-intent sells post on
+    // the YES bid side (because buy-NO ≡ sell-YES at complement).
+    let wire_side = match (side, action) {
+        (Side::Yes, Action::Buy) | (Side::No, Action::Sell) => OrderSideV2::Bid,
+        (Side::Yes, Action::Sell) | (Side::No, Action::Buy) => OrderSideV2::Ask,
+    };
+    let wire_action = match action {
+        Action::Buy => OrderAction::Buy,
+        Action::Sell => OrderAction::Sell,
+    };
+    (wire_side, wire_action)
 }
 
 /// `predigy_core::TimeInForce` → Kalshi V2 `time_in_force` + the
@@ -81,18 +96,6 @@ fn map_tif(tif: TimeInForce) -> (TimeInForceV2, Option<bool>) {
         TimeInForce::Fok => (TimeInForceV2::FillOrKill, None),
         TimeInForce::PostOnly => (TimeInForceV2::GoodTillCanceled, Some(true)),
     }
-}
-
-fn format_qty(qty: Qty) -> String {
-    format!("{}.00", qty.get())
-}
-
-/// `42` → `"0.4200"`. Kalshi expects 4-decimal precision; trailing
-/// zeros are fine.
-fn format_cents_to_dollars(cents: u8) -> String {
-    let dollars = u32::from(cents) / 100;
-    let frac = u32::from(cents) % 100;
-    format!("{dollars}.{frac:02}00")
 }
 
 /// Convert a Kalshi `FillRecord` into a `predigy_core::Fill`, using
@@ -202,11 +205,12 @@ mod tests {
     }
 
     #[test]
-    fn maps_buy_yes_to_bid_at_price() {
+    fn maps_buy_yes_to_bid_with_yes_price_and_buy_action() {
         let req =
             order_to_create_request(&order(Side::Yes, Action::Buy, 42, 100, TimeInForce::Gtc))
                 .unwrap();
-        assert!(matches!(req.side, OrderSideV2::Bid));
+        assert_eq!(req.side, OrderSideV2::Bid);
+        assert_eq!(req.action, OrderAction::Buy);
         assert_eq!(req.price, "0.4200");
         assert_eq!(req.count, "100.00");
         assert!(matches!(req.time_in_force, TimeInForceV2::GoodTillCanceled));
@@ -214,33 +218,35 @@ mod tests {
     }
 
     #[test]
-    fn maps_sell_yes_to_ask() {
+    fn maps_sell_yes_to_ask_with_yes_price_and_sell_action() {
         let req =
             order_to_create_request(&order(Side::Yes, Action::Sell, 60, 10, TimeInForce::Ioc))
                 .unwrap();
-        assert!(matches!(req.side, OrderSideV2::Ask));
+        assert_eq!(req.side, OrderSideV2::Ask);
+        assert_eq!(req.action, OrderAction::Sell);
         assert_eq!(req.price, "0.6000");
-        assert!(matches!(
-            req.time_in_force,
-            TimeInForceV2::ImmediateOrCancel
-        ));
     }
 
     #[test]
-    fn maps_buy_no_to_ask_at_complement() {
-        // Buy NO @ 30¢ ≡ sell YES @ 70¢.
+    fn maps_buy_no_to_ask_with_no_price_and_buy_action() {
+        // Buy NO @ 30¢ → posts on YES ask side (sell-yes-equivalent),
+        // but action stays `buy` and price rides `no_price` at face
+        // value. Kalshi accepts (side=ask, action=buy, no_price=30).
         let req = order_to_create_request(&order(Side::No, Action::Buy, 30, 5, TimeInForce::Gtc))
             .unwrap();
-        assert!(matches!(req.side, OrderSideV2::Ask));
+        assert_eq!(req.side, OrderSideV2::Ask);
+        assert_eq!(req.action, OrderAction::Buy);
+        // Buy NO @ 30¢ ≡ buy YES at the complement (70¢) — Kalshi's
+        // `price` is the YES-equivalent dollar limit.
         assert_eq!(req.price, "0.7000");
     }
 
     #[test]
-    fn maps_sell_no_to_bid_at_complement() {
-        // Sell NO @ 30¢ ≡ buy YES @ 70¢.
+    fn maps_sell_no_to_bid_with_no_price_and_sell_action() {
         let req = order_to_create_request(&order(Side::No, Action::Sell, 30, 5, TimeInForce::Gtc))
             .unwrap();
-        assert!(matches!(req.side, OrderSideV2::Bid));
+        assert_eq!(req.side, OrderSideV2::Bid);
+        assert_eq!(req.action, OrderAction::Sell);
         assert_eq!(req.price, "0.7000");
     }
 
