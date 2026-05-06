@@ -31,8 +31,8 @@
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use cross_arb_curator::{
-    CuratorState, KalshiMarket, PolyMarket, StoredPair, filter_for_batch, propose_pairs,
-    scan_political_markets, scan_top_markets,
+    CuratorState, DEFAULT_CATEGORIES, KalshiMarket, PolyMarket, StoredPair, filter_for_batch,
+    propose_pairs, scan_open_markets, scan_top_markets,
 };
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use std::collections::HashSet;
@@ -183,8 +183,10 @@ async fn run_tick(rest: &RestClient, args: &Args, state_path: Option<&Path>) -> 
     let mut state = state_path.map(CuratorState::load).unwrap_or_default();
     let prev_pair_count = state.pairs.len();
 
-    info!("scanning Kalshi political/elections/world/economics markets");
-    let kalshi = scan_political_markets(rest)
+    let now_unix = current_unix();
+    let kalshi_max_secs = args.max_days_to_settle.saturating_mul(86_400);
+    info!(categories = ?DEFAULT_CATEGORIES, max_days_to_settle = args.max_days_to_settle, "scanning Kalshi markets");
+    let kalshi = scan_open_markets(rest, DEFAULT_CATEGORIES, now_unix, kalshi_max_secs)
         .await
         .map_err(|e| anyhow!("kalshi scan: {e}"))?;
     let kalshi_open: HashSet<&str> = kalshi.iter().map(|k| k.ticker.as_str()).collect();
@@ -193,12 +195,12 @@ async fn run_tick(rest: &RestClient, args: &Args, state_path: Option<&Path>) -> 
         info!(
             dropped = dropped_settled.len(),
             tickers = ?dropped_settled,
-            "dropped pairs whose Kalshi side is no longer open"
+            "dropped pairs whose Kalshi side is no longer open or fell out of horizon"
         );
     }
-    info!(found = kalshi.len(), "kalshi markets discovered");
+    info!(found = kalshi.len(), "kalshi markets in horizon");
     if kalshi.is_empty() {
-        warn!("no actionable Kalshi political markets this tick — skipping LLM call");
+        warn!("no actionable Kalshi markets in horizon — skipping LLM call");
         write_outputs(&state, args, state_path, prev_pair_count).await?;
         return Ok(());
     }
@@ -215,7 +217,6 @@ async fn run_tick(rest: &RestClient, args: &Args, state_path: Option<&Path>) -> 
 
     // Apply settlement-horizon filter: cross-arb is a convergence
     // strategy and shouldn't be holding multi-month event contracts.
-    let now_unix = current_unix();
     let cutoff_unix = now_unix.saturating_add(args.max_days_to_settle * 86_400);
     let in_horizon: std::collections::HashMap<String, bool> = poly
         .iter()
@@ -282,7 +283,6 @@ async fn run_tick(rest: &RestClient, args: &Args, state_path: Option<&Path>) -> 
         return Ok(());
     }
 
-    let now_unix = current_unix();
     let mut batch_failures = 0usize;
     for (i, batch) in fresh_poly.chunks(args.batch_size).enumerate() {
         if i >= args.max_batches {
