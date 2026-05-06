@@ -23,6 +23,7 @@ members = [
     "bin/dashboard",
     "bin/settlement-trader",
     "bin/cross-arb-curator",
+    "bin/stat-curator",
 ]
 
 [workspace.package]
@@ -61,6 +62,7 @@ predigy-signals = { path = "crates/signals" }
 predigy-kalshi-fix = { path = "crates/kalshi-fix" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
+stat-trader = { path = "bin/stat-trader" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

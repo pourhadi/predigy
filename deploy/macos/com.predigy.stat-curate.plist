@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Statistical-alpha rule re-curation via Claude.  Runs every
+         6 hours at load + on schedule; the 6h step matches the
+         rate at which sports/political/macro contexts change in
+         Claude's view (game schedules update, polling shifts,
+         macroeconomic data lands).  Faster than wx-curate's 4h
+         is wasteful (Anthropic cost) and slower than 12h leaves
+         too much rule staleness during fast-moving days.
+
+         After each run, kickstarts com.predigy.stat-trader so it
+         picks up new rules without waiting for its own poll
+         cadence.
+
+         Pre-flight: until com.predigy.stat-trader is enabled,
+         the kickstart inside stat-curate.sh is a harmless no-op
+         (launchctl returns an error on a disabled-or-unloaded
+         job; we log + continue).
+    -->
+    <key>Label</key>
+    <string>com.predigy.stat-curate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/stat-curate.sh</string>
+    </array>
+
+    <!-- Every 6h: 02:00 / 08:00 / 14:00 / 20:00 local.  The 02:00
+         tick lands shortly after 00:00 UTC market rollover so the
+         rule file refreshes against the new day's listings before
+         US session-open lookups kick in. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>2</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>14</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>20</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Re-curate immediately on boot so the trader doesn't fire
+         on stale rules after a restart. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/stat-curate.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/stat-curate.stderr.log</string>
+</dict>
+</plist>

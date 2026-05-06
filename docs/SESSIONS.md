@@ -154,6 +154,50 @@ These all live in PR history (#7-#22). When something fails, look
 for similar wire-mismatch issues — Kalshi V2 docs and reality
 diverge.
 
+## Stat-trader lane added 2026-05-06
+
+The stat-curator + stat-trader pair is now built and shipped, mirroring
+the wx-curator + latency-trader pattern but for statistical-alpha
+betting on sports / politics / elections / world / economics markets.
+
+**What's in:**
+
+- `bin/stat-curator/` — Rust binary that scans Kalshi via REST,
+  filters to actionable markets settling within `--max-days-to-settle`
+  (default 14), batches them to Claude with a calibrated-probability
+  prompt, validates each proposed rule (probability range,
+  confidence rating, edge gap, side direction), writes
+  `~/.config/predigy/stat-rules.json`.  Live-shaken 2026-05-06:
+  scanned 25 markets, Claude proposed 2, validated 1 (TSA passenger
+  count, Yes side, model_p=0.28, edge=9¢).
+- `bin/stat-trader/` — was already built; consumes the rule file
+  the curator now produces.
+- `deploy/scripts/stat-curate.sh` + `deploy/scripts/stat-trader-run.sh`
+- `deploy/macos/com.predigy.stat-curate.plist` (every 6h:
+  02/08/14/20 local) + `deploy/macos/com.predigy.stat-trader.plist`
+  (Disabled=true by default)
+- Workspace + install-launchd.sh updated to include both new jobs.
+
+**To activate stat-trader live:**
+
+1. Confirm at least one stat-curate run has produced
+   `~/.config/predigy/stat-rules.json` with non-empty content.
+2. Manually review the rules — each has a `model_p`, `side`, and
+   `min_edge_cents`.  Reject anything that looks miscalibrated.
+3. Edit `<key>Disabled</key><true/>` → `<false/>` in
+   `deploy/macos/com.predigy.stat-trader.plist`.
+4. Re-run `deploy/scripts/install-launchd.sh`.
+5. Watch `~/Library/Logs/predigy/stat-trader.stderr.log` for fires.
+
+**Risk caps default tight for shake-down:** $5 account-wide gross,
+$2 per-side, $2 daily-loss breaker, max 3 contracts per fire,
+60s cooldown between fires per market.  Override via
+`PREDIGY_STAT_*` env vars in `~/.zprofile` after validation.
+
+**Cost shape:** stat-curate Anthropic call is ~3.4K input + ~900
+output tokens per batch = ~$0.02/batch.  Default 4 batches/run, 4
+runs/day = ~$0.32/day = ~$10/month.
+
 ## Open work / next session priorities
 
 In rough order of leverage:

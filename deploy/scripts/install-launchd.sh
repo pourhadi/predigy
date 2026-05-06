@@ -63,7 +63,7 @@ require_file "${PREDIGY_HOME}/target/release/settlement-trader" \
 
 echo ""
 echo "=== installing plists ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader; do
     src="${PLIST_SRC}/${name}.plist"
     dst="${LAUNCH_AGENTS}/${name}.plist"
     cp "$src" "$dst"
@@ -76,7 +76,7 @@ done
 
 echo ""
 echo "=== status ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader; do
     if launchctl print "gui/$(id -u)/${name}" >/dev/null 2>&1; then
         state=$(launchctl print "gui/$(id -u)/${name}" | grep -E "state\s*=" | head -1 | xargs || true)
         echo "  ${name}: ${state:-loaded}"

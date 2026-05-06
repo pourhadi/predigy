@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Statistical-alpha trader.  Long-running.  KeepAlive on
+         crash.  ThrottleInterval 30 s.
+
+         DISABLED BY DEFAULT — operator must explicitly flip
+         `Disabled=false` and reload after:
+           1. The stat-curator has run at least once and produced
+              a non-empty ~/.config/predigy/stat-rules.json
+           2. Operator has reviewed the rules in the file and is
+              comfortable with the proposed model probabilities.
+
+         Risk caps are tight for shake-down: $5 account-wide gross
+         notional, $2 per-side, $2 daily-loss breaker.  Override
+         via env vars in ~/.zprofile after validation.
+
+         The launcher script (`stat-trader-run.sh`) refuses to
+         start if the rule file is empty — so the daemon won't
+         busy-loop crash if the curator hasn't produced rules
+         yet.  Together with this plist's KeepAlive crash-only
+         policy and ThrottleInterval, that gives a clean back-
+         off behavior: no rules → exit 1 → wait 30s → retry.
+    -->
+    <key>Label</key>
+    <string>com.predigy.stat-trader</string>
+
+    <key>Disabled</key>
+    <true/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/stat-trader-run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/stat-trader.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/stat-trader.stderr.log</string>
+</dict>
+</plist>
