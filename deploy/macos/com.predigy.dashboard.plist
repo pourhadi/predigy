@@ -12,7 +12,7 @@
     <array>
         <string>/bin/zsh</string>
         <string>-lc</string>
-        <string>exec /Users/dan/code/predigy/target/release/predigy-dashboard --bind 0.0.0.0:8080 --kalshi-pem $HOME/.config/predigy/kalshi.pem --oms-state $HOME/.config/predigy/oms-state.json --log-file $HOME/Library/Logs/predigy/latency-trader.stderr.log</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/dashboard-run.sh</string>
     </array>
 
     <key>RunAtLoad</key>

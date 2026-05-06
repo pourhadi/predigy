@@ -34,14 +34,6 @@ EOF
     exit 1
 fi
 
-typeset -a PAIR_ARGS
-while IFS= read -r line; do
-    line="${line%%#*}"          # strip comments
-    line="${line//[[:space:]]/}"
-    [[ -z "$line" ]] && continue
-    PAIR_ARGS+=(--pair "$line")
-done < "$PAIRS_FILE"
-
 typeset -a EXTRA_ARGS
 if [[ "${PREDIGY_LIVE:-0}" != "1" ]]; then
     EXTRA_ARGS+=(--dry-run)
@@ -51,13 +43,15 @@ cd "$PREDIGY_HOME"
 
 LIVE_LABEL="dry-run"
 [[ "${PREDIGY_LIVE:-0}" == "1" ]] && LIVE_LABEL="LIVE"
-echo "[$(date -Iseconds)] cross-arb: starting (mode=$LIVE_LABEL, pairs=${#PAIR_ARGS[@]:-0})"
+echo "[$(date -Iseconds)] cross-arb: starting (mode=$LIVE_LABEL, pair_file=$PAIRS_FILE)"
 
 # Defaults sized for a small live account. Override via PREDIGY_*.
 exec "./target/release/cross-arb-trader" \
     --kalshi-key-id "$KALSHI_KEY_ID" \
     --kalshi-pem    "$KALSHI_PEM" \
     --strategy-id   "cross-arb" \
+    --pair-file     "$PAIRS_FILE" \
+    --pair-file-poll-secs "${PREDIGY_CROSS_PAIR_POLL_SECS:-30}" \
     --max-contracts-per-side       "${PREDIGY_CROSS_MAX_CONTRACTS:-2}" \
     --max-notional-cents-per-side  "${PREDIGY_CROSS_MAX_NOTIONAL_PER_SIDE:-200}" \
     --max-account-notional-cents   "${PREDIGY_CROSS_MAX_ACCOUNT_NOTIONAL:-300}" \
@@ -68,5 +62,5 @@ exec "./target/release/cross-arb-trader" \
     --max-size                     "${PREDIGY_CROSS_MAX_SIZE:-2}" \
     --cooldown-ms                  "${PREDIGY_CROSS_COOLDOWN_MS:-1000}" \
     --cid-store     "${CONFIG_DIR}/oms-cids-cross-arb" \
-    "${PAIR_ARGS[@]}" \
+    --oms-state     "${CONFIG_DIR}/oms-state-cross-arb.json" \
     "${EXTRA_ARGS[@]}"

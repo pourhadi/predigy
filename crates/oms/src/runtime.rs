@@ -153,6 +153,16 @@ impl OmsHandle {
             .map_err(|_| OmsError::Closed)
     }
 
+    /// Cheap clone-able control surface — arm/disarm only. Used by
+    /// background tasks (e.g. flag-file watchers, control sockets)
+    /// that need to issue control commands without owning the
+    /// `OmsHandle` event-receiver half.
+    pub fn control(&self) -> OmsControl {
+        OmsControl {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+
     /// Externally-supplied reconciliation: the venue's authoritative
     /// view of `(market, side) -> contracts`. The OMS compares this to
     /// its own ledger and emits `OmsEvent::Reconciled` (with any
@@ -194,6 +204,30 @@ impl Drop for OmsHandle {
         if let Some(handle) = self.task.take() {
             handle.abort();
         }
+    }
+}
+
+/// Cloneable control surface returned by [`OmsHandle::control`].
+/// Lets background tasks arm/disarm the kill switch (and, in the
+/// future, other control commands) without owning the OMS handle.
+#[derive(Debug, Clone)]
+pub struct OmsControl {
+    cmd_tx: mpsc::Sender<OmsCmd>,
+}
+
+impl OmsControl {
+    pub async fn arm_kill_switch(&self) -> Result<(), OmsError> {
+        self.cmd_tx
+            .send(OmsCmd::ArmKillSwitch)
+            .await
+            .map_err(|_| OmsError::Closed)
+    }
+
+    pub async fn disarm_kill_switch(&self) -> Result<(), OmsError> {
+        self.cmd_tx
+            .send(OmsCmd::DisarmKillSwitch)
+            .await
+            .map_err(|_| OmsError::Closed)
     }
 }
 
