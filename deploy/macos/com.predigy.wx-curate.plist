@@ -2,9 +2,14 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Daily Kalshi-weather rule re-curation via Claude. Runs once
-         a day at 06:30 local. After writing fresh rules, kicks the
-         latency-trader plist so it picks them up on restart. -->
+    <!-- Kalshi-weather rule re-curation via Claude. Runs every 4h
+         + at load. Daily-at-06:30-only meant the rules file pointed
+         at "today's" markets which expire at 00:00 UTC, so any
+         alert in the gap window between midnight UTC and the next
+         06:30 cron submitted to a settled market and got rejected.
+         Re-running at 4h cadence keeps the rules current. After
+         each run, kicks latency-trader so it picks up the new
+         rules. -->
     <key>Label</key>
     <string>com.predigy.wx-curate</string>
 
@@ -15,19 +20,55 @@
         <string>exec /Users/dan/code/predigy/deploy/scripts/wx-curate.sh</string>
     </array>
 
-    <!-- 06:30 local. Catches up if the laptop was asleep at the
-         scheduled time (StartCalendarInterval is missed-only when
-         the box is off; launchd runs on next wake). -->
+    <!-- Every 4h: 00:30 / 04:30 / 08:30 / 12:30 / 16:30 / 20:30
+         local. The 4h step ensures the rule file is never more
+         than 4h stale and that a fresh set lands shortly after
+         00:00 UTC market rollover (which is 20:00/19:00 local
+         depending on DST). -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>6</integer>
-        <key>Minute</key>
-        <integer>30</integer>
-    </dict>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>0</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>4</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>12</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>20</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
 
+    <!-- Re-curate immediately on boot so the trader doesn't fire
+         on stale rules after a restart. -->
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
 
     <key>StandardOutPath</key>
     <string>/Users/dan/Library/Logs/predigy/wx-curate.stdout.log</string>
