@@ -94,7 +94,8 @@ mpsc channels into the OMS task; no shared mutable state, no locks.
   confirmed not profitable on efficient markets (NBA series).
   Keep as regression test only.
 - `bin/cross-arb-trader` — Kalshi-vs-Polymarket convergence. Built,
-  NEVER live-shaken. Needs Kalshi/Polymarket pair list to run.
+  NEVER live-shaken. Pair list now produced by `cross-arb-curator`
+  (was previously operator-supplied).
 - `bin/latency-trader` — NWS alerts → Kalshi weather markets. **Currently live.**
 - `bin/stat-trader` — operator-supplied model probabilities. Built,
   no rules curated for it yet.
@@ -105,6 +106,10 @@ mpsc channels into the OMS task; no shared mutable state, no locks.
 
 - `bin/wx-curator` — Claude-powered rule curator for the weather
   strategy. Hits Anthropic Messages API.
+- `bin/cross-arb-curator` — Claude-powered Kalshi/Polymarket pair
+  curator for `cross-arb-trader`. Conservative settlement-alignment
+  prompt; drops ambiguous pairs. Hits gamma-api.polymarket.com +
+  Kalshi REST + Anthropic Messages API.
 - `bin/dashboard` — read-only HTTP dashboard, port 8080, mobile-first.
 
 **Deploy artifacts** (`deploy/`):
