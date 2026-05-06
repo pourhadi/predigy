@@ -1,9 +1,11 @@
 #!/bin/zsh
 # Production launcher for settlement-trader (settlement-time sports).
 #
-# Wrapped by launchd (com.predigy.settlement.plist). Reads market
-# tickers from $HOME/.config/predigy/settlement-markets.txt — one
-# Kalshi ticker per line; lines starting with `#` are comments.
+# Wrapped by launchd (com.predigy.settlement.plist). The trader
+# discovers live sports markets dynamically via Kalshi REST — no
+# markets file needed. Override --series via PREDIGY_SETT_SERIES
+# (space-separated) if you want a custom set; otherwise the default
+# basket of per-event sports series is used.
 #
 # Required env (from ~/.zprofile, sourced by zsh -lc):
 #   KALSHI_KEY_ID, KALSHI_PEM (or default path)
@@ -20,27 +22,12 @@ KALSHI_KEY_ID="${KALSHI_KEY_ID:?KALSHI_KEY_ID env var required}"
 KALSHI_PEM="${KALSHI_PEM:-${CONFIG_DIR}/kalshi.pem}"
 export KALSHI_KEY_ID KALSHI_PEM
 
-MARKETS_FILE="${CONFIG_DIR}/settlement-markets.txt"
-if [[ ! -s "$MARKETS_FILE" ]]; then
-    cat >&2 <<EOF
-[$(date -Iseconds)] settlement-run: no markets configured at $MARKETS_FILE
-  Format: one Kalshi ticker per line. Lines starting with # are comments.
-  Pick markets within ~24h of close, sports preferred (NBA, MLB, NHL).
-  Example file:
-      # NBA closes within 4h
-      KXNBASERIES-26PHINYKR2-NYK
-      KXNBASERIES-26LALOKCR2-OKC
-EOF
-    exit 1
+typeset -a SERIES_ARGS
+if [[ -n "${PREDIGY_SETT_SERIES:-}" ]]; then
+    for s in ${(z)PREDIGY_SETT_SERIES}; do
+        SERIES_ARGS+=(--series "$s")
+    done
 fi
-
-typeset -a MARKET_ARGS
-while IFS= read -r line; do
-    line="${line%%#*}"          # strip comments
-    line="${line//[[:space:]]/}"
-    [[ -z "$line" ]] && continue
-    MARKET_ARGS+=(--market "$line")
-done < "$MARKETS_FILE"
 
 typeset -a EXTRA_ARGS
 if [[ "${PREDIGY_LIVE:-0}" != "1" ]]; then
@@ -51,12 +38,14 @@ cd "$PREDIGY_HOME"
 
 LIVE_LABEL="dry-run"
 [[ "${PREDIGY_LIVE:-0}" == "1" ]] && LIVE_LABEL="LIVE"
-echo "[$(date -Iseconds)] settlement: starting (mode=$LIVE_LABEL, markets=${#MARKET_ARGS[@]:-0})"
+echo "[$(date -Iseconds)] settlement: starting (mode=$LIVE_LABEL, series_overrides=${#SERIES_ARGS[@]:-0})"
 
 exec "./target/release/settlement-trader" \
     --kalshi-key-id "$KALSHI_KEY_ID" \
     --kalshi-pem    "$KALSHI_PEM" \
     --strategy-id   "settlement" \
+    --discovery-interval-secs      "${PREDIGY_SETT_DISCOVERY_SECS:-60}" \
+    --max-secs-to-settle           "${PREDIGY_SETT_MAX_SECS_TO_SETTLE:-1800}" \
     --close-window-secs            "${PREDIGY_SETT_CLOSE_WINDOW_SECS:-600}" \
     --min-price-cents              "${PREDIGY_SETT_MIN_PRICE:-88}" \
     --max-price-cents              "${PREDIGY_SETT_MAX_PRICE:-96}" \
@@ -71,5 +60,5 @@ exec "./target/release/settlement-trader" \
     --rate-window-ms               "${PREDIGY_SETT_RATE_WINDOW_MS:-1000}" \
     --cid-store     "${CONFIG_DIR}/oms-cids-settlement" \
     --oms-state     "${CONFIG_DIR}/oms-state-settlement.json" \
-    "${MARKET_ARGS[@]}" \
+    "${SERIES_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"

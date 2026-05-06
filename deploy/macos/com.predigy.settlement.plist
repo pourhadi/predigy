@@ -3,9 +3,8 @@
 <plist version="1.0">
 <dict>
     <!-- Settlement-time strategy daemon. Long-running. KeepAlive on
-         crash. ThrottleInterval 30 s.
-         Disabled by default — `Disabled=true` until you author
-         ~/.config/predigy/settlement-markets.txt. -->
+         crash. ThrottleInterval 30 s. Discovers live sports markets
+         dynamically — no markets file needed. -->
     <key>Label</key>
     <string>com.predigy.settlement</string>
 
@@ -29,13 +28,6 @@
 
     <key>ThrottleInterval</key>
     <integer>30</integer>
-
-    <!-- Disabled until you write the markets file. To enable:
-         write $HOME/.config/predigy/settlement-markets.txt with one
-         Kalshi ticker per line, then re-run install-launchd.sh and
-         remove this Disabled key. -->
-    <key>Disabled</key>
-    <true/>
 
     <key>StandardOutPath</key>
     <string>/Users/dan/Library/Logs/predigy/settlement.stdout.log</string>

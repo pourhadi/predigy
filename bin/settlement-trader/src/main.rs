@@ -4,24 +4,27 @@
 //! `settlement-trader`: lift the touch on near-locked sports
 //! markets in the final minutes before settlement.
 //!
-//! Subscribes to Kalshi WS for the operator-supplied market list,
-//! evaluates each book update against [`SettlementStrategy`] (heavy-
-//! bid / thin-ask asymmetry inside `close_window`), submits IOC
-//! orders to Kalshi when the rule fires.
+//! Discovers Kalshi sports markets dynamically — no static markets
+//! file. Every `--discovery-interval-secs` (default 60s), polls
+//! REST for open markets in the configured `--series`, filters to
+//! markets whose `expected_expiration_time` is within
+//! `--max-secs-to-settle` from now, and (un)subscribes the WS feed
+//! accordingly. The strategy fires within `--close-window-secs` of
+//! each market's per-event settlement.
 //!
 //! ```text
 //! settlement-trader \
 //!     --kalshi-key-id $KALSHI_KEY_ID --kalshi-pem ./key.pem \
-//!     --market KXNBASERIES-26PHINYKR2-NYK \
-//!     --market KXNBASERIES-26LALOKCR2-OKC \
 //!     --close-window-secs 600 \
+//!     --max-secs-to-settle 1800 \
+//!     --discovery-interval-secs 60 \
 //!     --max-account-notional-cents 300
 //! ```
 //!
-//! Pass each Kalshi market ticker via `--market` once. The binary
-//! pulls the `close_time` for each from `Client::market_detail`
-//! at startup; markets with `close_time` already in the past are
-//! skipped with a warning.
+//! `--series` repeats; defaults to a curated set of per-event
+//! Kalshi sports series. `--market` still works as a manual seed
+//! that bypasses discovery filtering — useful for hand-picking a
+//! specific game.
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
@@ -32,7 +35,8 @@ use predigy_kalshi_md::{Channel as KalshiChannel, Client as MdClient};
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent};
 use predigy_risk::{AccountLimits, Limits, PerMarketLimits, RateLimits, RiskEngine};
-use settlement_trader::{SettlementConfig, SettlementStrategy};
+use settlement_trader::discovery::{self, DiscoveryConfig, DiscoveryDelta};
+use settlement_trader::{DEFAULT_SERIES, SettlementConfig, SettlementStrategy};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,15 +59,34 @@ struct Args {
     #[arg(long)]
     kalshi_ws_endpoint: Option<Url>,
 
-    /// Kalshi market tickers to watch. Pass once per market.
-    #[arg(long = "market", required = true)]
+    /// Manually seed specific Kalshi market tickers. Optional —
+    /// the discovery loop normally finds them automatically. Use
+    /// for hand-picked games or when testing.
+    #[arg(long = "market")]
     markets: Vec<String>,
+
+    /// Kalshi series to scan for live sports markets. Defaults to
+    /// a curated set of per-event series — see DEFAULT_SERIES.
+    #[arg(long = "series")]
+    series: Vec<String>,
+
+    /// How often to re-scan Kalshi for new tickers entering the
+    /// settlement window. Should be << close_window_secs so games
+    /// get discovered with head room before the strategy fires.
+    #[arg(long, default_value_t = 60)]
+    discovery_interval_secs: u64,
+
+    /// Only watch markets whose expected settlement is within this
+    /// many seconds of now. Default 30 min — gives the strategy
+    /// 20 min of book observation before the close_window opens.
+    #[arg(long, default_value_t = 1800)]
+    max_secs_to_settle: i64,
 
     #[arg(long, default_value = "settlement")]
     strategy_id: String,
 
     /// Time-to-close window. Strategy fires only when
-    /// `close_time - now < close_window`. Default 10 min.
+    /// `settle_time - now < close_window`. Default 10 min.
     #[arg(long, default_value_t = 600)]
     close_window_secs: u64,
     #[arg(long, default_value_t = 88)]
@@ -120,6 +143,17 @@ async fn main() -> Result<()> {
     }
     .map_err(|e| anyhow!("rest: {e}"))?;
 
+    // Discovery needs its own REST client because the executor takes
+    // `rest` by move and Client isn't Clone (RSA signer state).
+    let discovery_signer = Signer::from_pem(&args.kalshi_key_id, &pem)
+        .map_err(|e| anyhow!("discovery signer: {e}"))?;
+    let discovery_rest = if let Some(base) = &args.kalshi_rest_endpoint {
+        RestClient::with_base(base, Some(discovery_signer))
+    } else {
+        RestClient::authed(discovery_signer)
+    }
+    .map_err(|e| anyhow!("discovery rest: {e}"))?;
+
     let ws_signer =
         Signer::from_pem(&args.kalshi_key_id, &pem).map_err(|e| anyhow!("ws signer: {e}"))?;
     let ws_client = if let Some(endpoint) = &args.kalshi_ws_endpoint {
@@ -129,8 +163,6 @@ async fn main() -> Result<()> {
     };
     let mut md = ws_client.connect();
 
-    // Build strategy and pre-load each market's close_time via
-    // REST. Markets that already closed are dropped with a warning.
     let mut strategy = SettlementStrategy::new(SettlementConfig {
         close_window: Duration::from_secs(args.close_window_secs),
         min_price_cents: args.min_price_cents,
@@ -139,55 +171,29 @@ async fn main() -> Result<()> {
         size: args.size,
         cooldown: Duration::from_millis(args.cooldown_ms),
     });
-    let now_unix = current_unix();
-    let mut subscribe_markets: Vec<String> = Vec::with_capacity(args.markets.len());
-    for ticker in &args.markets {
-        match rest.market_detail(ticker).await {
-            Ok(detail) => {
-                // Prefer expected_expiration_time over close_time
-                // when both are present and the expected time is
-                // earlier. Per-event sports markets have close_time
-                // weeks past actual game settlement (the auction
-                // window) — keying off close_time means the strategy
-                // never fires near the real settlement.
-                let close_str = &detail.market.close_time;
-                let expected_str = detail.market.expected_expiration_time.as_deref();
-                let close_parsed = parse_iso8601_to_unix(close_str);
-                let expected_parsed = expected_str.and_then(parse_iso8601_to_unix);
-                let (settle_unix, source) = match (expected_parsed, close_parsed) {
-                    (Some(e), Some(c)) if e < c => (e, "expected_expiration_time"),
-                    (Some(e), None) => (e, "expected_expiration_time"),
-                    (_, Some(c)) => (c, "close_time"),
-                    (None, None) => {
-                        warn!(market = %ticker, close_time = %close_str,
-                            "couldn't parse settlement time; skipping");
-                        continue;
-                    }
-                };
-                if settle_unix <= now_unix {
-                    warn!(market = %ticker, source, settle_unix,
-                        "market already past settlement; skipping");
-                    continue;
-                }
-                strategy.set_close_time(MarketTicker::new(ticker), settle_unix);
-                subscribe_markets.push(ticker.clone());
-                info!(
-                    market = %ticker,
-                    source,
-                    secs_to_settle = settle_unix - now_unix,
-                    "settlement-trader: armed"
-                );
-            }
-            Err(e) => {
-                warn!(market = %ticker, error = %e, "couldn't fetch market_detail; skipping");
-            }
-        }
-    }
-    if subscribe_markets.is_empty() {
-        return Err(anyhow!(
-            "no actionable markets — every --market was unparseable, missing, or closed"
-        ));
-    }
+
+    let series = if args.series.is_empty() {
+        DEFAULT_SERIES.iter().map(|s| (*s).to_string()).collect()
+    } else {
+        args.series.clone()
+    };
+    info!(
+        series = ?series,
+        manual_seeds = args.markets.len(),
+        discovery_interval_secs = args.discovery_interval_secs,
+        max_secs_to_settle = args.max_secs_to_settle,
+        "settlement-trader: discovery config"
+    );
+    let mut discovery_rx = discovery::spawn(
+        discovery_rest,
+        DiscoveryConfig {
+            series,
+            interval: Duration::from_secs(args.discovery_interval_secs),
+            max_secs_to_settle: args.max_secs_to_settle,
+            require_quote: false,
+        },
+        args.markets.clone(),
+    );
 
     let limits = Limits {
         per_market: PerMarketLimits {
@@ -239,19 +245,15 @@ async fn main() -> Result<()> {
     )
     .map_err(|e| anyhow!("oms: {e}"))?;
 
-    let req_id = md
-        .subscribe(
-            &[KalshiChannel::OrderbookDelta, KalshiChannel::Ticker],
-            &subscribe_markets,
-        )
-        .await
-        .map_err(|e| anyhow!("subscribe: {e}"))?;
-    info!(req_id, dry_run = args.dry_run, markets = ?subscribe_markets, "settlement-trader: subscribed");
-
-    let mut books: HashMap<MarketTicker, OrderBook> = subscribe_markets
-        .iter()
-        .map(|m| (MarketTicker::new(m), OrderBook::new(m.clone())))
-        .collect();
+    let mut books: HashMap<MarketTicker, OrderBook> = HashMap::new();
+    // Per-ticker subscription bookkeeping. We subscribe one ticker
+    // at a time so each gets its own pair of (orderbook_delta,
+    // ticker) sids, which makes per-ticker unsubscribe trivial.
+    // `pending_subs` maps the subscribe req_id → ticker until the
+    // server's Subscribed message confirms the sid.
+    let mut pending_subs: HashMap<u64, MarketTicker> = HashMap::new();
+    let mut sids_by_ticker: HashMap<MarketTicker, Vec<u64>> = HashMap::new();
+    let channels = [KalshiChannel::OrderbookDelta, KalshiChannel::Ticker];
 
     let stop = wait_for_ctrl_c();
     tokio::pin!(stop);
@@ -263,16 +265,93 @@ async fn main() -> Result<()> {
             }
             ev = md.next_event() => {
                 let Some(ev) = ev else { break; };
-                handle_md(ev, &mut books, &mut strategy, &oms, args.dry_run).await;
+                handle_md(
+                    ev,
+                    &mut books,
+                    &mut strategy,
+                    &oms,
+                    args.dry_run,
+                    &mut pending_subs,
+                    &mut sids_by_ticker,
+                ).await;
             }
             ev = oms.next_event() => {
                 let Some(ev) = ev else { break; };
                 log_oms_event(&ev);
             }
+            delta = discovery_rx.recv() => {
+                let Some(delta) = delta else {
+                    warn!("discovery channel closed; exiting");
+                    break;
+                };
+                apply_discovery_delta(
+                    delta,
+                    &mut md,
+                    &channels,
+                    &mut strategy,
+                    &mut books,
+                    &mut pending_subs,
+                    &mut sids_by_ticker,
+                ).await;
+            }
         }
     }
     oms.close().await;
     Ok(())
+}
+
+async fn apply_discovery_delta(
+    delta: DiscoveryDelta,
+    md: &mut predigy_kalshi_md::Connection,
+    channels: &[KalshiChannel],
+    strategy: &mut SettlementStrategy,
+    books: &mut HashMap<MarketTicker, OrderBook>,
+    pending_subs: &mut HashMap<u64, MarketTicker>,
+    sids_by_ticker: &mut HashMap<MarketTicker, Vec<u64>>,
+) {
+    for (ticker, settle_unix) in delta.add {
+        let key = MarketTicker::new(&ticker);
+        // Strategy-side state: the close-time table and the book.
+        // Set/overwrite even on re-subscribe — the discovery loop
+        // is idempotent on the strategy.
+        strategy.set_close_time(key.clone(), settle_unix);
+        books
+            .entry(key.clone())
+            .or_insert_with(|| OrderBook::new(ticker.clone()));
+        if sids_by_ticker.contains_key(&key) {
+            // Already subscribed — discovery emitted a re-add (e.g.
+            // after a settlement-time update). Strategy state is
+            // refreshed above; nothing more to do.
+            continue;
+        }
+        match md.subscribe(channels, std::slice::from_ref(&ticker)).await {
+            Ok(req_id) => {
+                pending_subs.insert(req_id, key.clone());
+                sids_by_ticker.insert(key, Vec::new());
+                info!(
+                    market = %ticker,
+                    secs_to_settle = settle_unix.saturating_sub(current_unix()),
+                    "settlement-trader: subscribing"
+                );
+            }
+            Err(e) => warn!(market = %ticker, error = %e, "subscribe failed"),
+        }
+    }
+    for ticker in delta.remove {
+        let key = MarketTicker::new(&ticker);
+        let Some(sids) = sids_by_ticker.remove(&key) else {
+            books.remove(&key);
+            continue;
+        };
+        if !sids.is_empty() {
+            if let Err(e) = md.unsubscribe(&sids).await {
+                warn!(market = %ticker, error = %e, "unsubscribe failed");
+            } else {
+                info!(market = %ticker, sids = ?sids, "settlement-trader: unsubscribed");
+            }
+        }
+        books.remove(&key);
+    }
 }
 
 async fn handle_md(
@@ -281,8 +360,18 @@ async fn handle_md(
     strategy: &mut SettlementStrategy,
     oms: &predigy_oms::OmsHandle,
     dry_run: bool,
+    pending_subs: &mut HashMap<u64, MarketTicker>,
+    sids_by_ticker: &mut HashMap<MarketTicker, Vec<u64>>,
 ) {
     use predigy_kalshi_md::Event as MdEvent;
+    if let MdEvent::Subscribed { req_id, sid, .. } = &ev {
+        if let Some(req_id) = req_id
+            && let Some(ticker) = pending_subs.get(req_id).cloned()
+        {
+            sids_by_ticker.entry(ticker).or_default().push(*sid);
+        }
+        return;
+    }
     let updated_market = match ev {
         MdEvent::Snapshot {
             market, snapshot, ..
@@ -383,51 +472,6 @@ fn current_unix() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
-/// Tiny ISO-8601 → unix-seconds parser. RFC3339 is what Kalshi
-/// emits; assumes `Z` suffix (UTC). Returns `None` on any
-/// malformed input — caller should warn-log and skip the market.
-fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
-    // Format: `2026-05-19T00:00:00Z` or `2026-05-19T00:00:00.123456Z`.
-    // Take the first 19 chars — `YYYY-MM-DDTHH:MM:SS` — and parse
-    // each component. Reject anything else.
-    let part = s.get(..19)?;
-    let bytes = part.as_bytes();
-    if bytes.len() != 19 || bytes[4] != b'-' || bytes[10] != b'T' {
-        return None;
-    }
-    let atoi = |slice: &[u8]| -> Option<i64> {
-        let mut n = 0i64;
-        for &c in slice {
-            if !c.is_ascii_digit() {
-                return None;
-            }
-            n = n * 10 + i64::from(c - b'0');
-        }
-        Some(n)
-    };
-    let (y, m, d, hh, mm, ss) = (
-        atoi(&bytes[0..4])?,
-        atoi(&bytes[5..7])?,
-        atoi(&bytes[8..10])?,
-        atoi(&bytes[11..13])?,
-        atoi(&bytes[14..16])?,
-        atoi(&bytes[17..19])?,
-    );
-    // Civil-from-days (Howard Hinnant). UTC, no DST.
-    let y_adj = if m <= 2 { y - 1 } else { y };
-    let era = if y_adj >= 0 {
-        y_adj / 400
-    } else {
-        (y_adj - 399) / 400
-    };
-    let yoe = y_adj - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
-}
-
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -435,41 +479,4 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn iso8601_parser_basic() {
-        // Sanity-check via a self-consistent epoch round-trip rather
-        // than a hand-calculated day count: parse two timestamps a
-        // known number of seconds apart.
-        let a = parse_iso8601_to_unix("2026-05-19T00:00:00Z").unwrap();
-        let b = parse_iso8601_to_unix("2026-05-20T00:00:00Z").unwrap();
-        assert_eq!(b - a, 86_400);
-        // And one round-the-year jump from 2025-01-01 to 2026-01-01
-        // (365 days; 2025 is not a leap year).
-        let y2025 = parse_iso8601_to_unix("2025-01-01T00:00:00Z").unwrap();
-        let y2026 = parse_iso8601_to_unix("2026-01-01T00:00:00Z").unwrap();
-        assert_eq!(y2026 - y2025, 365 * 86_400);
-        // 2024 was a leap year; 2024-01-01 → 2025-01-01 = 366d.
-        let y2024 = parse_iso8601_to_unix("2024-01-01T00:00:00Z").unwrap();
-        assert_eq!(y2025 - y2024, 366 * 86_400);
-    }
-
-    #[test]
-    fn iso8601_parser_with_fractional_secs() {
-        let base = parse_iso8601_to_unix("2026-05-19T00:00:00Z").unwrap();
-        let withtime = parse_iso8601_to_unix("2026-05-19T12:34:56.789Z").unwrap();
-        assert_eq!(withtime - base, 12 * 3600 + 34 * 60 + 56);
-    }
-
-    #[test]
-    fn iso8601_parser_rejects_malformed() {
-        assert!(parse_iso8601_to_unix("not-a-date").is_none());
-        assert!(parse_iso8601_to_unix("2026/05/19").is_none());
-        assert!(parse_iso8601_to_unix("").is_none());
-    }
 }

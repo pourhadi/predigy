@@ -89,6 +89,13 @@ pub struct MarketSummary {
     #[serde(default, deserialize_with = "de_dollars::opt")]
     pub last_price_dollars: Option<f64>,
     pub close_time: String, // RFC3339
+    /// Per-event settlement time. Set on markets with
+    /// `can_close_early=true` (sports games, occurrence markets).
+    /// Often hours/days before `close_time`.
+    #[serde(default)]
+    pub expected_expiration_time: Option<String>,
+    #[serde(default)]
+    pub can_close_early: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
