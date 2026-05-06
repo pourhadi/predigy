@@ -4,10 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0b0d10">
-  <title>predigy · wx</title>
+  <title>predigy · fleet</title>
   <style>
-    /* Mobile-first dark UI. Vanilla CSS — no framework, so no
-       extra HTTP fetch or layout-shift on first paint. */
     :root {
       color-scheme: dark;
       --bg: #0b0d10;
@@ -75,7 +73,27 @@
 
     .empty { color: var(--muted); font-style: italic; padding: 12px 4px; }
 
-    /* On wider screens, give summary cards a 4-up grid. */
+    .strategy-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .strategy-name { font-weight: 600; }
+
+    button.kill {
+      background: var(--bad);
+      color: #0b0d10;
+      border: none;
+      border-radius: 12px;
+      padding: 14px 20px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 14px;
+      width: 100%;
+      cursor: pointer;
+    }
+    button.kill.disarm {
+      background: var(--good);
+    }
+    button.kill:disabled { opacity: 0.6; }
+
     @media (min-width: 640px) {
       .summary > .card { flex: 1 1 22%; }
     }
@@ -85,7 +103,7 @@
 <main>
   <header>
     <div>
-      <h1>predigy · weather strategy</h1>
+      <h1>predigy · fleet</h1>
       <div id="status-line" class="updated">loading …</div>
     </div>
     <span id="health-pill" class="pill muted">—</span>
@@ -102,25 +120,37 @@
       <div class="value" id="m-portfolio">—</div>
     </div>
     <div class="card">
-      <div class="label">today's P&amp;L</div>
+      <div class="label">today's P&amp;L (all)</div>
       <div class="value" id="m-pnl">—</div>
     </div>
     <div class="card">
-      <div class="label">open orders</div>
+      <div class="label">in-flight orders</div>
       <div class="value" id="m-inflight">—</div>
+    </div>
+  </div>
+
+  <h2>strategies</h2>
+  <div id="strats-wrap"></div>
+
+  <h2>kill switch</h2>
+  <div class="card">
+    <div id="kill-state" style="margin-bottom: 12px;">—</div>
+    <button id="kill-btn" class="kill" onclick="toggleKill()">arm kill switch</button>
+    <div class="ev meta" style="margin-top: 8px;">
+      Writes <span class="market" id="kill-path">~/.config/predigy/kill-switch.flag</span>;
+      every strategy daemon polls it every 2 s and refuses new submits while armed.
     </div>
   </div>
 
   <h2>positions</h2>
   <div id="pos-wrap"></div>
 
-  <h2>recent fires</h2>
-  <div id="fires-wrap"></div>
+  <h2>recent events</h2>
+  <div id="events-wrap"></div>
 
   <h2>diagnostics</h2>
   <div class="card">
     <table>
-      <tr><th>kill switch</th><td id="d-kill">—</td></tr>
       <tr><th>last refresh err</th><td id="d-err">—</td></tr>
     </table>
   </div>
@@ -141,56 +171,165 @@ const fmtUnixAge = (ts) => {
     if (d < 86400) return `${Math.round(d / 3600)}h ago`;
     return `${Math.round(d / 86400)}d ago`;
 };
-const setText = (id, v) => { document.getElementById(id).textContent = v; };
-const setHTML = (id, v) => { document.getElementById(id).innerHTML = v; };
+const setText = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+const setHTML = (id, v) => { const e = document.getElementById(id); if (e) e.innerHTML = v; };
 const setNumClass = (el, signedCents) => {
     el.classList.remove("num-pos", "num-neg");
     if (signedCents > 0) el.classList.add("num-pos");
     if (signedCents < 0) el.classList.add("num-neg");
 };
 
+let lastSnap = null;
+
+function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, c => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+}
+
+function renderStrategies(strats) {
+    if (!strats || strats.length === 0) {
+        setHTML("strats-wrap", `<div class="card"><div class="empty">no strategies configured</div></div>`);
+        return;
+    }
+    const totalInFlight = strats.reduce((a, s) => a + (s.oms_in_flight_orders || 0), 0);
+    setText("m-inflight", totalInFlight);
+    const cards = strats.map(s => {
+        let healthPill = `<span class="pill muted">no log</span>`;
+        if (s.log_age_secs != null) {
+            if (s.log_age_secs < 90) healthPill = `<span class="pill good">live · ${s.log_age_secs}s</span>`;
+            else if (s.log_age_secs < 600) healthPill = `<span class="pill warn">stale · ${Math.round(s.log_age_secs / 60)}m</span>`;
+            else healthPill = `<span class="pill bad">down · ${Math.round(s.log_age_secs / 60)}m</span>`;
+        }
+        const killPill = s.oms_kill_switch ? `<span class="pill bad">kill armed</span>` : "";
+        const pnl = s.oms_daily_realized_pnl_cents | 0;
+        const pnlClass = pnl > 0 ? "num-pos" : (pnl < 0 ? "num-neg" : "");
+        return `
+          <div class="card" style="margin-bottom: 8px;">
+            <div class="strategy-row">
+              <span class="strategy-name">${escapeHtml(s.name)}</span>
+              ${healthPill}
+              ${killPill}
+            </div>
+            <div class="ev meta" style="margin-top: 6px;">
+              P&amp;L <span class="${pnlClass}">${fmtCents(pnl, true)}</span>
+              · in-flight <strong>${s.oms_in_flight_orders}</strong>
+              ${s.oms_state_present ? "" : " · <em>no state file</em>"}
+            </div>
+          </div>`;
+    }).join("");
+    setHTML("strats-wrap", cards);
+}
+
+function renderEvents(events) {
+    if (!events || events.length === 0) {
+        setHTML("events-wrap", `<div class="card"><div class="empty">no events recorded yet</div></div>`);
+        return;
+    }
+    const cards = events.slice(0, 20).map(e => {
+        const kindClass = ({
+            fire: "warn", fill: "good", reject: "bad",
+            submit: "muted", position: "good"
+        })[e.kind] || "muted";
+        return `
+          <div class="card" style="margin-bottom: 8px;">
+            <div class="ev">
+              <span class="pill ${kindClass}">${escapeHtml(e.kind)}</span>
+              <span class="market">${escapeHtml(e.strategy)}</span>
+            </div>
+            <div class="ev meta" style="margin-top: 6px;">
+              ${escapeHtml(e.summary)}
+            </div>
+            <div class="ev meta" style="margin-top: 4px;">${fmtUnixAge(e.ts)}</div>
+          </div>`;
+    }).join("");
+    setHTML("events-wrap", cards);
+}
+
+function renderKill(s) {
+    const armed = !!s.kill_flag_armed;
+    const stateEl = document.getElementById("kill-state");
+    if (armed) {
+        stateEl.innerHTML = `<span class="pill bad">FLAG ARMED</span> all strategies refusing new submits`;
+    } else if (s.any_kill_switch) {
+        stateEl.innerHTML = `<span class="pill warn">in-process armed</span> a daemon's OMS is armed but the flag isn't — possible drift`;
+    } else {
+        stateEl.innerHTML = `<span class="pill good">all clear</span>`;
+    }
+    const btn = document.getElementById("kill-btn");
+    btn.classList.toggle("disarm", armed);
+    btn.textContent = armed ? "DISARM" : "ARM KILL SWITCH";
+}
+
+async function toggleKill() {
+    if (!lastSnap) return;
+    const target = !lastSnap.kill_flag_armed;
+    if (target) {
+        const ok = confirm("Arm the kill switch? All strategies will reject new submits within ~2s.");
+        if (!ok) return;
+    }
+    const btn = document.getElementById("kill-btn");
+    btn.disabled = true;
+    try {
+        const r = await fetch("/api/kill", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({armed: target})
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const resp = await r.json();
+        document.getElementById("kill-path").textContent = resp.flag_path;
+        await tick();
+    } catch (e) {
+        alert(`kill toggle failed: ${e}`);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
 function render(s) {
+    lastSnap = s;
     const cash = s.balance_cents | 0;
     const port = s.portfolio_cents | 0;
-    const pnl  = s.oms_daily_realized_pnl_cents | 0;
+    const pnl  = s.total_daily_realized_pnl_cents | 0;
     setText("m-cash", fmtCents(cash));
     setText("m-portfolio", fmtCents(port));
     const pnlEl = document.getElementById("m-pnl");
     pnlEl.textContent = fmtCents(pnl, true);
     setNumClass(pnlEl, pnl);
-    setText("m-inflight", s.oms_in_flight_orders ?? 0);
 
-    // health pill — green if log file written in last 90s.
+    // overall health pill is derived from all strategy log ages.
+    const ages = (s.strategies || []).map(x => x.log_age_secs).filter(x => x != null);
+    const oldest = ages.length ? Math.max(...ages) : null;
     const pill = document.getElementById("health-pill");
     pill.classList.remove("good", "warn", "bad", "muted");
-    let pillText = "—";
-    if (s.log_age_secs == null) {
-        pill.classList.add("warn");
-        pillText = "no log";
-    } else if (s.log_age_secs < 90) {
+    if (oldest == null) {
+        pill.classList.add("muted");
+        pill.textContent = "no logs";
+    } else if (oldest < 90) {
         pill.classList.add("good");
-        pillText = `live · ${s.log_age_secs}s`;
-    } else if (s.log_age_secs < 600) {
+        pill.textContent = `live · ${oldest}s`;
+    } else if (oldest < 600) {
         pill.classList.add("warn");
-        pillText = `stale · ${Math.round(s.log_age_secs / 60)}m`;
+        pill.textContent = `stale · ${Math.round(oldest / 60)}m`;
     } else {
         pill.classList.add("bad");
-        pillText = `down · ${Math.round(s.log_age_secs / 60)}m`;
+        pill.textContent = `down · ${Math.round(oldest / 60)}m`;
     }
-    pill.textContent = pillText;
 
     setText("status-line", `refreshed ${fmtUnixAge(s.refreshed_at)}`);
-    setText("d-kill", s.oms_kill_switch ? "ARMED" : "off");
     setText("d-err", s.last_refresh_error || "ok");
 
-    // positions
+    renderStrategies(s.strategies);
+    renderKill(s);
+
     const positions = s.open_positions || [];
     if (positions.length === 0) {
         setHTML("pos-wrap", `<div class="card"><div class="empty">no open positions</div></div>`);
     } else {
         const rows = positions.map(p => `
           <tr>
-            <td class="market">${p.ticker}</td>
+            <td class="market">${escapeHtml(p.ticker)}</td>
             <td>${p.contracts.toFixed(0)}</td>
             <td>$${p.exposure_dollars.toFixed(2)}</td>
             <td class="${p.realized_pnl_dollars >= 0 ? 'num-pos' : 'num-neg'}">$${p.realized_pnl_dollars.toFixed(2)}</td>
@@ -205,28 +344,7 @@ function render(s) {
           </div>`);
     }
 
-    // recent fires
-    const fires = s.recent_fires || [];
-    if (fires.length === 0) {
-        setHTML("fires-wrap", `<div class="card"><div class="empty">no fires recorded yet</div></div>`);
-    } else {
-        const cards = fires.slice(0, 12).map(f => {
-            const drypill = f.dry_run ? `<span class="pill muted">DRY</span>` : `<span class="pill good">LIVE</span>`;
-            const sevpill = f.severity === "Extreme" ? "bad" : (f.severity === "Severe" ? "warn" : "muted");
-            return `
-              <div class="card" style="margin-bottom: 8px;">
-                <div class="ev">
-                  <span class="market">${f.market}</span>
-                  ${drypill}
-                  <span class="pill ${sevpill}">${f.severity || '?'}</span>
-                </div>
-                <div class="ev meta">
-                  ${f.event} · ${f.side} @ ${f.price_cents}¢ × ${f.size} · ${fmtUnixAge(f.ts)}
-                </div>
-              </div>`;
-        }).join("");
-        setHTML("fires-wrap", cards);
-    }
+    renderEvents(s.recent_events);
 }
 
 async function tick() {

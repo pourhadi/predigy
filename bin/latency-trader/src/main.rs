@@ -27,7 +27,7 @@ use predigy_ext_feeds::{MIN_POLL_INTERVAL, NwsAlertsConfig, spawn_nws};
 use predigy_kalshi_exec::{PollerConfig, RestExecutor};
 use predigy_kalshi_md::Client as MdClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
-use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent};
+use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent, spawn_kill_watcher};
 use predigy_risk::{AccountLimits, Limits, PerMarketLimits, RateLimits, RiskEngine};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -91,6 +91,13 @@ struct Args {
 
     #[arg(long)]
     cid_store: Option<PathBuf>,
+
+    /// Out-of-process kill switch. Path to a flag file the daemon
+    /// polls every 2 s; when its content starts with `armed`, the
+    /// OMS rejects new submits. Used by the dashboard's
+    /// emergency-stop button. Set to `""` to disable.
+    #[arg(long, default_value = "~/.config/predigy/kill-switch.flag")]
+    kill_flag: PathBuf,
 
     /// Path to a JSON file the OMS snapshots its state to. See
     /// `arb-trader --help` for details.
@@ -193,6 +200,14 @@ async fn main() -> Result<()> {
         reports,
     )
     .map_err(|e| anyhow!("oms: {e}"))?;
+
+    // Wire the out-of-process kill flag. Empty path disables the
+    // watcher (useful for tests).
+    let kill_flag = expand_tilde(&args.kill_flag);
+    if !kill_flag.as_os_str().is_empty() {
+        info!(kill_flag = %kill_flag.display(), "kill-flag watcher armed");
+        spawn_kill_watcher(oms.control(), kill_flag, Duration::from_secs(2));
+    }
 
     // The latency strategy doesn't read Kalshi books — the rule
     // file already encodes "what to lift" — so we don't subscribe
@@ -316,6 +331,18 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+/// Expand a leading `~/` to `$HOME` so clap default-value paths
+/// resolve correctly under launchd (which doesn't expand `~`).
+fn expand_tilde(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    p.to_path_buf()
 }
 
 // `predigy_core::market::MarketTicker` is referenced by the rule

@@ -33,7 +33,7 @@ use predigy_core::market::MarketTicker;
 use predigy_kalshi_exec::{PollerConfig, RestExecutor};
 use predigy_kalshi_md::{Channel as KalshiChannel, Client as MdClient};
 use predigy_kalshi_rest::{Client as RestClient, Signer};
-use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent};
+use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent, spawn_kill_watcher};
 use predigy_risk::{AccountLimits, Limits, PerMarketLimits, RateLimits, RiskEngine};
 use settlement_trader::discovery::{self, DiscoveryConfig, DiscoveryDelta};
 use settlement_trader::{DEFAULT_SERIES, SettlementConfig, SettlementStrategy};
@@ -123,6 +123,11 @@ struct Args {
 
     #[arg(long)]
     oms_state: Option<PathBuf>,
+
+    /// Out-of-process kill switch flag file. Polled every 2 s; when
+    /// content starts with `armed` the OMS rejects new submits.
+    #[arg(long, default_value = "~/.config/predigy/kill-switch.flag")]
+    kill_flag: PathBuf,
 }
 
 #[tokio::main]
@@ -244,6 +249,12 @@ async fn main() -> Result<()> {
         reports,
     )
     .map_err(|e| anyhow!("oms: {e}"))?;
+
+    let kill_flag = expand_tilde(&args.kill_flag);
+    if !kill_flag.as_os_str().is_empty() {
+        info!(kill_flag = %kill_flag.display(), "kill-flag watcher armed");
+        spawn_kill_watcher(oms.control(), kill_flag, Duration::from_secs(2));
+    }
 
     let mut books: HashMap<MarketTicker, OrderBook> = HashMap::new();
     // Per-ticker subscription bookkeeping. We subscribe one ticker
@@ -479,4 +490,14 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+fn expand_tilde(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    p.to_path_buf()
 }

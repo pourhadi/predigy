@@ -2,26 +2,29 @@
 #![allow(clippy::doc_markdown, clippy::too_many_lines)]
 
 //! `predigy-dashboard`: mobile-friendly HTTP dashboard for the
-//! weather strategy daemon.
+//! whole strategy fleet.
 //!
 //! Serves a single-page HTML view at `/` that auto-refreshes every
-//! 15 seconds, plus a JSON API at `/api/state` for programmatic
-//! consumers. Backed by a periodically-refreshed in-memory snapshot
-//! that pulls from:
+//! 15 s, plus JSON API at `/api/state`. Backed by a periodically-
+//! refreshed in-memory snapshot that pulls from:
 //!
-//! - Kalshi REST (`/portfolio/balance`, `/portfolio/positions`) for
-//!   the venue's authoritative view of cash + positions.
-//! - The OMS state snapshot file (positions, daily P&L, kill-switch).
-//! - The `latency-trader` log file (parsed for `rule fired` and
-//!   `rule_fired`-derived fill events).
+//! - Kalshi REST (`/portfolio/balance`, `/portfolio/positions`)
+//! - Each strategy's OMS state file (positions, daily P&L,
+//!   kill-switch, in-flight order count)
+//! - Each strategy's stderr log (recent rule fires, fills, errors)
+//! - The shared kill-flag file at `~/.config/predigy/kill-switch.flag`
+//!   (POST `/api/kill` writes/clears this; the strategy daemons
+//!   poll it via [`predigy_oms::spawn_kill_watcher`]).
 //!
 //! ```text
 //! predigy-dashboard \
 //!     --kalshi-key-id $KALSHI_KEY_ID \
 //!     --kalshi-pem    /path/to/kalshi.pem \
-//!     --oms-state     ~/.config/predigy/oms-state.json \
-//!     --log-file      ~/Library/Logs/predigy/latency-trader.stderr.log \
-//!     --bind          0.0.0.0:8080
+//!     --strategy "weather=~/.config/predigy/oms-state.json:~/Library/Logs/predigy/latency-trader.stderr.log" \
+//!     --strategy "settlement=~/.config/predigy/oms-state-settlement.json:~/Library/Logs/predigy/settlement.stderr.log" \
+//!     --strategy "cross-arb=~/.config/predigy/oms-state-cross-arb.json:~/Library/Logs/predigy/cross-arb.stderr.log" \
+//!     --kill-flag ~/.config/predigy/kill-switch.flag \
+//!     --bind 0.0.0.0:8080
 //! ```
 //!
 //! Bind `0.0.0.0:8080` for LAN/Tailscale access from a phone;
@@ -33,28 +36,28 @@ use axum::{
     extract::State,
     http::header,
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
 };
 use clap::Parser;
 use predigy_kalshi_rest::types::MarketPosition;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const RECENT_FIRES_KEEP: usize = 30;
+const RECENT_EVENTS_KEEP: usize = 30;
 const HTML: &str = include_str!("../static/index.html");
 
 #[derive(Debug, Parser)]
 #[command(
     name = "predigy-dashboard",
-    about = "Mobile dashboard for the predigy weather strategy."
+    about = "Mobile dashboard for the predigy fleet."
 )]
 struct Args {
     #[arg(long, env = "KALSHI_KEY_ID")]
@@ -64,17 +67,16 @@ struct Args {
     #[arg(long)]
     kalshi_rest_endpoint: Option<String>,
 
-    /// OMS state snapshot file (the same path latency-trader writes).
-    #[arg(long, default_value = "~/.config/predigy/oms-state.json")]
-    oms_state: PathBuf,
+    /// Repeatable strategy spec: `NAME=OMS_STATE_PATH:LOG_PATH`.
+    /// Pass once per strategy (weather, settlement, cross-arb, …).
+    /// Tilde expansion supported in both paths.
+    #[arg(long = "strategy", value_parser = parse_strategy_spec)]
+    strategies: Vec<StrategySpec>,
 
-    /// latency-trader log file (the dashboard tails the last N
-    /// lines for recent fires/fills).
-    #[arg(
-        long,
-        default_value = "~/Library/Logs/predigy/latency-trader.stderr.log"
-    )]
-    log_file: PathBuf,
+    /// Path to the shared kill-switch flag file. Written by
+    /// `POST /api/kill`. Polled by each strategy daemon.
+    #[arg(long, default_value = "~/.config/predigy/kill-switch.flag")]
+    kill_flag: PathBuf,
 
     /// Bind address. `127.0.0.1:8080` (default) restricts to local;
     /// use `0.0.0.0:8080` for LAN/Tailscale.
@@ -82,29 +84,60 @@ struct Args {
     bind: String,
 }
 
+#[derive(Debug, Clone)]
+struct StrategySpec {
+    name: String,
+    oms_state: PathBuf,
+    log_file: PathBuf,
+}
+
+fn parse_strategy_spec(s: &str) -> std::result::Result<StrategySpec, String> {
+    let (name, rest) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=OMS_PATH:LOG_PATH, got {s:?}"))?;
+    let (oms, log) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| format!("expected OMS_PATH:LOG_PATH, got {rest:?}"))?;
+    Ok(StrategySpec {
+        name: name.trim().to_string(),
+        oms_state: PathBuf::from(oms.trim()),
+        log_file: PathBuf::from(log.trim()),
+    })
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 struct Snapshot {
-    /// Wall-clock unix-seconds when this snapshot was taken.
     refreshed_at: i64,
     /// Cents of settled cash on Kalshi.
     balance_cents: i64,
     /// Cents of mark-to-market open positions.
     portfolio_cents: i64,
-    /// Per-market venue position rows (active, non-zero only).
     open_positions: Vec<PositionRow>,
-    /// OMS-side daily realized P&L, cents (signed).
-    oms_daily_realized_pnl_cents: i64,
-    /// OMS kill-switch armed?
-    oms_kill_switch: bool,
-    /// In-flight order count from the OMS snapshot.
-    oms_in_flight_orders: usize,
-    /// Most recent rule fires parsed from the log (newest first).
-    recent_fires: Vec<FireRow>,
-    /// Latency-trader daemon health: how long since the log file
-    /// was last written, in seconds. `None` if the log is missing.
-    log_age_secs: Option<i64>,
-    /// Last error / warning encountered when refreshing.
+    /// Per-strategy P&L + status rolled up from each OMS state file.
+    strategies: Vec<StrategyRow>,
+    /// Recent rule fires/fills aggregated across all strategy logs,
+    /// newest first.
+    recent_events: Vec<EventRow>,
+    /// Sum of `oms_daily_realized_pnl_cents` across strategies.
+    total_daily_realized_pnl_cents: i64,
+    /// Any strategy currently armed.
+    any_kill_switch: bool,
+    /// Shared kill-flag file currently armed.
+    kill_flag_armed: bool,
     last_refresh_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StrategyRow {
+    name: String,
+    oms_daily_realized_pnl_cents: i64,
+    oms_kill_switch: bool,
+    oms_in_flight_orders: usize,
+    /// How long since the strategy log was last written, in
+    /// seconds. `None` if the log is missing.
+    log_age_secs: Option<i64>,
+    /// `None` if the OMS state file doesn't exist yet.
+    oms_state_present: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,30 +150,53 @@ struct PositionRow {
     resting_orders: u32,
 }
 
+/// Generic strategy event extracted from a stderr log: fires,
+/// submits, fills, rejects.
 #[derive(Debug, Clone, Serialize)]
-struct FireRow {
-    /// Unix seconds.
+struct EventRow {
     ts: i64,
-    market: String,
-    event: String,
-    severity: String,
-    side: String,
-    price_cents: u8,
-    size: u32,
-    dry_run: bool,
+    strategy: String,
+    kind: String,
+    /// Free-form summary the UI displays as the body of the card.
+    summary: String,
 }
 
 #[derive(Clone)]
 struct AppState {
     snapshot: Arc<RwLock<Snapshot>>,
+    kill_flag: Arc<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KillRequest {
+    armed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct KillResponse {
+    armed: bool,
+    flag_path: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
-    let oms_state = expand_tilde(&args.oms_state);
-    let log_file = expand_tilde(&args.log_file);
+    let strategies: Vec<StrategySpec> = args
+        .strategies
+        .into_iter()
+        .map(|s| StrategySpec {
+            name: s.name,
+            oms_state: expand_tilde(&s.oms_state),
+            log_file: expand_tilde(&s.log_file),
+        })
+        .collect();
+    if strategies.is_empty() {
+        return Err(anyhow!(
+            "no --strategy provided; pass at least one NAME=OMS_PATH:LOG_PATH"
+        ));
+    }
+    let kill_flag = expand_tilde(&args.kill_flag);
 
     let pem = std::fs::read_to_string(expand_tilde(&args.kalshi_pem))
         .with_context(|| format!("read PEM at {}", args.kalshi_pem.display()))?;
@@ -155,24 +211,22 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         snapshot: Arc::new(RwLock::new(Snapshot::default())),
+        kill_flag: Arc::new(kill_flag.clone()),
     };
 
-    // Seed the snapshot once before opening the port so the first
-    // request doesn't see a zero-state placeholder.
-    let initial = build_snapshot(&rest, &oms_state, &log_file).await;
+    let initial = build_snapshot(&rest, &strategies, &kill_flag).await;
     *state.snapshot.write().await = initial;
 
-    // Background refresher.
     let refresh_state = state.clone();
     let refresh_rest = rest.clone();
-    let refresh_oms = oms_state.clone();
-    let refresh_log = log_file.clone();
+    let refresh_strats = strategies.clone();
+    let refresh_kill_flag = kill_flag.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REFRESH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let snap = build_snapshot(&refresh_rest, &refresh_oms, &refresh_log).await;
+            let snap = build_snapshot(&refresh_rest, &refresh_strats, &refresh_kill_flag).await;
             *refresh_state.snapshot.write().await = snap;
         }
     });
@@ -180,6 +234,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(serve_html))
         .route("/api/state", get(serve_state))
+        .route("/api/kill", post(serve_kill))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
 
@@ -187,7 +242,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", args.bind))?;
     let bound = listener.local_addr()?;
-    info!(%bound, "predigy-dashboard listening");
+    info!(%bound, strategies = strategies.len(), "predigy-dashboard listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -204,16 +259,50 @@ async fn serve_state(State(state): State<AppState>) -> impl IntoResponse {
     Json(snap)
 }
 
+async fn serve_kill(
+    State(state): State<AppState>,
+    Json(req): Json<KillRequest>,
+) -> impl IntoResponse {
+    let path = state.kill_flag.as_ref().clone();
+    let body = if req.armed { "armed\n" } else { "" };
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)
+    })();
+    match result {
+        Ok(()) => {
+            info!(armed = req.armed, path = %path.display(), "kill flag updated");
+            Json(KillResponse {
+                armed: req.armed,
+                flag_path: path.display().to_string(),
+            })
+            .into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "kill flag write failed");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("kill flag write failed: {e}"),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn build_snapshot(
     rest: &RestClient,
-    oms_state: &std::path::Path,
-    log_file: &std::path::Path,
+    strategies: &[StrategySpec],
+    kill_flag: &std::path::Path,
 ) -> Snapshot {
     let mut snap = Snapshot {
         refreshed_at: now_unix(),
         ..Snapshot::default()
     };
-    // Balance + portfolio value.
+
     match rest.balance().await {
         Ok(b) => {
             snap.balance_cents = b.balance;
@@ -224,7 +313,7 @@ async fn build_snapshot(
             warn!(error = %e, "refresh: balance failed");
         }
     }
-    // Positions (filter to non-zero).
+
     match rest.positions().await {
         Ok(positions_resp) => {
             snap.open_positions = positions_resp
@@ -239,34 +328,55 @@ async fn build_snapshot(
             warn!(error = %e, "refresh: positions failed");
         }
     }
-    // OMS state snapshot — best-effort.
-    match read_oms_state(oms_state) {
-        Ok(Some(oms)) => {
-            snap.oms_daily_realized_pnl_cents = oms
-                .get("account")
-                .and_then(|a| a.get("daily_realized_pnl_cents"))
-                .and_then(serde_json::Value::as_i64)
-                .unwrap_or(0);
-            snap.oms_kill_switch = oms
-                .get("account")
-                .and_then(|a| a.get("kill_switch"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            snap.oms_in_flight_orders = oms
-                .get("orders")
-                .and_then(serde_json::Value::as_array)
-                .map_or(0, std::vec::Vec::len);
+
+    let mut total_pnl: i64 = 0;
+    let mut any_kill = false;
+    let mut all_events: Vec<EventRow> = Vec::new();
+    for strat in strategies {
+        let mut row = StrategyRow {
+            name: strat.name.clone(),
+            oms_daily_realized_pnl_cents: 0,
+            oms_kill_switch: false,
+            oms_in_flight_orders: 0,
+            log_age_secs: log_age_secs(&strat.log_file),
+            oms_state_present: false,
+        };
+        match read_oms_state(&strat.oms_state) {
+            Ok(Some(oms)) => {
+                row.oms_state_present = true;
+                row.oms_daily_realized_pnl_cents = oms
+                    .get("account")
+                    .and_then(|a| a.get("daily_realized_pnl_cents"))
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                row.oms_kill_switch = oms
+                    .get("account")
+                    .and_then(|a| a.get("kill_switch"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                row.oms_in_flight_orders = oms
+                    .get("orders")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, std::vec::Vec::len);
+            }
+            Ok(None) => { /* file not yet written */ }
+            Err(e) => {
+                snap.last_refresh_error = Some(format!("oms-state {}: {e}", strat.name));
+            }
         }
-        Ok(None) => {
-            // First-run case — file not yet written.
-        }
-        Err(e) => {
-            snap.last_refresh_error = Some(format!("oms-state: {e}"));
-        }
+        total_pnl += row.oms_daily_realized_pnl_cents;
+        any_kill = any_kill || row.oms_kill_switch;
+        all_events.extend(parse_recent_events(&strat.name, &strat.log_file));
+        snap.strategies.push(row);
     }
-    // Tail log for fires + age.
-    snap.log_age_secs = log_age_secs(log_file);
-    snap.recent_fires = parse_recent_fires(log_file);
+    snap.total_daily_realized_pnl_cents = total_pnl;
+    snap.any_kill_switch = any_kill;
+    snap.kill_flag_armed = read_kill_flag(kill_flag);
+
+    all_events.sort_by_key(|e| std::cmp::Reverse(e.ts));
+    all_events.truncate(RECENT_EVENTS_KEEP);
+    snap.recent_events = all_events;
+
     snap
 }
 
@@ -295,6 +405,10 @@ fn read_oms_state(path: &std::path::Path) -> Result<Option<serde_json::Value>> {
     }
 }
 
+fn read_kill_flag(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|s| s.trim().to_ascii_lowercase().starts_with("armed"))
+}
+
 fn log_age_secs(path: &std::path::Path) -> Option<i64> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
@@ -303,94 +417,64 @@ fn log_age_secs(path: &std::path::Path) -> Option<i64> {
     i64::try_from(dur.as_secs()).ok()
 }
 
-/// Tails the log file looking for the structured "rule fired" line
-/// emitted by latency-trader. The line is roughly:
-///
-///   2026-05-05T... INFO latency-trader: rule fired event=...
-///       area=... severity=... market=... side=... price=... size=...
-///       dry_run=... rule_idx=...
-///
-/// We do a brittle but cheap regex parse — production-grade would
-/// switch latency-trader to JSON logs and consume that. For v1 the
-/// goal is "show the operator what's happening" and a fuzzy parser
-/// gets us 95% of the way there with no dependency.
-fn parse_recent_fires(path: &std::path::Path) -> Vec<FireRow> {
+/// Parse the last N kind-of-interest lines from a strategy log.
+/// We pick up `rule fired`, `submitted`, `filled`, `partial`,
+/// `rejected`, and any line with a `cid=` plus `position`.
+fn parse_recent_events(strategy: &str, path: &std::path::Path) -> Vec<EventRow> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let mut fires: Vec<FireRow> = Vec::new();
+    let mut out: Vec<EventRow> = Vec::new();
     for raw in text.lines().rev() {
-        if !raw.contains("rule fired") {
-            continue;
-        }
-        // Strip ANSI colour codes that tracing emits when not piped
-        // through a tty stripper.
         let line = strip_ansi(raw);
-        let Some(fire) = parse_fire_line(&line) else {
+        let lower = line.to_ascii_lowercase();
+        let kind = if lower.contains("rule fired") {
+            "fire"
+        } else if lower.contains(" filled ") || lower.contains(" partial ") {
+            "fill"
+        } else if lower.contains("submit rejected") || lower.contains("rejected ") {
+            "reject"
+        } else if lower.contains(" submitted ") {
+            "submit"
+        } else if lower.contains("position ") && lower.contains("cid=") {
+            "position"
+        } else {
             continue;
         };
-        fires.push(fire);
-        if fires.len() >= RECENT_FIRES_KEEP {
+        let ts = parse_iso_timestamp(&line);
+        let summary = extract_summary(&line);
+        out.push(EventRow {
+            ts,
+            strategy: strategy.to_string(),
+            kind: kind.to_string(),
+            summary,
+        });
+        if out.len() >= RECENT_EVENTS_KEEP {
             break;
         }
     }
-    fires
+    out
 }
 
-fn parse_fire_line(line: &str) -> Option<FireRow> {
-    let ts = parse_iso_timestamp(line);
-    // Each known key's value runs from `<key>=` up to the next
-    // ` <known-key>=` boundary. Without the leading space, a value
-    // like `area=Lincoln, Lyon ...` would swallow the whole tail.
-    let event = field(line, "event=", &[" area=", " severity="]).unwrap_or_default();
-    let severity = field(line, "severity=", &[" market=", " rule_idx="]).unwrap_or_default();
-    let market = field(line, "market=", &[" side="]).unwrap_or_default();
-    let side = field(line, "side=", &[" price="]).unwrap_or_default();
-    let price_cents = field(line, "price=", &[" size="])
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(0);
-    let qty = field(line, "size=", &[" dry_run="])
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    let dry_run = field(line, "dry_run=", &[" rule_idx="])
-        .or_else(|| field(line, "dry_run=", &[]))
-        .as_deref()
-        == Some("true");
-    if market.is_empty() || event.is_empty() {
-        return None;
-    }
-    Some(FireRow {
-        ts,
-        market,
-        event,
-        severity,
-        side,
-        price_cents,
-        size: qty,
-        dry_run,
-    })
+/// Pull the structured-fields tail off a tracing log line.
+/// Tracing's `key=value` tail starts after the message; we keep
+/// it short and human-readable for the dashboard card.
+fn extract_summary(line: &str) -> String {
+    // Drop the leading timestamp + level + module prefix if any.
+    // Best-effort: split on the first occurrence of double-space
+    // after the initial timestamp and keep everything past it.
+    let trimmed = line.trim();
+    let after_ts = trimmed.get(20..).unwrap_or(trimmed);
+    let after_level = after_ts
+        .split_once("INFO ")
+        .map(|x| x.1)
+        .or_else(|| after_ts.split_once("WARN ").map(|x| x.1))
+        .or_else(|| after_ts.split_once("ERROR").map(|x| x.1))
+        .unwrap_or(after_ts);
+    after_level.trim().chars().take(200).collect()
 }
 
-/// Extract `<start>VALUE<end-marker>` from `line`. Picks the
-/// nearest `end_markers` match (so multiple candidates work). If
-/// none match, runs to end of line.
-fn field(line: &str, start: &str, end_markers: &[&str]) -> Option<String> {
-    let i = line.find(start)? + start.len();
-    let tail = &line[i..];
-    let j = end_markers
-        .iter()
-        .filter_map(|m| tail.find(m))
-        .min()
-        .unwrap_or(tail.len());
-    Some(tail[..j].trim().to_string())
-}
-
-/// Best-effort: pull the leading ISO timestamp out of the log line.
-/// Returns 0 if the line doesn't start with one.
 fn parse_iso_timestamp(line: &str) -> i64 {
-    // Lines look like `2026-05-05T19:33:51.236748Z INFO ...`. Keep
-    // the date+time part, drop fractional seconds + `Z`, parse to
-    // unix-seconds via a tiny manual scan (no chrono dep).
     let part = line.get(..19).unwrap_or("");
     let bytes = part.as_bytes();
     if bytes.len() < 19 || bytes[4] != b'-' || bytes[10] != b'T' {
@@ -421,9 +505,6 @@ fn atoi(b: &[u8]) -> i64 {
     n
 }
 
-/// Days from 1970-01-01 to (year, month, day) UTC. Civil-from-days
-/// algorithm (Howard Hinnant). No locale, no DST — log timestamps
-/// are emitted as UTC `Z` by tracing's default fmt.
 fn days_from_epoch_utc(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
@@ -435,14 +516,10 @@ fn days_from_epoch_utc(y: i64, m: i64, d: i64) -> i64 {
 }
 
 fn strip_ansi(s: &str) -> String {
-    // Trivial state machine — sufficient for the `\x1b[...m` SGR
-    // sequences `tracing-subscriber` emits. Doesn't bother with
-    // full ANSI; nothing else appears in our logs.
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            // skip until 'm'
             for d in chars.by_ref() {
                 if d == 'm' {
                     break;
@@ -480,25 +557,28 @@ fn init_tracing() {
         .init();
 }
 
-// Keep `Instant` referenced so the lints don't warn on a stale
-// import if the periodic task signature changes.
-const _UNUSED_INSTANT: Option<Instant> = None;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parse_fire_extracts_fields() {
-        let raw = "2026-05-05T19:33:51.236748Z  INFO latency-trader: rule fired \
-                   rule_idx=44 event=Winter Storm Warning area=South CO severity=Severe \
-                   market=KXHIGHDEN-26MAY05-T48 side=Yes price=52 size=1 dry_run=true";
-        let f = parse_fire_line(raw).expect("parsed");
-        assert_eq!(f.market, "KXHIGHDEN-26MAY05-T48");
-        assert_eq!(f.severity, "Severe");
-        assert_eq!(f.price_cents, 52);
-        assert_eq!(f.size, 1);
-        assert!(f.dry_run);
+    fn parse_strategy_spec_ok() {
+        let s = parse_strategy_spec("weather=/tmp/oms.json:/tmp/wx.log").unwrap();
+        assert_eq!(s.name, "weather");
+        assert_eq!(s.oms_state, PathBuf::from("/tmp/oms.json"));
+        assert_eq!(s.log_file, PathBuf::from("/tmp/wx.log"));
+    }
+
+    #[test]
+    fn parse_strategy_spec_with_tilde() {
+        let s = parse_strategy_spec("x=~/oms.json:~/log").unwrap();
+        assert_eq!(s.oms_state, PathBuf::from("~/oms.json"));
+    }
+
+    #[test]
+    fn parse_strategy_spec_rejects_malformed() {
+        assert!(parse_strategy_spec("bad").is_err());
+        assert!(parse_strategy_spec("name=/path-without-colon").is_err());
     }
 
     #[test]

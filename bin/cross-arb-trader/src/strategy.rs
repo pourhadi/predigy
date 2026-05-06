@@ -111,6 +111,22 @@ impl CrossArbStrategy {
         &self.config
     }
 
+    /// Add a Kalshi↔Polymarket pair at runtime. No-op if already
+    /// present. Used by the pair-file watcher when curator output
+    /// grows.
+    pub fn add_pair(&mut self, kalshi: MarketTicker, poly_asset: String) {
+        self.market_map.insert(kalshi, poly_asset);
+    }
+
+    /// Remove a pair. Returns the Polymarket asset id if the pair
+    /// existed (the caller uses this to issue a Polymarket
+    /// unsubscribe). Cooldown bookkeeping for the dropped market is
+    /// also cleared so a future re-add starts clean.
+    pub fn remove_pair(&mut self, kalshi: &MarketTicker) -> Option<String> {
+        self.last_submit_at.remove(kalshi);
+        self.market_map.remove(kalshi)
+    }
+
     /// Update the reference for one Polymarket asset. Call this from
     /// the Polymarket WS event handler whenever a `book` or
     /// `price_change` fires.

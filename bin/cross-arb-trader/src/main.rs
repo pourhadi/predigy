@@ -22,7 +22,7 @@ use predigy_core::market::MarketTicker;
 use predigy_kalshi_exec::{PollerConfig, RestExecutor};
 use predigy_kalshi_md::{Channel as KalshiChannel, Client as MdClient};
 use predigy_kalshi_rest::{Client as RestClient, Signer};
-use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent};
+use predigy_oms::{CidBacking, Oms, OmsConfig, OmsEvent, spawn_kill_watcher};
 use predigy_poly_md::{Client as PolyClient, Event as PolyEvent};
 use predigy_risk::{AccountLimits, Limits, PerMarketLimits, RateLimits, RiskEngine};
 use std::collections::HashMap;
@@ -39,9 +39,25 @@ use url::Url;
 )]
 struct Args {
     /// Pair Kalshi market ↔ Polymarket asset_id with `=`. Pass once
-    /// per pair, e.g. `--pair FED-23DEC=0xabc`.
-    #[arg(long = "pair", required = true, value_parser = parse_pair)]
+    /// per pair, e.g. `--pair FED-23DEC=0xabc`. Required iff
+    /// `--pair-file` is not given.
+    #[arg(long = "pair", value_parser = parse_pair)]
     pairs: Vec<(MarketTicker, String)>,
+
+    /// Path to a pair file (`KALSHI_TICKER=POLY_ASSET_ID` per line,
+    /// `#` comments allowed). When set, the daemon polls the file
+    /// every `--pair-file-poll-secs`, diffs against the current
+    /// pair set, and dynamically subscribes new pairs +
+    /// unsubscribes removed ones. Used in production where the
+    /// curator daemon writes the file.
+    #[arg(long)]
+    pair_file: Option<PathBuf>,
+
+    /// How often to re-read `--pair-file`. Lower values pick up
+    /// curator-written changes faster at the cost of a syscall per
+    /// tick.
+    #[arg(long, default_value_t = 30)]
+    pair_file_poll_secs: u64,
 
     #[arg(long, env = "KALSHI_KEY_ID")]
     kalshi_key_id: String,
@@ -93,6 +109,12 @@ struct Args {
     /// `arb-trader --help` for details.
     #[arg(long)]
     oms_state: Option<PathBuf>,
+
+    /// Out-of-process kill switch. Path to a flag file the daemon
+    /// polls every 2 s; when its content starts with `armed`, the
+    /// OMS rejects new submits. Set to `""` to disable.
+    #[arg(long, default_value = "~/.config/predigy/kill-switch.flag")]
+    kill_flag: PathBuf,
 }
 
 fn parse_pair(s: &str) -> std::result::Result<(MarketTicker, String), String> {
@@ -194,15 +216,34 @@ async fn main() -> Result<()> {
     )
     .map_err(|e| anyhow!("oms init: {e}"))?;
 
-    let market_map: HashMap<MarketTicker, String> = args.pairs.iter().cloned().collect();
+    let kill_flag = expand_tilde(&args.kill_flag);
+    if !kill_flag.as_os_str().is_empty() {
+        info!(kill_flag = %kill_flag.display(), "kill-flag watcher armed");
+        spawn_kill_watcher(oms.control(), kill_flag, Duration::from_secs(2));
+    }
+
+    let pair_file_path = args.pair_file.as_ref().map(|p| expand_tilde(p));
+    let initial_map = build_initial_pair_map(&args.pairs, pair_file_path.as_deref())?;
+    if initial_map.is_empty() {
+        return Err(anyhow!(
+            "no pairs configured: pass --pair or --pair-file with at least one entry"
+        ));
+    }
     let mut strategy = CrossArbStrategy::new(
         CrossArbConfig {
             min_edge_cents: args.min_edge_cents,
             max_size: args.max_size,
             cooldown: Duration::from_millis(args.cooldown_ms),
         },
-        market_map,
+        initial_map.clone(),
     );
+
+    // Track current pair set for the file watcher's diff logic.
+    let mut active_pairs: HashMap<MarketTicker, String> = initial_map;
+    let mut pair_file_mtime: Option<std::time::SystemTime> = pair_file_path
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok());
 
     let kalshi_market_strs: Vec<String> = strategy
         .kalshi_markets()
@@ -246,6 +287,11 @@ async fn main() -> Result<()> {
     let stop = wait_for_ctrl_c();
     tokio::pin!(stop);
 
+    let mut pair_tick = tokio::time::interval(Duration::from_secs(args.pair_file_poll_secs));
+    pair_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Burn the immediate first tick so we don't re-read on startup.
+    pair_tick.tick().await;
+
     loop {
         tokio::select! {
             () = &mut stop => {
@@ -264,10 +310,140 @@ async fn main() -> Result<()> {
                 let Some(ev) = ev else { break; };
                 log_oms_event(&ev);
             }
+            _ = pair_tick.tick(), if pair_file_path.is_some() => {
+                let path = pair_file_path.as_deref().expect("guarded by select condition");
+                match maybe_reload_pairs(path, &mut pair_file_mtime) {
+                    Ok(Some(next_map)) => {
+                        apply_pair_diff(
+                            &active_pairs,
+                            &next_map,
+                            &mut strategy,
+                            &mut books,
+                            &mut kalshi_md,
+                            &mut poly_md,
+                        ).await;
+                        active_pairs = next_map;
+                    }
+                    Ok(None) => { /* no change */ }
+                    Err(e) => warn!(error = %e, "pair-file reload failed; keeping current set"),
+                }
+            }
         }
     }
     oms.close().await;
     Ok(())
+}
+
+fn build_initial_pair_map(
+    cli: &[(MarketTicker, String)],
+    pair_file: Option<&std::path::Path>,
+) -> Result<HashMap<MarketTicker, String>> {
+    if let Some(path) = pair_file {
+        let parsed =
+            cross_arb_trader::pair_file::read(path).context("read --pair-file at startup")?;
+        let mut map: HashMap<MarketTicker, String> = parsed
+            .into_iter()
+            .map(|(k, p)| (MarketTicker::new(k), p))
+            .collect();
+        // CLI --pair entries are merged on top, useful for hand-
+        // testing additions without editing the file.
+        for (k, p) in cli {
+            map.insert(k.clone(), p.clone());
+        }
+        Ok(map)
+    } else {
+        Ok(cli.iter().cloned().collect())
+    }
+}
+
+/// Returns `Some(map)` if the file changed since `last_mtime` and
+/// parsed cleanly; `None` if there was no change. Updates
+/// `last_mtime` on a successful read.
+fn maybe_reload_pairs(
+    path: &std::path::Path,
+    last_mtime: &mut Option<std::time::SystemTime>,
+) -> Result<Option<HashMap<MarketTicker, String>>> {
+    let meta = std::fs::metadata(path).context("stat pair-file")?;
+    let mtime = meta.modified().context("pair-file mtime")?;
+    if Some(mtime) == *last_mtime {
+        return Ok(None);
+    }
+    let parsed = cross_arb_trader::pair_file::read(path).context("re-read pair-file")?;
+    let map: HashMap<MarketTicker, String> = parsed
+        .into_iter()
+        .map(|(k, p)| (MarketTicker::new(k), p))
+        .collect();
+    *last_mtime = Some(mtime);
+    Ok(Some(map))
+}
+
+/// Apply the diff between the previous and new pair set: subscribe
+/// new pairs to both venues, remove gone pairs from the strategy.
+/// Note: we don't unsubscribe gone pairs from the WS feeds — the
+/// strategy's `evaluate()` is keyed by the active pair map and
+/// silently no-ops on a market that's no longer paired, so the
+/// only cost is bandwidth on a stale subscription. Acceptable for
+/// the low-churn cross-arb workload.
+async fn apply_pair_diff(
+    prev: &HashMap<MarketTicker, String>,
+    next: &HashMap<MarketTicker, String>,
+    strategy: &mut CrossArbStrategy,
+    books: &mut HashMap<MarketTicker, predigy_book::OrderBook>,
+    kalshi_md: &mut predigy_kalshi_md::Connection,
+    poly_md: &mut predigy_poly_md::Connection,
+) {
+    let added: Vec<(MarketTicker, String)> = next
+        .iter()
+        .filter(|(k, _)| !prev.contains_key(*k))
+        .map(|(k, p)| (k.clone(), p.clone()))
+        .collect();
+    let removed: Vec<MarketTicker> = prev
+        .keys()
+        .filter(|k| !next.contains_key(*k))
+        .cloned()
+        .collect();
+    if added.is_empty() && removed.is_empty() {
+        return;
+    }
+    info!(
+        added = added.len(),
+        removed = removed.len(),
+        active_now = next.len(),
+        "pair-file change detected; applying diff"
+    );
+    for (k, _) in &added {
+        strategy.add_pair(k.clone(), next[k].clone());
+        books
+            .entry(k.clone())
+            .or_insert_with(|| predigy_book::OrderBook::new(k.as_str().to_string()));
+    }
+    if !added.is_empty() {
+        let kalshi_strs: Vec<String> = added.iter().map(|(k, _)| k.as_str().to_string()).collect();
+        let poly_strs: Vec<String> = added.iter().map(|(_, p)| p.clone()).collect();
+        if let Err(e) = kalshi_md
+            .subscribe(
+                &[
+                    KalshiChannel::OrderbookDelta,
+                    KalshiChannel::Ticker,
+                    KalshiChannel::Trade,
+                ],
+                &kalshi_strs,
+            )
+            .await
+        {
+            warn!(error = %e, ?kalshi_strs, "kalshi subscribe (reload) failed");
+        }
+        if let Err(e) = poly_md.subscribe(&poly_strs).await {
+            warn!(error = %e, ?poly_strs, "poly subscribe (reload) failed");
+        }
+        info!(?kalshi_strs, ?poly_strs, "subscribed new pairs");
+    }
+    for k in removed {
+        if let Some(asset) = strategy.remove_pair(&k) {
+            books.remove(&k);
+            info!(market = %k, asset, "removed pair (still subscribed; ignored by strategy)");
+        }
+    }
 }
 
 async fn handle_kalshi(
@@ -422,4 +598,14 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+fn expand_tilde(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    p.to_path_buf()
 }
