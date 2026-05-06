@@ -256,6 +256,26 @@ stat-trader pick them up on its own poll cadence. The deliberate
 two-file split keeps the LLM-curated stat rules and the
 forecast-derived wx-stat rules from racing.
 
+**To inspect proposed rules**: run the curator without `--write`
+and the stderr output now includes a sorted table of every
+proposed rule, biggest apparent edge first:
+
+```
+inspection (sorted by apparent edge desc):
+   edge  ticker                            airpt  thresh    fcst  model  side    ask  title
+    +92  KXHIGHTOKC-26MAY07-T78            OKC    >78       85.0    97%   YES     5c  Will the maximum temperature be >78° on May 7, 2026?
+    +88  KXLOWTPHIL-26MAY06-T58            PHIL   <58       53.0    97%   YES     9c  Will the minimum temperature be <58° on May 6, 2026?
+    ...
+```
+
+`edge` is `(model_p_in_cents − quoted_ask_cents)` for the bet
+side at curator time. Stat-trader re-evaluates against live
+prices at fire time, so edge here is a ranking aid, not a
+guarantee. Investigate the highest-edge candidates before
+promoting — edges over ~50¢ usually indicate either real
+arbitrage, stale market quotes, or a forecast/Kalshi-source
+mismatch the operator can spot.
+
 Phase 2 (NBM probabilistic + per-airport calibration) and Phase 3
 (auto-merge into stat-rules.json + bigger-cap deploy) are
 described in `docs/WX_STAT_PLAN.md`.

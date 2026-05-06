@@ -125,14 +125,20 @@ async fn main() -> Result<()> {
         predigy_ext_feeds::nws_forecast::HourlyForecast,
     > = HashMap::new();
     let mut rules: Vec<StatRule> = Vec::new();
+    let mut inspections: Vec<RuleInspection> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut skip_counts: HashMap<&'static str, u32> = HashMap::new();
 
     for m in &markets {
         match curate_one(&nws, m, &cfg, &mut grid_cache, &mut forecast_cache).await {
-            CurateOutcome::Rule { rule, audit } => {
+            CurateOutcome::Rule {
+                rule,
+                audit,
+                inspection,
+            } => {
                 info!(audit = %audit, "accepted rule");
                 rules.push(rule);
+                inspections.push(inspection);
             }
             CurateOutcome::Skip(reason) => {
                 debug!(market = %m.ticker, reason = %reason, "skip");
@@ -184,14 +190,44 @@ async fn main() -> Result<()> {
                 eprintln!("  {n:>4}  {cat}");
             }
         }
+        print_inspection_table(&inspections);
     }
     Ok(())
 }
 
 enum CurateOutcome {
-    Rule { rule: StatRule, audit: String },
+    Rule {
+        rule: StatRule,
+        audit: String,
+        inspection: RuleInspection,
+    },
     Skip(String),
     Error(String),
+}
+
+/// Per-rule details surfaced in the dry-run inspection table.
+/// Lets the operator scan the proposed rules sorted by apparent
+/// edge before promoting them.
+#[derive(Debug, Clone)]
+struct RuleInspection {
+    ticker: String,
+    title: String,
+    airport: String,
+    threshold: String,
+    forecast_value_f: f64,
+    /// Calibrated probability YES will resolve true (0.97 or 0.03
+    /// in Phase 1). Surfaced in the table so the operator sees the
+    /// belief side, not just the price.
+    model_p: f64,
+    side: Side,
+    /// Quote of the side this rule will bet on (YES ask if side=Yes,
+    /// NO ask if side=No), in cents.
+    quoted_ask_cents: u8,
+    /// `(model_p_in_cents - quoted_ask_cents)` for the bet side.
+    /// Positive = apparent edge in our favour. Stat-trader recomputes
+    /// this against live prices at fire time; this is the curator-
+    /// time snapshot for ranking only.
+    apparent_edge_cents: i32,
 }
 
 async fn curate_one(
@@ -298,8 +334,22 @@ fn emit_rule(
         TempStrikeKind::Less { threshold } => format!("<{threshold}"),
         TempStrikeKind::Between { lower, upper } => format!("[{lower},{upper}]"),
     };
+    // The quote of the side we'd bet on. For Yes we cross at yes_ask;
+    // for No we cross at no_ask. Edge is `(model_p_in_cents - ask)`.
+    let model_p_cents = (model_p * 100.0).round() as i32;
+    let (quoted_ask_cents, apparent_edge_cents) = match side {
+        Side::Yes => (
+            m.yes_ask_cents,
+            model_p_cents - i32::from(m.yes_ask_cents),
+        ),
+        Side::No => (
+            m.no_ask_cents,
+            // For a No bet the relevant model probability is 1 - model_p.
+            (100 - model_p_cents) - i32::from(m.no_ask_cents),
+        ),
+    };
     let audit = format!(
-        "ticker={ticker} airport={code}({city}) kind={threshold} forecast={forecast:.1}F hours={hours} model_p={mp:.3} side={side:?} yes_ask={yes_ask}c",
+        "ticker={ticker} airport={code}({city}) kind={threshold} forecast={forecast:.1}F hours={hours} model_p={mp:.3} side={side:?} ask={ask}c edge={edge:+}c",
         ticker = m.ticker,
         code = airport.code,
         city = airport.city,
@@ -308,9 +358,25 @@ fn emit_rule(
         hours = hours_considered,
         mp = model_p,
         side = side,
-        yes_ask = m.yes_ask_cents,
+        ask = quoted_ask_cents,
+        edge = apparent_edge_cents,
     );
-    CurateOutcome::Rule { rule, audit }
+    let inspection = RuleInspection {
+        ticker: m.ticker.clone(),
+        title: m.title.clone(),
+        airport: airport.code.to_string(),
+        threshold: threshold_str,
+        forecast_value_f,
+        model_p,
+        side,
+        quoted_ask_cents,
+        apparent_edge_cents,
+    };
+    CurateOutcome::Rule {
+        rule,
+        audit,
+        inspection,
+    }
 }
 
 async fn write_rules(rules: &[StatRule], output: &std::path::Path) -> Result<()> {
@@ -349,6 +415,54 @@ fn current_uid() -> Option<u32> {
     let out = std::process::Command::new("id").arg("-u").output().ok()?;
     let s = std::str::from_utf8(&out.stdout).ok()?.trim();
     s.parse().ok()
+}
+
+/// Render the proposed rules to stderr as a sorted table — biggest
+/// apparent edge first. The operator scans this to pick which rules
+/// are worth promoting from `wx-stat-rules.json` to the live
+/// `stat-rules.json`. Apparent edge is the curator-time snapshot
+/// (model_p_cents − quoted_ask_cents); stat-trader re-evaluates
+/// against live prices at fire time.
+fn print_inspection_table(inspections: &[RuleInspection]) {
+    if inspections.is_empty() {
+        return;
+    }
+    let mut rows: Vec<&RuleInspection> = inspections.iter().collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.apparent_edge_cents));
+
+    eprintln!();
+    eprintln!("inspection (sorted by apparent edge desc):");
+    eprintln!(
+        "  {edge:>5}  {ticker:<32}  {airport:<5}  {threshold:<8}  {fcst:>5}  {model:>5}  {side:>4}  {ask:>5}  title",
+        edge = "edge",
+        ticker = "ticker",
+        airport = "airpt",
+        threshold = "thresh",
+        fcst = "fcst",
+        model = "model",
+        side = "side",
+        ask = "ask",
+    );
+    for r in &rows {
+        let side_str = match r.side {
+            Side::Yes => "YES",
+            Side::No => "NO",
+        };
+        let title_short: String = r.title.chars().take(60).collect();
+        eprintln!(
+            "  {edge:>+5}  {ticker:<32}  {airport:<5}  {threshold:<8}  {fcst:>5.1}  {model:>4.0}%  {side:>4}  {ask:>4}c  {title}",
+            edge = r.apparent_edge_cents,
+            ticker = r.ticker,
+            airport = r.airport,
+            threshold = r.threshold,
+            fcst = r.forecast_value_f,
+            model = r.model_p * 100.0,
+            side = side_str,
+            ask = r.quoted_ask_cents,
+            title = title_short,
+        );
+    }
+    eprintln!();
 }
 
 /// Bucket a skip reason string into a coarse category label for
