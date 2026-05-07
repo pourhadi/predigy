@@ -29,7 +29,7 @@ use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 use predigy_engine_core::cross_strategy::{CrossStrategyEvent, topic};
 use predigy_engine_core::events::Event;
-use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use std::collections::HashMap;
@@ -294,7 +294,7 @@ impl StatStrategy {
             let reason_tag = if take { "tp" } else { "sl" };
             let client_id = format!(
                 "stat-exit:{ticker}:{side_tag}:{tag}:{minute:08x}",
-                ticker = market.as_str(),
+                ticker = cid_safe_ticker(market.as_str()),
                 tag = reason_tag,
             );
 
@@ -522,7 +522,7 @@ fn build_intent(
     // the same id (idempotent in the OMS).
     let client_id = format!(
         "stat:{ticker}:{ask:02}:{size:04}:{ts:08x}",
-        ticker = market.as_str(),
+        ticker = cid_safe_ticker(market.as_str()),
         ask = ask_cents,
         size = size,
         ts = chrono::Utc::now().timestamp() as u32 / 60,

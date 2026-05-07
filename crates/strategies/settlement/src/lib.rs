@@ -44,7 +44,7 @@ use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 use predigy_engine_core::discovery::DiscoverySubscription;
 use predigy_engine_core::events::Event;
-use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use std::collections::HashMap;
@@ -186,7 +186,7 @@ impl SettlementStrategy {
         let minute = (now_unix / 60) as u32;
         let client_id = format!(
             "settlement:{ticker}:{ask:02}:{size:04}:{minute:08x}",
-            ticker = market.as_str(),
+            ticker = cid_safe_ticker(market.as_str()),
             ask = yes_ask_cents,
             size = self.config.size,
         );

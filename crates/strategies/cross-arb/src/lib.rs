@@ -58,7 +58,7 @@ use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 use predigy_engine_core::cross_strategy::CrossStrategyEvent;
 use predigy_engine_core::events::{Event, ExternalEvent, KalshiPolyPair};
-use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use std::collections::HashMap;
@@ -366,7 +366,7 @@ impl CrossArbStrategy {
             // same price collapse via OMS idempotency.
             let client_id = format!(
                 "cross-arb-exit:{ticker}:{side_tag}:{tag}:{lim:02}:{qty:04}",
-                ticker = market.as_str(),
+                ticker = cid_safe_ticker(market.as_str()),
                 tag = reason_tag,
                 lim = limit_cents,
                 qty = abs_qty,
@@ -560,7 +560,7 @@ fn build_intent(
     };
     let client_id = format!(
         "cross-arb:{ticker}:{side_tag}:{ask:02}:{qty:04}",
-        ticker = market.as_str(),
+        ticker = cid_safe_ticker(market.as_str()),
         ask = kalshi_ask_cents,
     );
     Some(Intent {

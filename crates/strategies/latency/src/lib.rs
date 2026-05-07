@@ -50,7 +50,7 @@ use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 use predigy_engine_core::events::predigy_core_compat::NwsAlertPayload;
 use predigy_engine_core::events::{Event, ExternalEvent};
-use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use serde::{Deserialize, Serialize};
@@ -260,7 +260,7 @@ impl LatencyStrategy {
             // edited by NWS) collapses cleanly via the OMS.
             let client_id = format!(
                 "latency:{ticker}:{alert_short}:{idx}",
-                ticker = rule.kalshi_market,
+                ticker = cid_safe_ticker(&rule.kalshi_market),
                 alert_short = alert.id.chars().take(20).collect::<String>(),
             );
             let intent = Intent {
@@ -374,7 +374,8 @@ impl LatencyStrategy {
                 None => continue,
             };
             let client_id = format!(
-                "latency-flat:{ticker}:{side_tag}:{day:08x}",
+                "latency-flat:{cid_ticker}:{side_tag}:{day:08x}",
+                cid_ticker = cid_safe_ticker(ticker),
                 day = day_bucket as u32,
             );
             let intent = Intent {

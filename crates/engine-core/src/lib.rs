@@ -36,7 +36,7 @@ pub use db::{DailyPnl, Db, LatestModelP, OpenPosition, RuleRow};
 pub use discovery::{DiscoveredMarket, DiscoverySubscription};
 pub use error::{EngineError, EngineResult};
 pub use events::{Event, ExternalEvent, KalshiPolyPair};
-pub use intent::{Intent, IntentAction, OrderType, Tif};
+pub use intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 pub use metrics::{InMemoryMetrics, Metrics, NullMetrics, Tags};
 pub use oms::{
     ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, ReconciliationDiff, RejectionReason,

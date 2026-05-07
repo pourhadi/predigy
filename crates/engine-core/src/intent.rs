@@ -8,6 +8,20 @@
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 
+/// Strip characters Kalshi rejects in `client_order_id`. Confirmed
+/// by Kalshi's V2 venue: cids containing `.` (e.g. tickers like
+/// `KXBRAZILINF-26APR-T4.30`) get rejected with
+/// `400 invalid_parameters`. The legacy `CidAllocator` already
+/// strips them; engine strategies must do the same when embedding
+/// a ticker in a cid format string.
+///
+/// Returns a `String` rather than `&str` so callers don't have to
+/// worry about borrow lifetimes when feeding into `format!`.
+#[must_use]
+pub fn cid_safe_ticker(ticker: &str) -> String {
+    ticker.replace('.', "")
+}
+
 #[derive(Debug, Clone)]
 pub struct Intent {
     /// Operator-namespaced client order id; uniqueness is the
