@@ -633,10 +633,17 @@ For each remaining strategy:
       0 disables the global gate (per-strategy caps still apply).
       Default shake-down: $15 global vs 4×$5 per-strategy so it
       actually binds.
-- [ ] Port the exit pattern to settlement / latency. Settlement
-      probably skips (venue auto-settles); latency needs market
-      subscription plumbing for held positions OR time-based
-      exits via Tick.
+- [x] **latency-trader force-flat** (Phase 6.2). Time-based
+      exit only — latency has no book subscription so it can't
+      do mark-aware TP/SL. `LatencyConfig::max_hold_secs`
+      (default 30 min); 0 disables. On each Tick, the strategy
+      walks open positions and force-flats any held longer than
+      max_hold via a wide IOC at `force_flat_floor_cents` (1¢
+      default — any standing bid takes us). Idempotent cid
+      `latency-flat:{ticker}:{side}:{day_bucket:08x}`.
+- [ ] settlement-trader exits intentionally skipped — Kalshi
+      auto-settles binary outcomes at $1/$0, so the strategy
+      doesn't need an explicit close.
 - [ ] Cross-strategy data sharing (wx-stat's model_p drift
       triggers stat-trader re-evaluation; cross-arb's Polymarket
       view feeds stat-trader's belief). Requires a

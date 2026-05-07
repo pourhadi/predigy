@@ -54,8 +54,10 @@ use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
-use tracing::info;
+use std::time::Duration;
+use tracing::{debug, info};
 
 pub const STRATEGY_ID: StrategyId = StrategyId("latency");
 
@@ -111,14 +113,73 @@ struct LatencyRuleState {
     armed: bool,
 }
 
+/// Phase 6.2 — strategy-level config that's not per-rule.
+/// Loaded separately from the rule JSON.
+#[derive(Debug, Clone)]
+pub struct LatencyConfig {
+    /// Maximum seconds an open position is allowed to sit before
+    /// the strategy force-flats it. Latency entries are bets that
+    /// the alert moves the market within minutes; if the move
+    /// hasn't materialised by `max_hold_secs`, the alert was
+    /// likely a false positive and we'd rather free up risk
+    /// budget than hold indefinitely. `0` disables time-based
+    /// exits.
+    pub max_hold_secs: i64,
+    /// Floor price (cents) for the wide-IOC force-flat. Latency
+    /// has no book subscription, so the exit limit is set
+    /// conservatively so any standing bid takes us. `1` cent is
+    /// the venue-side floor.
+    pub force_flat_floor_cents: i32,
+    /// How often to refresh the position cache from Postgres.
+    pub position_refresh_interval: Duration,
+    /// Periodic timer for re-evaluating exit conditions.
+    pub tick_interval: Duration,
+}
+
+impl Default for LatencyConfig {
+    fn default() -> Self {
+        Self {
+            // Default: force-flat at 30 min. Operator can disable
+            // by setting to 0 if they want to hold indefinitely.
+            max_hold_secs: 30 * 60,
+            force_flat_floor_cents: 1,
+            position_refresh_interval: Duration::from_secs(60),
+            tick_interval: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Phase 6.2 — open-position snapshot. Refreshed from Postgres
+/// on the configured cadence; stale up to one
+/// `position_refresh_interval`.
+#[derive(Debug, Clone)]
+struct CachedPosition {
+    side: Side,
+    /// Signed: positive = long.
+    signed_qty: i32,
+    avg_entry_cents: i32,
+    opened_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug)]
 pub struct LatencyStrategy {
+    config: LatencyConfig,
     rules: Vec<LatencyRuleState>,
+    /// Phase 6.2 — open positions, keyed by `"{ticker}:{side_tag}"`.
+    positions: HashMap<String, CachedPosition>,
+    /// Phase 6.2 — per-position exit cooldown.
+    last_exit_at: HashMap<String, std::time::Instant>,
+    last_position_refresh: Option<std::time::Instant>,
 }
 
 impl LatencyStrategy {
     pub fn new(rules: Vec<LatencyRule>) -> Self {
+        Self::with_config(LatencyConfig::default(), rules)
+    }
+
+    pub fn with_config(config: LatencyConfig, rules: Vec<LatencyRule>) -> Self {
         Self {
+            config,
             rules: rules
                 .into_iter()
                 .map(|r| LatencyRuleState {
@@ -126,6 +187,9 @@ impl LatencyStrategy {
                     armed: true,
                 })
                 .collect(),
+            positions: HashMap::new(),
+            last_exit_at: HashMap::new(),
+            last_position_refresh: None,
         }
     }
 
@@ -227,6 +291,128 @@ impl LatencyStrategy {
         }
         None
     }
+
+    /// Phase 6.2 — refresh the open-position cache from Postgres.
+    async fn refresh_positions(
+        &mut self,
+        state: &mut StrategyState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let rows = state.db.open_positions(Some(STRATEGY_ID.0)).await?;
+        let n = rows.len();
+        let mut next: HashMap<String, CachedPosition> = HashMap::with_capacity(n);
+        for r in rows {
+            let side = match r.side.as_str() {
+                "yes" => Side::Yes,
+                "no" => Side::No,
+                _ => continue,
+            };
+            let key = position_key(&r.ticker, side);
+            next.insert(
+                key,
+                CachedPosition {
+                    side,
+                    signed_qty: r.current_qty,
+                    avg_entry_cents: r.avg_entry_cents,
+                    opened_at: r.opened_at,
+                },
+            );
+        }
+        self.positions = next;
+        self.last_position_refresh = Some(std::time::Instant::now());
+        debug!(n_positions = n, "latency: position cache refreshed");
+        Ok(())
+    }
+
+    /// Phase 6.2 — emit force-flat IOCs for any position older
+    /// than `max_hold_secs`. Latency has no book subscription so
+    /// the limit price is set conservatively to
+    /// `force_flat_floor_cents` (default 1¢) — any standing bid
+    /// takes us. Returns 0..N closing intents (one per stale
+    /// position).
+    fn evaluate_force_flats(&mut self, now_utc: chrono::DateTime<chrono::Utc>) -> Vec<Intent> {
+        if self.config.max_hold_secs <= 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let now_instant = std::time::Instant::now();
+        for (key, pos) in self.positions.clone() {
+            if pos.signed_qty == 0 {
+                continue;
+            }
+            // Per-position cooldown so multiple Ticks within the
+            // tick_interval don't re-fire the close intent. The
+            // OMS cid would dedupe anyway but the cooldown saves
+            // round trips.
+            if let Some(last) = self.last_exit_at.get(&key)
+                && now_instant.duration_since(*last) < self.config.tick_interval
+            {
+                continue;
+            }
+            let age_secs = (now_utc - pos.opened_at).num_seconds();
+            if age_secs < self.config.max_hold_secs {
+                continue;
+            }
+            // Construct the force-flat. Sell on the same leg we
+            // hold; buy if we're short. Limit at the wide floor.
+            let action = if pos.signed_qty > 0 {
+                IntentAction::Sell
+            } else {
+                IntentAction::Buy
+            };
+            let limit_cents = self.config.force_flat_floor_cents.clamp(1, 99);
+            let abs_qty = pos.signed_qty.unsigned_abs() as i32;
+            // Position-key + open-day bucket for idempotency. The
+            // open-day is stable across ticks so repeated triggers
+            // collapse via the OMS.
+            let day_bucket = pos.opened_at.timestamp() / 86_400;
+            let side_tag = match pos.side {
+                Side::Yes => "Y",
+                Side::No => "N",
+            };
+            let ticker = match key.split_once(':') {
+                Some((t, _)) => t,
+                None => continue,
+            };
+            let client_id = format!(
+                "latency-flat:{ticker}:{side_tag}:{day:08x}",
+                day = day_bucket as u32,
+            );
+            let intent = Intent {
+                client_id,
+                strategy: STRATEGY_ID.0,
+                market: MarketTicker::new(ticker),
+                side: pos.side,
+                action,
+                price_cents: Some(limit_cents),
+                qty: abs_qty,
+                order_type: OrderType::Limit,
+                tif: Tif::Ioc,
+                reason: Some(format!(
+                    "latency-flat: held_{age_secs}s ≥ max_hold_{}s entry={}¢",
+                    self.config.max_hold_secs, pos.avg_entry_cents
+                )),
+            };
+            info!(
+                ticker,
+                side = ?pos.side,
+                signed_qty = pos.signed_qty,
+                age_secs,
+                avg_entry = pos.avg_entry_cents,
+                "latency: force-flat aging position"
+            );
+            self.last_exit_at.insert(key, now_instant);
+            out.push(intent);
+        }
+        out
+    }
+}
+
+fn position_key(ticker: &str, side: Side) -> String {
+    let tag = match side {
+        Side::Yes => 'y',
+        Side::No => 'n',
+    };
+    format!("{ticker}:{tag}")
 }
 
 #[async_trait]
@@ -252,14 +438,36 @@ impl Strategy for LatencyStrategy {
     async fn on_event(
         &mut self,
         ev: &Event,
-        _state: &mut StrategyState,
+        state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Event::External(ExternalEvent::NwsAlert(alert)) = ev {
-            if let Some((_idx, intent)) = self.evaluate(alert) {
-                return Ok(vec![intent]);
-            }
+        // Phase 6.2 — refresh the position cache periodically so
+        // tick-driven force-flats see fresh state.
+        let needs_refresh = self
+            .last_position_refresh
+            .is_none_or(|t| t.elapsed() >= self.config.position_refresh_interval);
+        if needs_refresh {
+            self.refresh_positions(state).await?;
         }
-        Ok(Vec::new())
+
+        match ev {
+            Event::External(ExternalEvent::NwsAlert(alert)) => {
+                if let Some((_idx, intent)) = self.evaluate(alert) {
+                    return Ok(vec![intent]);
+                }
+                Ok(Vec::new())
+            }
+            Event::Tick => {
+                // Phase 6.2 — Tick-driven force-flat for stale
+                // positions. The strategy has no book access so
+                // exits are time-based only.
+                Ok(self.evaluate_force_flats(chrono::Utc::now()))
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        Some(self.config.tick_interval)
     }
 }
 
@@ -439,5 +647,134 @@ mod tests {
         std::fs::write(&path, json).unwrap();
         let s = LatencyStrategy::from_json_file(&path).unwrap();
         assert_eq!(s.rule_count(), 1);
+    }
+
+    // ─── Phase 6.2 force-flat tests ──────────────────────────
+
+    fn cached_position(
+        side: Side,
+        signed_qty: i32,
+        avg_entry: i32,
+        opened_at: chrono::DateTime<chrono::Utc>,
+    ) -> CachedPosition {
+        CachedPosition {
+            side,
+            signed_qty,
+            avg_entry_cents: avg_entry,
+            opened_at,
+        }
+    }
+
+    fn cfg() -> LatencyConfig {
+        LatencyConfig {
+            max_hold_secs: 1800,
+            force_flat_floor_cents: 1,
+            position_refresh_interval: Duration::from_secs(60),
+            tick_interval: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn force_flat_fires_for_aged_long_yes() {
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        // Position opened 2h ago, max_hold is 30 min.
+        let opened = now - chrono::Duration::seconds(7200);
+        s.positions.insert(
+            position_key("WX-A", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.market.as_str(), "WX-A");
+        assert_eq!(intent.side, Side::Yes);
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.qty, 5);
+        assert_eq!(intent.price_cents, Some(1));
+        assert_eq!(intent.tif, Tif::Ioc);
+        assert!(intent.client_id.starts_with("latency-flat:WX-A:Y:"));
+    }
+
+    #[test]
+    fn force_flat_skips_recent_position() {
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        // Just opened — well under max_hold.
+        let opened = now - chrono::Duration::seconds(60);
+        s.positions.insert(
+            position_key("WX-B", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        assert!(s.evaluate_force_flats(now).is_empty());
+    }
+
+    #[test]
+    fn force_flat_handles_long_no() {
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(7200);
+        s.positions.insert(
+            position_key("WX-C", Side::No),
+            cached_position(Side::No, 4, 30, opened),
+        );
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].side, Side::No);
+        assert_eq!(intents[0].action, IntentAction::Sell);
+        assert_eq!(intents[0].price_cents, Some(1));
+    }
+
+    #[test]
+    fn force_flat_disabled_when_max_hold_zero() {
+        let mut cfg_off = cfg();
+        cfg_off.max_hold_secs = 0;
+        let mut s = LatencyStrategy::with_config(cfg_off, Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(7200);
+        s.positions.insert(
+            position_key("WX-D", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        assert!(s.evaluate_force_flats(now).is_empty());
+    }
+
+    #[test]
+    fn force_flat_cooldown_blocks_repeat() {
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(7200);
+        s.positions.insert(
+            position_key("WX-E", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        let first = s.evaluate_force_flats(now);
+        assert_eq!(first.len(), 1);
+        // Immediate repeat: cooldown blocks it.
+        let second = s.evaluate_force_flats(now);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn force_flat_emits_one_per_aging_position() {
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let aged = now - chrono::Duration::seconds(7200);
+        let fresh = now - chrono::Duration::seconds(60);
+        s.positions.insert(
+            position_key("WX-F", Side::Yes),
+            cached_position(Side::Yes, 5, 50, aged),
+        );
+        s.positions.insert(
+            position_key("WX-G", Side::Yes),
+            cached_position(Side::Yes, 5, 50, fresh),
+        );
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(
+            intents.len(),
+            1,
+            "only the aged position should produce a flat"
+        );
+        assert_eq!(intents[0].market.as_str(), "WX-F");
     }
 }
