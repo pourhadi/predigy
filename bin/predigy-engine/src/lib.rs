@@ -17,6 +17,7 @@
 pub mod config;
 pub mod discovery_service;
 pub mod exec_data;
+pub mod external_feeds;
 pub mod market_data;
 pub mod oms_db;
 pub mod registry;

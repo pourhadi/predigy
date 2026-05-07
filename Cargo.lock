@@ -1675,8 +1675,10 @@ dependencies = [
  "predigy-book",
  "predigy-core",
  "predigy-engine-core",
+ "predigy-ext-feeds",
  "predigy-kalshi-md",
  "predigy-kalshi-rest",
+ "predigy-strategy-latency",
  "predigy-strategy-settlement",
  "predigy-strategy-stat",
  "serde",
@@ -1869,6 +1871,22 @@ dependencies = [
  "predigy-risk",
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-strategy-latency"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-core",
+ "predigy-engine-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

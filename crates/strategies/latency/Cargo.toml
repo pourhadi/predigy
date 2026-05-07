@@ -1,5 +1,5 @@
 [package]
-name = "predigy-engine"
+name = "predigy-strategy-latency"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,36 +9,20 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "predigy-engine"
-path = "src/main.rs"
-
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 predigy-core = { workspace = true }
-predigy-book = { workspace = true }
 predigy-engine-core = { workspace = true }
-predigy-ext-feeds = { workspace = true }
-predigy-kalshi-rest = { workspace = true }
-predigy-kalshi-md = { workspace = true }
-predigy-strategy-stat = { workspace = true }
-predigy-strategy-settlement = { workspace = true }
-predigy-strategy-latency = { workspace = true }
 
-sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
-clap = { workspace = true }
-anyhow = { workspace = true }
-url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

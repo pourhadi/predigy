@@ -29,6 +29,7 @@ use predigy_engine::{
     config::EngineConfig,
     discovery_service::DiscoveryService,
     exec_data::{ExecDataConfig, ExecDataConsumer},
+    external_feeds::{build_subscriber_map, nws_config_from_env, ExternalFeeds},
     market_data::{MarketDataRouter, RouterConfig},
     oms_db::DbBackedOms,
     registry::StrategyRegistry,
@@ -41,6 +42,7 @@ use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use predigy_engine_core::Db;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
+use predigy_strategy_latency::LatencyStrategy;
 use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
 use predigy_strategy_stat::{StatConfig, StatStrategy};
 use sqlx::postgres::PgPoolOptions;
@@ -180,6 +182,11 @@ async fn main() -> Result<()> {
     let db = Db::connect(&config.database_url).await?;
     let mut supervisors: Vec<Supervisor> = Vec::new();
     let mut discovery_subs: HashMap<StrategyId, Vec<DiscoverySubscription>> = HashMap::new();
+    let mut external_subscribers: Vec<(
+        StrategyId,
+        &'static str,
+        tokio::sync::mpsc::Sender<predigy_engine_core::events::Event>,
+    )> = Vec::new();
     for (id, _) in registry.instantiate_all().await {
         let factory = strategy_factory(id);
         let strategy = factory();
@@ -189,6 +196,7 @@ async fn main() -> Result<()> {
         if !subs.is_empty() {
             discovery_subs.insert(id, subs);
         }
+        let ext_subs = strategy.external_subscriptions();
         let supervisor = Supervisor::spawn(
             id,
             Arc::from(factory),
@@ -199,6 +207,9 @@ async fn main() -> Result<()> {
         router
             .register_strategy(id, &markets, supervisor.event_tx.clone())
             .await;
+        for feed in ext_subs {
+            external_subscribers.push((id, feed, supervisor.event_tx.clone()));
+        }
         info!(
             strategy = id.0,
             n_markets = markets.len(),
@@ -208,7 +219,31 @@ async fn main() -> Result<()> {
         supervisors.push(supervisor);
     }
 
-    // 8a. Discovery service — periodic Kalshi REST scan that
+    // 8a. External-feed dispatcher — single NWS connection
+    //     fanned out to every supervisor that opted in via
+    //     `external_subscriptions()`. Skipped at boot if no
+    //     supervisor opted in OR if `PREDIGY_NWS_USER_AGENT`
+    //     isn't set (NWS requires identifying contact info; we
+    //     refuse to spawn it without).
+    let external_feeds = if external_subscribers.is_empty() {
+        info!("external_feeds: no subscribers; skipping");
+        None
+    } else {
+        let nws = nws_config_from_env();
+        if nws.is_none() {
+            warn!(
+                "external_feeds: PREDIGY_NWS_USER_AGENT not set — \
+                 NWS-dependent strategies (latency) won't fire this run"
+            );
+            None
+        } else {
+            let subs_map = build_subscriber_map(external_subscribers);
+            let svc = ExternalFeeds::start(nws, &subs_map)?;
+            Some(svc)
+        }
+    };
+
+    // 8b. Discovery service — periodic Kalshi REST scan that
     //     auto-registers tickers with the router and pushes
     //     Event::DiscoveryDelta into strategies. Spawned only if
     //     at least one supervised strategy declared a discovery
@@ -250,6 +285,9 @@ async fn main() -> Result<()> {
     if let Some(svc) = discovery_service {
         svc.shutdown(config.shutdown_grace).await;
     }
+    if let Some(svc) = external_feeds {
+        svc.shutdown(config.shutdown_grace).await;
+    }
     for sup in supervisors {
         sup.shutdown(config.shutdown_grace).await;
     }
@@ -266,6 +304,7 @@ async fn main() -> Result<()> {
 /// them in. Adding a new strategy = add it here + add the dep.
 async fn register_strategies(registry: &StrategyRegistry) {
     use predigy_engine::registry::StrategyHandle;
+    use predigy_strategy_latency::STRATEGY_ID as LATENCY_ID;
     use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
 
@@ -279,6 +318,17 @@ async fn register_strategies(registry: &StrategyRegistry) {
             Box::new(SettlementStrategy::new(SettlementConfig::default())) as Box<dyn Strategy>
         }))
         .await;
+    // Latency only registers if a rules file is configured —
+    // without rules the strategy is a no-op and we'd rather not
+    // claim the supervisor slot. PREDIGY_LATENCY_RULE_FILE points
+    // at a JSON file; bad path / bad JSON warns + skips.
+    if let Some(path) = latency_rules_path() {
+        registry
+            .register(StrategyHandle::new(LATENCY_ID, move || {
+                build_latency_strategy(&path)
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -286,6 +336,7 @@ async fn register_strategies(registry: &StrategyRegistry) {
 fn strategy_factory(
     id: predigy_engine_core::strategy::StrategyId,
 ) -> Box<dyn Fn() -> Box<dyn Strategy> + Send + Sync> {
+    use predigy_strategy_latency::STRATEGY_ID as LATENCY_ID;
     use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
     if id == STAT_ID {
@@ -294,8 +345,40 @@ fn strategy_factory(
         Box::new(|| {
             Box::new(SettlementStrategy::new(SettlementConfig::default())) as Box<dyn Strategy>
         })
+    } else if id == LATENCY_ID {
+        let path = latency_rules_path()
+            .expect("LATENCY_ID registered without a rule-file path; engine startup invariant");
+        Box::new(move || build_latency_strategy(&path))
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
+    }
+}
+
+fn latency_rules_path() -> Option<std::path::PathBuf> {
+    std::env::var("PREDIGY_LATENCY_RULE_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn build_latency_strategy(path: &std::path::Path) -> Box<dyn Strategy> {
+    match LatencyStrategy::from_json_file(path) {
+        Ok(s) => {
+            info!(
+                rule_file = %path.display(),
+                n_rules = s.rule_count(),
+                "latency: rules loaded"
+            );
+            Box::new(s) as Box<dyn Strategy>
+        }
+        Err(e) => {
+            warn!(
+                rule_file = %path.display(),
+                error = %e,
+                "latency: rule file unreadable; running with empty rule set"
+            );
+            Box::new(LatencyStrategy::new(Vec::new())) as Box<dyn Strategy>
+        }
     }
 }
 

@@ -501,10 +501,13 @@ Strategy ports (one crate per strategy under `crates/strategies/`):
       (Phase 5, shipped 2026-05-07). Pure discovery-driven —
       operator no longer seeds tickers at boot. Ships with the
       engine's new discovery service infrastructure (see below).
-- [ ] cross-arb (Polymarket-coupled; needs poly-md handle on
-      StrategyState — Phase 6 work).
-- [ ] latency (NWS-alert driven; needs ext-feeds wiring on
-      StrategyState).
+- [x] **latency-trader** → `crates/strategies/latency`
+      (Phase 5, shipped 2026-05-07). NWS-alert driven; rules
+      loaded from JSON file at `PREDIGY_LATENCY_RULE_FILE`. Ships
+      alongside the new external-feed dispatcher infrastructure
+      (see below).
+- [ ] cross-arb (Polymarket-coupled; needs poly-md handle in
+      external-feed dispatcher — Phase 6 work).
 - [ ] wx-stat / wx-curator / stat-curator / cross-arb-curator
       (curators run on a different cadence; possibly stay
       external for now).
@@ -538,6 +541,26 @@ The settlement strategy is the canonical consumer. With the
 discovery service running, the engine picks up newly-listed games
 within one polling interval (60s default); operator restart is no
 longer the bottleneck for sports-market entries.
+
+#### External-feed dispatcher (shipped 2026-05-07)
+
+Single point of contact for non-Kalshi data feeds — today NWS
+alerts, future Polymarket book / NBM cycle publish.
+
+- `bin/predigy-engine/src/external_feeds.rs` — spawns each feed
+  at most once, fans events out to every supervisor that opted in
+  via `Strategy::external_subscriptions() -> ["nws_alerts"]`.
+  Translates `predigy_ext_feeds::NwsAlert` → engine-core's
+  vendor-agnostic `NwsAlertPayload` shim at the boundary so
+  engine-core stays free of the ext-feeds dep.
+- Configured via env vars: `PREDIGY_NWS_USER_AGENT` (required —
+  NWS refuses connections without identifying contact info),
+  `PREDIGY_NWS_STATES`, `PREDIGY_NWS_POLL_MS`,
+  `PREDIGY_NWS_SEEN_PATH` (cross-restart dedup).
+- Latency strategy is the first consumer. Without
+  `PREDIGY_NWS_USER_AGENT` set the engine logs a warning at boot
+  and skips spawning the feed; latency-strategy supervisor still
+  comes up but never receives an event.
 
 #### Migration plan per strategy
 
