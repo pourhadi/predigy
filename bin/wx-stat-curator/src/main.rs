@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use wx_stat_curator::calibration::Calibration;
 use wx_stat_curator::nbm_curate::{NbmCurateOutcome, curate_via_nbm};
 use wx_stat_curator::nbm_path::recent_qmd_cycle;
 use wx_stat_curator::{
@@ -98,6 +99,13 @@ struct Args {
     /// effectively free.
     #[arg(long, default_value = "data/nbm_cache")]
     nbm_cache: PathBuf,
+
+    /// Path to a Phase-2E Platt-scaling calibration JSON file. If
+    /// absent, calibration falls back to the identity (raw NBM
+    /// quantile probabilities). Produced by `wx-stat-fit-calibration`
+    /// from accumulated (forecast, outcome) pairs.
+    #[arg(long, default_value = "data/wx_stat_calibration.json")]
+    nbm_calibration: PathBuf,
 }
 
 #[tokio::main]
@@ -145,7 +153,35 @@ async fn main() -> Result<()> {
         let cycle = recent_qmd_cycle(now_unix());
         info!(?cycle, "nbm: using cycle");
         std::fs::create_dir_all(&args.nbm_cache).ok();
-        let outcomes = curate_via_nbm(&nbm_client, &args.nbm_cache, cycle, &markets).await;
+        let calibration = match Calibration::load(&args.nbm_calibration) {
+            Ok(Some(cal)) => {
+                info!(
+                    path = %args.nbm_calibration.display(),
+                    n_buckets = cal.buckets.len(),
+                    fitted_at = cal.fitted_at_iso.as_deref().unwrap_or("?"),
+                    "nbm: loaded calibration"
+                );
+                Some(cal)
+            }
+            Ok(None) => {
+                info!(
+                    path = %args.nbm_calibration.display(),
+                    "nbm: no calibration file present; using identity (raw NBM probabilities)"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    path = %args.nbm_calibration.display(),
+                    error = %e,
+                    "nbm: calibration load failed; using identity"
+                );
+                None
+            }
+        };
+        let outcomes =
+            curate_via_nbm(&nbm_client, &args.nbm_cache, cycle, &markets, calibration.as_ref())
+                .await;
         for (m, outcome) in markets.iter().zip(outcomes.into_iter()) {
             match outcome {
                 NbmCurateOutcome::Rule(out) => {

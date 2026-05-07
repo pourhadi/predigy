@@ -13,6 +13,7 @@
 //! See `docs/WX_STAT_PLAN.md` for the full design.
 
 pub mod airports;
+pub mod calibration;
 pub mod forecast_to_p;
 pub mod kalshi_scan;
 pub mod nbm_curate;

@@ -19,6 +19,7 @@
 //! effectively free — only file reads, no decode.
 
 use crate::airports::{Airport, lookup_airport};
+use crate::calibration::{BucketKey, Calibration};
 use crate::kalshi_scan::TempMarket;
 use crate::nbm_path::{
     DAILY_HIGH_LOCAL_HOURS, DAILY_LOW_LOCAL_HOURS, approx_utc_offset_hours, forecast_hour_window,
@@ -77,6 +78,7 @@ pub async fn curate_via_nbm(
     cache_dir: &Path,
     cycle: NbmCycle,
     markets: &[TempMarket],
+    calibration: Option<&Calibration>,
 ) -> Vec<NbmCurateOutcome> {
     // ---- Pass 1: plan ----
     let mut plans: Vec<Plan> = Vec::new();
@@ -144,7 +146,7 @@ pub async fn curate_via_nbm(
 
     // ---- Pass 3: emit per market ----
     for plan in plans {
-        match score_plan(&plan, &fetched) {
+        match score_plan(&plan, &fetched, calibration) {
             Ok(out) => outcomes.push(NbmCurateOutcome::Rule(out)),
             Err(reason) => outcomes.push(NbmCurateOutcome::Skip { reason }),
         }
@@ -211,6 +213,7 @@ fn plan_market(m: &TempMarket, cycle: NbmCycle) -> Result<Plan, String> {
 fn score_plan(
     plan: &Plan,
     fetched: &HashMap<(u16, &'static str), AirportQuantiles>,
+    calibration: Option<&Calibration>,
 ) -> Result<NbmRuleOut, String> {
     // Threshold in Kelvin (NBM is K).
     let threshold_k = match plan.spec.kind {
@@ -242,16 +245,28 @@ fn score_plan(
     if best_h.is_none() {
         return Err("no NBM quantiles available in forecast window".into());
     }
-    // Clamp away from {0, 1}.  A raw 100% from NBM means "all 21
-    // ensemble quantiles bracket below the threshold" — it does NOT
-    // mean "physically impossible to exceed the threshold". A black-
-    // swan front, a measurement-source quirk, or a settlement-feed
-    // mismatch can still flip the outcome. Capping at [0.02, 0.98]
-    // keeps stat-trader's Kelly sizing finite — without it, a 100%
-    // belief at price 5¢ would size to ~max contracts.  Phase 2E
-    // calibration replaces this hard cap with per-airport Platt
-    // scaling against historical observations.
-    let model_p = best_p.clamp(0.02, 0.98);
+    // Phase 2E calibration: if a fitted (airport, month) bucket
+    // exists, apply Platt scaling to the raw NBM probability before
+    // emitting. The bucket's coefficients shift saturated/biased
+    // model probabilities toward observed reality.
+    let raw_p = best_p;
+    let calibrated_p = match calibration {
+        Some(cal) => {
+            let month = parse_settlement_month(&plan.spec.settlement_date).unwrap_or(0);
+            if month == 0 {
+                raw_p
+            } else {
+                cal.apply_or_identity(&BucketKey::new(plan.airport.code, month), raw_p)
+            }
+        }
+        None => raw_p,
+    };
+    // Hard clamp [0.02, 0.98] independent of whether calibration
+    // was applied. A calibration fit on noisy data could itself
+    // produce 99.9% beliefs we don't trust to size against; the
+    // clamp is the floor of confidence, not a substitute for
+    // calibration.
+    let model_p = calibrated_p.clamp(0.02, 0.98);
     let side = if model_p > 0.5 { Side::Yes } else { Side::No };
 
     // Edge in cents at curator time.
@@ -275,8 +290,13 @@ fn score_plan(
     let forecast_value_f = peak_value_k
         .map(|k| (f64::from(k) - 273.15) * 9.0 / 5.0 + 32.0)
         .unwrap_or(0.0);
+    let calibration_note = if (raw_p - calibrated_p).abs() > 1e-6 {
+        format!(" raw_p={raw_p:.3}")
+    } else {
+        String::new()
+    };
     let audit = format!(
-        "ticker={ticker} airport={code}({city}) kind={threshold} fcst_h={fh} fcst_50pct={fcst:.1}F model_p={mp:.3} side={side:?} ask={ask}c edge={edge:+}c",
+        "ticker={ticker} airport={code}({city}) kind={threshold} fcst_h={fh} fcst_50pct={fcst:.1}F model_p={mp:.3}{cnote} side={side:?} ask={ask}c edge={edge:+}c",
         ticker = plan.market.ticker,
         code = plan.airport.code,
         city = plan.airport.city,
@@ -284,6 +304,7 @@ fn score_plan(
         fh = best_h.unwrap_or(0),
         fcst = forecast_value_f,
         mp = model_p,
+        cnote = calibration_note,
         side = side,
         ask = quoted_ask_cents,
         edge = apparent_edge_cents,
@@ -315,9 +336,36 @@ fn f_to_k(fahrenheit: f64) -> f64 {
     (fahrenheit - 32.0) * 5.0 / 9.0 + 273.15
 }
 
+/// `"2026-05-07"` → `Some(5)`. Returns `None` if the date doesn't
+/// parse — caller treats that as "no calibration bucket".
+fn parse_settlement_month(iso_date: &str) -> Option<u8> {
+    let mut parts = iso_date.splitn(3, '-');
+    parts.next()?; // year
+    let month: u8 = parts.next()?.parse().ok()?;
+    if (1..=12).contains(&month) {
+        Some(month)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_month_canonical() {
+        assert_eq!(parse_settlement_month("2026-05-07"), Some(5));
+        assert_eq!(parse_settlement_month("2026-12-31"), Some(12));
+    }
+
+    #[test]
+    fn parse_month_rejects_invalid() {
+        assert_eq!(parse_settlement_month("2026-13-01"), None);
+        assert_eq!(parse_settlement_month("2026-00-01"), None);
+        assert_eq!(parse_settlement_month("not-a-date"), None);
+        assert_eq!(parse_settlement_month("2026"), None);
+    }
 
     #[test]
     fn fahrenheit_to_kelvin_known_values() {
