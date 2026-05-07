@@ -611,15 +611,26 @@ For each remaining strategy:
 
 ### Phase 6 — Active position management
 
-- [ ] Per-position re-evaluation on book updates (in each
-      strategy module)
-- [ ] Adverse-drift exits with configurable threshold
-- [ ] Profit-take saturation logic
+- [x] **Per-position re-evaluation on book updates** (Phase 6.1
+      in stat-trader, shipped 2026-05-07). Strategy maintains an
+      in-memory position cache (refreshed on Tick from
+      `Db::open_positions(Some(STRATEGY_ID.0))`); on each
+      `Event::BookUpdate` the strategy re-evaluates open
+      positions for that ticker against current mark.
+- [x] **Adverse-drift + profit-take exits** (Phase 6.1 in
+      stat-trader). `StatConfig::take_profit_cents` /
+      `stop_loss_cents` (defaults 8¢ / 5¢; 0 disables).
+      Closing IOCs use the same idempotent-cid pattern as
+      entries — minute-bucketed `stat-exit:{ticker}:{side}:{tag}:{minute:08x}`.
+- [ ] Port the same exit pattern to settlement / latency /
+      cross-arb. Each has different exit semantics (settlement
+      = time-to-close; latency = post-event drift; cross-arb =
+      convergence event).
 - [ ] Global Kelly accounting (sizing knows about other
-      strategies' open positions in correlated markets)
+      strategies' open positions in correlated markets).
 - [ ] Cross-strategy data sharing (wx-stat's model_p drift
       triggers stat-trader re-evaluation; cross-arb's Polymarket
-      view feeds stat-trader's belief)
+      view feeds stat-trader's belief).
 
 ### Phase 7 — Retire scaffolding
 
