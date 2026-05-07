@@ -307,18 +307,24 @@ async fn main() -> Result<()> {
         info!("external_feeds: no subscribers; skipping");
         None
     } else {
+        // NWS and Polymarket are independent feeds. NWS without a
+        // configured user-agent is a soft-skip (only NWS-dependent
+        // strategies are affected); Polymarket has no such
+        // requirement. Pre-fix the gate killed both: if
+        // PREDIGY_NWS_USER_AGENT was missing the engine returned
+        // None for external_feeds entirely, leaving Polymarket
+        // dead even though cross-arb declared the subscription.
         let nws = nws_config_from_env();
         if nws.is_none() {
             warn!(
                 "external_feeds: PREDIGY_NWS_USER_AGENT not set — \
-                 NWS-dependent strategies (latency) won't fire this run"
+                 NWS-dependent strategies (latency) won't fire this run; \
+                 other feeds (polymarket) start regardless"
             );
-            None
-        } else {
-            let subs_map = build_subscriber_map(external_subscribers);
-            let svc = ExternalFeeds::start(nws, &subs_map)?;
-            Some(svc)
         }
+        let subs_map = build_subscriber_map(external_subscribers);
+        let svc = ExternalFeeds::start(nws, &subs_map)?;
+        Some(svc)
     };
 
     // 8b. Pair-file service — watches the cross-arb-curator's

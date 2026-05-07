@@ -944,6 +944,175 @@ async fn submit_group_partial_collision_when_cid_reused_under_different_group() 
 }
 
 #[tokio::test]
+async fn partial_close_preserves_avg_entry_cents() {
+    // Regression for the upsert_position bug where a partial
+    // close (sell against a long position that doesn't cross
+    // zero) was treated as "adding to position" because both
+    // cur_qty.signum() and new_qty.signum() were positive. The
+    // weighted-avg formula then divided by `new_qty.abs()`,
+    // corrupting `avg_entry_cents` by amplifying it (live
+    // observation: a position bought at ~62¢ ended up with
+    // avg_entry_cents=982 after a partial-close cycle).
+    //
+    // Correct behavior: a partial close leaves avg_entry_cents
+    // unchanged; only the realized PnL accumulates.
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-PC").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    // Submit + fill 3 buys @ 60¢.
+    oms.submit(buy_yes("test:PC:0001", "KX-INT-PC", 3, 60))
+        .await
+        .unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:PC:0001".into(),
+        venue_order_id: Some("v-PC1".into()),
+        venue_fill_id: Some("v-PC1-fill".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 3,
+        avg_fill_price_cents: Some(60),
+        last_fill_qty: Some(3),
+        last_fill_price_cents: Some(60),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Partial close: sell 2 @ 65¢. Same side ("yes"), opposite
+    // action ("sell"). Position goes from +3 long to +1 long.
+    let exit = Intent {
+        client_id: "test:PC:exit-0001".into(),
+        strategy: "test",
+        market: MarketTicker::new("KX-INT-PC"),
+        side: Side::Yes,
+        action: IntentAction::Sell,
+        price_cents: Some(65),
+        qty: 2,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: Some("partial close".into()),
+    };
+    oms.submit(exit).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:PC:exit-0001".into(),
+        venue_order_id: Some("v-PC2".into()),
+        venue_fill_id: Some("v-PC2-fill".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 2,
+        avg_fill_price_cents: Some(65),
+        last_fill_qty: Some(2),
+        last_fill_price_cents: Some(65),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    let pos: (i32, i32, i64) = sqlx::query_as(
+        "SELECT current_qty, avg_entry_cents, realized_pnl_cents
+           FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-PC' AND closed_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pos.0, 1, "partial close should leave 1 contract");
+    assert_eq!(
+        pos.1, 60,
+        "partial close MUST NOT change avg_entry_cents (bug: was being recomputed via weighted-avg formula)"
+    );
+    assert_eq!(
+        pos.2, 10,
+        "realized PnL = (65-60) * 2 contracts closed = 10c"
+    );
+}
+
+#[tokio::test]
+async fn position_reversal_resets_avg_to_fill_price() {
+    // When a fill flips the position to the opposite side
+    // (cur=+3 long @ 60, sell 5 @ 65), the OMS should:
+    //   1. Realize PnL on the closed portion (3 contracts).
+    //   2. Reset avg_entry_cents to the fill price for the new
+    //      opposing portion (the remaining 2 contracts on the
+    //      short side, opened at 65¢).
+    //
+    // Pre-fix behavior: the "partial close" branch ran (because
+    // cur and new had different signs) and avg_entry was left
+    // unchanged at 60 — wrong, since we're now SHORT @ 65.
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-RV").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    // Build cur=+3 long @ 60.
+    oms.submit(buy_yes("test:RV:0001", "KX-INT-RV", 3, 60))
+        .await
+        .unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:RV:0001".into(),
+        venue_order_id: Some("v-RV1".into()),
+        venue_fill_id: Some("v-RV1-f".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 3,
+        avg_fill_price_cents: Some(60),
+        last_fill_qty: Some(3),
+        last_fill_price_cents: Some(60),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Reversal sell 5 @ 65: closes 3, opens new short of 2.
+    let exit = Intent {
+        client_id: "test:RV:exit-0001".into(),
+        strategy: "test",
+        market: MarketTicker::new("KX-INT-RV"),
+        side: Side::Yes,
+        action: IntentAction::Sell,
+        price_cents: Some(65),
+        qty: 5,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: Some("reversal".into()),
+    };
+    oms.submit(exit).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:RV:exit-0001".into(),
+        venue_order_id: Some("v-RV2".into()),
+        venue_fill_id: Some("v-RV2-f".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 5,
+        avg_fill_price_cents: Some(65),
+        last_fill_qty: Some(5),
+        last_fill_price_cents: Some(65),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    let pos: (i32, i32, i64) = sqlx::query_as(
+        "SELECT current_qty, avg_entry_cents, realized_pnl_cents
+           FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-RV' AND closed_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pos.0, -2, "should be short 2 after reversal");
+    assert_eq!(
+        pos.1, 65,
+        "avg_entry should reset to fill price for the new side"
+    );
+    assert_eq!(pos.2, 15, "realized = (65-60) * 3 closed = 15c");
+}
+
+#[tokio::test]
 async fn rejection_cascades_cancel_request_to_sibling_legs() {
     let _g = test_lock().await;
     let pool = fresh_pool().await;

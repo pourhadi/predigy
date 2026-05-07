@@ -789,8 +789,18 @@ async fn upsert_position(
 
     if let Some((id, cur_qty, cur_avg)) = existing {
         let new_qty = cur_qty + signed_qty;
+        // Branch on whether the fill is adding to, partially
+        // closing, fully closing, or reversing the position. The
+        // **fill direction** (`signed_qty.signum()`) vs the
+        // **current position direction** (`cur_qty.signum()`) is
+        // the right discriminator — NOT `new_qty.signum()`. A
+        // partial close (sell 2 against +3 long) leaves new_qty
+        // positive, which previously matched the "same sign"
+        // condition and ran the weighted-avg formula on a
+        // reducing fill, corrupting avg_entry_cents.
+        let same_direction = cur_qty == 0 || signed_qty.signum() == cur_qty.signum();
         if new_qty == 0 {
-            // Closing leg. Realised PnL formula:
+            // Full close. Realised PnL formula:
             //
             //   long close (cur_qty > 0):
             //     pnl = (close_price - entry) * abs(closed_qty)
@@ -800,7 +810,7 @@ async fn upsert_position(
             //
             // Combined: pnl = (close_price - entry) * cur_qty.signum() * abs(closed).
             // The sign comes from the SIDE WE WERE ON (cur_qty),
-            // not the closing-fill direction (signed_qty).
+            // not the closing-fill direction.
             let realised =
                 (fill_price_cents - cur_avg) as i64 * cur_qty.signum() as i64 * i64::from(fill_qty);
             sqlx::query(
@@ -817,8 +827,9 @@ async fn upsert_position(
             .bind(i64::from(fee_cents))
             .execute(&mut **tx)
             .await?;
-        } else if (cur_qty.signum() == new_qty.signum()) || cur_qty == 0 {
-            // Adding to position (same side). Weighted avg.
+        } else if same_direction {
+            // Adding to position (same side as existing or
+            // opening from flat). Weighted avg.
             let new_avg = (cur_qty.unsigned_abs() as i64 * i64::from(cur_avg)
                 + i64::from(fill_qty) * i64::from(fill_price_cents))
                 / new_qty.unsigned_abs() as i64;
@@ -836,10 +847,12 @@ async fn upsert_position(
             .bind(i64::from(fee_cents))
             .execute(&mut **tx)
             .await?;
-        } else {
-            // Partial close — reducing position. Realised on the
-            // closed portion.
-            let closed_qty = std::cmp::min(cur_qty.abs(), fill_qty);
+        } else if new_qty.signum() == cur_qty.signum() {
+            // Partial close — fill reduces the position but
+            // doesn't cross zero. Realise PnL on the closed
+            // portion; avg_entry stays unchanged (the remaining
+            // contracts retain their original entry basis).
+            let closed_qty = fill_qty;
             let realised = (fill_price_cents - cur_avg) as i64
                 * cur_qty.signum() as i64
                 * i64::from(closed_qty);
@@ -853,6 +866,35 @@ async fn upsert_position(
             )
             .bind(id)
             .bind(new_qty)
+            .bind(realised)
+            .bind(i64::from(fee_cents))
+            .execute(&mut **tx)
+            .await?;
+        } else {
+            // Reversal — fill flips the position to the
+            // opposite side. Realise PnL on the previously-held
+            // portion (cur_qty.abs()), then reset avg_entry to
+            // the fill price for the new opposing portion.
+            //
+            // Example: cur=+3 long @ 60, sell 5 @ 65 →
+            //   close 3 @ 65 (realise 3*(65-60)=15c), open new
+            //   short of 2 @ 65.
+            let closed_qty = cur_qty.abs();
+            let realised = (fill_price_cents - cur_avg) as i64
+                * cur_qty.signum() as i64
+                * i64::from(closed_qty);
+            sqlx::query(
+                "UPDATE positions
+                    SET current_qty = $2,
+                        avg_entry_cents = $3,
+                        last_fill_at = now(),
+                        realized_pnl_cents = realized_pnl_cents + $4,
+                        fees_paid_cents = fees_paid_cents + $5
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .bind(new_qty)
+            .bind(fill_price_cents)
             .bind(realised)
             .bind(i64::from(fee_cents))
             .execute(&mut **tx)
