@@ -32,7 +32,7 @@ use predigy_engine_core::events::Event;
 use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -259,6 +259,7 @@ pub struct StatStrategy {
     /// `evaluate` to blend the poly reference into the rule's
     /// model_p (per `config.poly_mid_blend_alpha`).
     poly_mid_cents: HashMap<String, u8>,
+    subscribed: HashSet<String>,
     last_rule_refresh: Option<Instant>,
     last_position_refresh: Option<Instant>,
 }
@@ -273,6 +274,7 @@ impl StatStrategy {
             last_exit_at: HashMap::new(),
             high_water_pnl: HashMap::new(),
             poly_mid_cents: HashMap::new(),
+            subscribed: HashSet::new(),
             last_rule_refresh: None,
             last_position_refresh: None,
         }
@@ -302,6 +304,14 @@ impl StatStrategy {
                     min_edge_cents: r.min_edge_cents,
                 },
             );
+        }
+        let added_rule_markets: Vec<MarketTicker> = next
+            .keys()
+            .filter(|ticker| self.subscribed.insert((*ticker).clone()))
+            .map(MarketTicker::new)
+            .collect();
+        if !added_rule_markets.is_empty() {
+            state.subscribe_to_markets(added_rule_markets);
         }
         self.rules = next;
         self.last_rule_refresh = Some(Instant::now());
@@ -383,6 +393,15 @@ impl StatStrategy {
         // A3 — drop high-water entries for positions that have
         // closed (no longer in `next`). Keeps the map bounded.
         self.high_water_pnl.retain(|k, _| next.contains_key(k));
+        let held_markets: Vec<MarketTicker> = next
+            .keys()
+            .filter_map(|k| k.split_once(':').map(|(ticker, _)| ticker.to_string()))
+            .filter(|ticker| self.subscribed.insert(ticker.clone()))
+            .map(MarketTicker::new)
+            .collect();
+        if !held_markets.is_empty() {
+            state.subscribe_to_markets(held_markets);
+        }
         self.positions = next;
         self.last_position_refresh = Some(Instant::now());
         debug!(n_positions = n, "stat: position cache refreshed");
@@ -606,10 +625,11 @@ impl Strategy for StatStrategy {
         state: &StrategyState,
     ) -> Result<Vec<MarketTicker>, Box<dyn std::error::Error + Send + Sync>> {
         let rows = state.db.active_rules(STRATEGY_ID.0).await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| MarketTicker::new(&r.ticker))
-            .collect())
+        let mut tickers: HashSet<String> = rows.into_iter().map(|r| r.ticker).collect();
+        for p in state.db.open_positions(Some(STRATEGY_ID.0)).await? {
+            tickers.insert(p.ticker);
+        }
+        Ok(tickers.into_iter().map(MarketTicker::new).collect())
     }
 
     async fn on_event(

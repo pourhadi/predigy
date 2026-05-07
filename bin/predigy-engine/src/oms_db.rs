@@ -238,14 +238,6 @@ impl DbBackedOms {
                 strategy: intent.strategy,
             });
         }
-        if exposure.missing_recent_mark && !risk_reducing {
-            return Err(RejectionReason::InvalidIntent {
-                reason: format!(
-                    "missing recent mark for open {} positions; refusing risk-increasing entry",
-                    intent.strategy
-                ),
-            });
-        }
         if exposure.in_flight >= caps.max_in_flight {
             return Err(RejectionReason::TooManyInFlight {
                 strategy: intent.strategy,
@@ -1000,13 +992,9 @@ async fn daily_pnl_with_marks(
             missing_recent_mark = true;
             continue;
         }
-        let mark = domain_mark_cents(&side, qty, bid, ask);
-        if let Some(mark_cents) = mark {
-            pnl +=
-                i64::from(mark_cents - avg_entry) * i64::from(qty.signum()) * i64::from(qty.abs());
-        } else {
-            missing_recent_mark = true;
-        }
+        let (mark_cents, conservative) = risk_mark_cents(&side, qty, bid, ask, recent);
+        missing_recent_mark |= conservative;
+        pnl += i64::from(mark_cents - avg_entry) * i64::from(qty.signum()) * i64::from(qty.abs());
     }
     Ok(DailyPnlSnapshot {
         pnl_cents: pnl,
@@ -1027,6 +1015,21 @@ fn domain_mark_cents(
         ("no", -1) => best_yes_bid_cents.map(|bid| 100 - bid),
         _ => None,
     }
+}
+
+fn risk_mark_cents(
+    side: &str,
+    qty: i32,
+    best_yes_bid_cents: Option<i32>,
+    best_yes_ask_cents: Option<i32>,
+    recent: bool,
+) -> (i32, bool) {
+    if recent
+        && let Some(mark) = domain_mark_cents(side, qty, best_yes_bid_cents, best_yes_ask_cents)
+    {
+        return (mark, false);
+    }
+    if qty > 0 { (0, true) } else { (100, true) }
 }
 
 fn rest_fill_price_cents_for_intent_side(
@@ -1520,7 +1523,7 @@ fn execution_status_str(s: ExecutionStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{domain_mark_cents, rest_fill_price_cents_for_intent_side};
+    use super::{domain_mark_cents, rest_fill_price_cents_for_intent_side, risk_mark_cents};
     use predigy_kalshi_rest::types::FillRecord;
 
     #[test]
@@ -1540,6 +1543,32 @@ mod tests {
         assert_eq!(domain_mark_cents("no", 3, Some(84), None), None);
         assert_eq!(domain_mark_cents("no", -3, None, Some(87)), None);
         assert_eq!(domain_mark_cents("yes", 0, Some(42), Some(44)), None);
+    }
+
+    #[test]
+    fn risk_mark_uses_domain_mark_when_recent() {
+        assert_eq!(
+            risk_mark_cents("no", 3, Some(84), Some(87), true),
+            (13, false)
+        );
+        assert_eq!(
+            risk_mark_cents("yes", -2, Some(42), Some(44), true),
+            (44, false)
+        );
+    }
+
+    #[test]
+    fn risk_mark_conservatively_values_stale_or_missing_marks() {
+        assert_eq!(
+            risk_mark_cents("yes", 3, Some(42), Some(44), false),
+            (0, true)
+        );
+        assert_eq!(risk_mark_cents("no", 3, Some(84), None, true), (0, true));
+        assert_eq!(
+            risk_mark_cents("yes", -2, Some(42), Some(44), false),
+            (100, true)
+        );
+        assert_eq!(risk_mark_cents("no", -2, None, Some(87), true), (100, true));
     }
 
     fn fill_record() -> FillRecord {

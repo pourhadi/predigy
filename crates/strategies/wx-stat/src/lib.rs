@@ -312,6 +312,25 @@ impl WxStatStrategy {
         self.last_fire_at.insert(key, now);
         Some(intent)
     }
+
+    async fn subscribe_held_positions(
+        &mut self,
+        state: &StrategyState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let added: Vec<MarketTicker> = state
+            .db
+            .open_positions(Some(STRATEGY_ID.0))
+            .await?
+            .into_iter()
+            .map(|p| p.ticker)
+            .filter(|ticker| self.subscribed.insert(ticker.clone()))
+            .map(MarketTicker::new)
+            .collect();
+        if !added.is_empty() {
+            state.subscribe_to_markets(added);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -322,14 +341,25 @@ impl Strategy for WxStatStrategy {
 
     async fn subscribed_markets(
         &self,
-        _state: &StrategyState,
+        state: &StrategyState,
     ) -> Result<Vec<MarketTicker>, Box<dyn std::error::Error + Send + Sync>> {
-        // Markets are picked up dynamically when the rules file
-        // is loaded (first Tick after boot). Returning an empty
-        // initial list is intentional: the curator's rule set
-        // changes per-cycle and the operator may not have written
-        // it before engine boot.
-        Ok(Vec::new())
+        let mut tickers: HashSet<String> = state
+            .db
+            .open_positions(Some(STRATEGY_ID.0))
+            .await?
+            .into_iter()
+            .map(|p| p.ticker)
+            .collect();
+        if let Ok(raw) = std::fs::read(&self.config.rule_file)
+            && let Ok(rules) = serde_json::from_slice::<Vec<WxStatRule>>(&raw)
+        {
+            tickers.extend(
+                rules
+                    .into_iter()
+                    .map(|r| r.kalshi_market.as_str().to_string()),
+            );
+        }
+        Ok(tickers.into_iter().map(MarketTicker::new).collect())
     }
 
     async fn on_event(
@@ -346,6 +376,7 @@ impl Strategy for WxStatStrategy {
             if !added.is_empty() {
                 state.subscribe_to_markets(added);
             }
+            self.subscribe_held_positions(state).await?;
         }
 
         match ev {

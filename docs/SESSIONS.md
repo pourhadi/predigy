@@ -164,7 +164,11 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    `wx-stat-rules.json` as `stat`, and the latest DB refresh disabled all
    legacy enabled rows from that source; `KXHIGHTSFO-26MAY07-T62` is disabled.
    `KXHIGHTPHX-26MAY08-T98` was corrected from YES 0.98 to NO 0.066, and the
-   bad 14-contract YES exposure was sold at 3c.
+   bad 14-contract YES exposure was sold at 3c. The OMS no longer blanket-blocks
+   all strategy entries because unrelated held positions have stale marks; stale
+   marks are valued conservatively for daily-loss checks, while `stat` and
+   `wx-stat` self-subscribe held-position tickers so marks can recover after
+   rules roll off.
 8. **Latency stale-replay guard is fixed.** NWS alerts now require fresh onset
    or effective timestamps, reject expired or missing-timestamp alerts, and use
    a stable full-alert SHA-256 hash in cids instead of a shared short prefix.
