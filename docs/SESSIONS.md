@@ -120,34 +120,27 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 
 ## Open work / next session priorities
 
-1. **Watch live trading for ≥24h.** Initial cutover surfaced one
-   bug (cid period-strip). Subsequent audit work (A/B/D/S1)
-   landed across 13 commits and is in the live binary as of
-   the most recent kickstart. Dashboard at <http://127.0.0.1:8080>
-   — engine positions, recent exits (now with bd/conv/inv/ts
-   tags), fill-latency telemetry per strategy.
-2. **Operator config tunables** now in env (per audit B1+B2+B3):
-   - `PREDIGY_STAT_*`, `PREDIGY_SETTLEMENT_*`, `PREDIGY_LATENCY_*`,
-     `PREDIGY_CROSS_ARB_*` — per-strategy knobs.
-   - `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS` — global cap.
-   - Defaults are conservative; raise after ≥1 week of clean
-     engine operation.
-3. **Phase 4b (FIX)**: blocked on Kalshi institutional access.
-   Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action.
-4. **Audit deferred items** (`docs/AUDIT.md`):
-   - **S2 pre-settlement weather decay** — needs wx-stat curator
-     integration. Tractable next.
-   - **S4 order-book mean reversion** — tractable but overlaps
-     settlement's signal; needs careful ticker filter.
-   - **S5 semantic news latency** — needs Twitter/RSS feed +
-     Claude classifier infra.
-   - **S6 multi-venue cross-arb (Manifold)** — needs Manifold
-     WS integration.
-   - **S3 / S9 multi-leg arb** — coupled to I7 (atomic submit
-     infra). Build I7 first.
-   - **I7 atomic multi-leg submit** — defer until S3/S9 are
-     prioritized.
-5. **Phase 7 — retire legacy daemons** completely (delete
+1. **Do not scale yet.** A full profitability/safety audit is now
+   captured in `docs/PROFITABILITY_AUDIT_PLAN.md`. Keep caps small
+   until Priority 0 and Priority 1 items are fixed and live-observed.
+2. **Fix exit/reduce cap handling first.** Current OMS risk checks
+   treat exits as additive exposure, so TP/SL/force-flat orders can be
+   rejected by notional or contract caps. Live logs have shown this.
+3. **Fix tick scheduling and reconciliation.** Strategy `tick_interval()`
+   exists but supervisors currently depend on inbound events; venue
+   reconciliation is documented but not production-complete.
+4. **Harden market data and duplicate fills.** Sid-level sequence handling
+   is better than per-market REST resnapshot loops, but stale/duplicate
+   frames still need explicit drop semantics. Fill dedupe must happen
+   before mutating intent lifecycle state.
+5. **Gate strategy exposure while proving edge.** Favor `wx-stat`,
+   `implication-arb`, `internal-arb`, and measured `settlement`.
+   Shadow or tightly gate `book-imbalance`, `variance-fade`, `latency`,
+   and `news-trader` until empirical edge exists.
+6. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
+   Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
+   do not prioritize FIX above the safety blockers.
+7. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.

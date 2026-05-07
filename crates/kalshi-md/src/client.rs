@@ -27,7 +27,7 @@ use crate::decode::{delta_from_wire, snapshot_from_wire};
 use crate::error::Error;
 use crate::messages::{
     Channel, FillBody, Incoming, MarketPositionBody, Outgoing, SubscribeParams, TickerBody,
-    TradeBody, UnsubscribeParams,
+    TradeBody, UnsubscribeParams, UpdateAction, UpdateParams,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
@@ -179,6 +179,36 @@ impl Connection {
         Ok(req_id)
     }
 
+    /// Request fresh orderbook snapshots for markets already attached to one
+    /// orderbook subscription sid.
+    ///
+    /// This uses Kalshi's `update_subscription` / `get_snapshot` action over
+    /// the existing websocket instead of REST, so consumers can resync after a
+    /// true stream sequence gap without creating REST rate-limit bursts.
+    pub async fn get_snapshot(
+        &mut self,
+        sid: u64,
+        market_tickers: &[String],
+    ) -> Result<u64, Error> {
+        if market_tickers.is_empty() {
+            return Err(Error::Invalid(
+                "get_snapshot: market_tickers is empty".into(),
+            ));
+        }
+        let req_id = self.next_req_id;
+        self.next_req_id += 1;
+        self.cmd_tx
+            .send(TaskCmd::UpdateSubscription {
+                req_id,
+                sids: vec![sid],
+                action: UpdateAction::GetSnapshot,
+                market_tickers: market_tickers.to_vec(),
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        Ok(req_id)
+    }
+
     /// Pop the next event. Returns `None` once the background task has
     /// fully exited and drained its event queue.
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -268,6 +298,12 @@ enum TaskCmd {
     Unsubscribe {
         req_id: u64,
         sids: Vec<u64>,
+    },
+    UpdateSubscription {
+        req_id: u64,
+        sids: Vec<u64>,
+        action: UpdateAction,
+        market_tickers: Vec<String>,
     },
     Shutdown,
 }
@@ -404,6 +440,19 @@ where
                         };
                         if let Err(e) = send_outgoing(&mut sink, &cmd).await {
                             return SessionOutcome::Disconnected(format!("send unsubscribe: {e}"));
+                        }
+                    }
+                    TaskCmd::UpdateSubscription { req_id, sids, action, market_tickers } => {
+                        let cmd = Outgoing::UpdateSubscription {
+                            id: req_id,
+                            params: UpdateParams {
+                                sids: sids.clone(),
+                                action,
+                                market_tickers: Some(market_tickers.clone()),
+                            },
+                        };
+                        if let Err(e) = send_outgoing(&mut sink, &cmd).await {
+                            return SessionOutcome::Disconnected(format!("send update_subscription: {e}"));
                         }
                     }
                 }
@@ -551,10 +600,11 @@ fn apply_command_offline(cmd: TaskCmd, subs: &mut Vec<SavedSub>) {
                 market_tickers,
             });
         }
-        TaskCmd::Unsubscribe { .. } | TaskCmd::Shutdown => {
+        TaskCmd::Unsubscribe { .. } | TaskCmd::UpdateSubscription { .. } | TaskCmd::Shutdown => {
             // Unsubscribe-by-sid only meaningful in-session; queueing
-            // would target a nonexistent sid post-reconnect. Drop. Shutdown
-            // is handled by the outer select.
+            // would target a nonexistent sid post-reconnect. Same for
+            // update_subscription snapshot requests. Shutdown is handled by
+            // the outer select.
         }
     }
 }
@@ -626,6 +676,23 @@ mod tests {
     }
 
     #[test]
+    fn update_subscription_get_snapshot_serialises() {
+        let cmd = Outgoing::UpdateSubscription {
+            id: 9,
+            params: UpdateParams {
+                sids: vec![7],
+                action: UpdateAction::GetSnapshot,
+                market_tickers: Some(vec!["A".into(), "B".into()]),
+            },
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        assert!(s.contains(r#""cmd":"update_subscription""#), "got: {s}");
+        assert!(s.contains(r#""action":"get_snapshot""#), "got: {s}");
+        assert!(s.contains(r#""sids":[7]"#), "got: {s}");
+        assert!(s.contains(r#""market_tickers":["A","B"]"#), "got: {s}");
+    }
+
+    #[test]
     fn apply_command_offline_appends_subscribe() {
         let mut subs = Vec::new();
         apply_command_offline(
@@ -647,6 +714,21 @@ mod tests {
             TaskCmd::Unsubscribe {
                 req_id: 4,
                 sids: vec![7],
+            },
+            &mut subs,
+        );
+        assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn apply_command_offline_drops_update_subscription() {
+        let mut subs = Vec::new();
+        apply_command_offline(
+            TaskCmd::UpdateSubscription {
+                req_id: 5,
+                sids: vec![7],
+                action: UpdateAction::GetSnapshot,
+                market_tickers: vec!["X".into()],
             },
             &mut subs,
         );

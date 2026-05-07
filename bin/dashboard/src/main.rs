@@ -39,19 +39,21 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use predigy_kalshi_rest::types::MarketPosition;
+use predigy_kalshi_rest::types::{MarketDetail, MarketPosition};
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+const MARKET_DETAIL_CACHE_TTL: Duration = Duration::from_secs(60);
+const MARKET_DETAIL_FETCH_SPACING: Duration = Duration::from_millis(75);
 const RECENT_EVENTS_KEEP: usize = 30;
 const HTML: &str = include_str!("../static/index.html");
 
@@ -270,11 +272,23 @@ struct ExitRow {
 #[derive(Clone)]
 struct AppState {
     snapshot: Arc<RwLock<Snapshot>>,
+    market_details: Arc<Mutex<MarketDetailCache>>,
     kill_flag: Arc<PathBuf>,
     /// Optional Postgres pool. `None` if DB connection failed at
     /// startup (dashboard still works against JSON-only). Logs
     /// the degradation at WARN.
     db: Option<sqlx::PgPool>,
+}
+
+#[derive(Debug, Default)]
+struct MarketDetailCache {
+    entries: HashMap<String, CachedMarketDetail>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedMarketDetail {
+    detail: MarketDetail,
+    fetched_at: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,11 +355,19 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         snapshot: Arc::new(RwLock::new(Snapshot::default())),
+        market_details: Arc::new(Mutex::new(MarketDetailCache::default())),
         kill_flag: Arc::new(kill_flag.clone()),
         db: db.clone(),
     };
 
-    let initial = build_snapshot(&rest, &strategies, &kill_flag, db.as_ref()).await;
+    let initial = build_snapshot(
+        &rest,
+        &state.market_details,
+        &strategies,
+        &kill_flag,
+        db.as_ref(),
+    )
+    .await;
     *state.snapshot.write().await = initial;
 
     let refresh_state = state.clone();
@@ -360,6 +382,7 @@ async fn main() -> Result<()> {
             tick.tick().await;
             let snap = build_snapshot(
                 &refresh_rest,
+                &refresh_state.market_details,
                 &refresh_strats,
                 &refresh_kill_flag,
                 refresh_db.as_ref(),
@@ -466,8 +489,72 @@ async fn serve_kill(
     }
 }
 
+async fn fetch_market_details(
+    rest: &RestClient,
+    cache: &Arc<Mutex<MarketDetailCache>>,
+    tickers: Vec<String>,
+) -> Vec<(String, Option<MarketDetail>)> {
+    let mut unique = tickers
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    unique.sort();
+
+    let mut out = Vec::with_capacity(unique.len());
+    for ticker in unique {
+        let now = Instant::now();
+        if let Some(detail) = cached_market_detail(cache, &ticker, now).await {
+            out.push((ticker, Some(detail)));
+            continue;
+        }
+
+        match rest.market_detail(&ticker).await {
+            Ok(resp) => {
+                let detail = resp.market;
+                cache_market_detail(cache, ticker.clone(), detail.clone(), Instant::now()).await;
+                out.push((ticker, Some(detail)));
+            }
+            Err(e) => {
+                warn!(ticker, error = %e, "refresh: market_detail failed");
+                out.push((ticker, None));
+            }
+        }
+        tokio::time::sleep(MARKET_DETAIL_FETCH_SPACING).await;
+    }
+    out
+}
+
+async fn cached_market_detail(
+    cache: &Arc<Mutex<MarketDetailCache>>,
+    ticker: &str,
+    now: Instant,
+) -> Option<MarketDetail> {
+    let cache = cache.lock().await;
+    cache.entries.get(ticker).and_then(|entry| {
+        if now.duration_since(entry.fetched_at) <= MARKET_DETAIL_CACHE_TTL {
+            Some(entry.detail.clone())
+        } else {
+            None
+        }
+    })
+}
+
+async fn cache_market_detail(
+    cache: &Arc<Mutex<MarketDetailCache>>,
+    ticker: String,
+    detail: MarketDetail,
+    fetched_at: Instant,
+) {
+    let mut cache = cache.lock().await;
+    cache
+        .entries
+        .insert(ticker, CachedMarketDetail { detail, fetched_at });
+}
+
 async fn build_snapshot(
     rest: &RestClient,
+    market_details: &Arc<Mutex<MarketDetailCache>>,
     strategies: &[StrategySpec],
     kill_flag: &std::path::Path,
     db: Option<&sqlx::PgPool>,
@@ -492,8 +579,7 @@ async fn build_snapshot(
     // (PositionRow) and the engine-positions table
     // (EnginePositionRow / I4 enrichment below). Built once,
     // consulted by both consumers.
-    let mut mark_map: std::collections::HashMap<String, predigy_kalshi_rest::types::MarketDetail> =
-        std::collections::HashMap::new();
+    let mut mark_map: HashMap<String, MarketDetail> = HashMap::new();
 
     match rest.positions().await {
         Ok(positions_resp) => {
@@ -502,15 +588,11 @@ async fn build_snapshot(
                 .into_iter()
                 .filter(has_activity)
                 .collect();
-            // Mark each open position to the current touch in
-            // parallel — N concurrent market_detail fetches. The
-            // 429-retry layer in kalshi-rest absorbs occasional
-            // burst rejections.
-            let mark_futures = active.iter().map(|p| async {
-                let detail = rest.market_detail(&p.ticker).await;
-                (p.ticker.clone(), detail.ok().map(|r| r.market))
-            });
-            let marks = futures_util::future::join_all(mark_futures).await;
+            // Mark each open position to the current touch without bursting
+            // Kalshi REST. Dashboard marks tolerate a short cache TTL; rate
+            // limits do not tolerate dozens of concurrent detail requests.
+            let active_tickers: Vec<String> = active.iter().map(|p| p.ticker.clone()).collect();
+            let marks = fetch_market_details(rest, market_details, active_tickers).await;
             for (t, d) in marks {
                 if let Some(detail) = d {
                     mark_map.insert(t, detail);
@@ -635,11 +717,7 @@ async fn build_snapshot(
                     .into_iter()
                     .collect();
                 if !missing.is_empty() {
-                    let extras = futures_util::future::join_all(missing.iter().map(|t| async {
-                        let d = rest.market_detail(t).await;
-                        (t.clone(), d.ok().map(|r| r.market))
-                    }))
-                    .await;
+                    let extras = fetch_market_details(rest, market_details, missing).await;
                     for (t, d) in extras {
                         if let Some(detail) = d {
                             mark_map.insert(t, detail);
@@ -1026,14 +1104,14 @@ async fn db_fill_latency(pool: &sqlx::PgPool) -> Result<Vec<FillLatencyRow>, sql
         "SELECT
              i.strategy,
              COUNT(*)::BIGINT AS n_fills,
-             AVG(EXTRACT(EPOCH FROM (f.ts - i.submitted_at))) AS mean_secs,
+             AVG(EXTRACT(EPOCH FROM (f.ts - i.submitted_at)))::DOUBLE PRECISION AS mean_secs,
              PERCENTILE_DISC(0.5) WITHIN GROUP (
-                 ORDER BY EXTRACT(EPOCH FROM (f.ts - i.submitted_at))
+                 ORDER BY EXTRACT(EPOCH FROM (f.ts - i.submitted_at))::DOUBLE PRECISION
              ) AS p50_secs,
              PERCENTILE_DISC(0.95) WITHIN GROUP (
-                 ORDER BY EXTRACT(EPOCH FROM (f.ts - i.submitted_at))
+                 ORDER BY EXTRACT(EPOCH FROM (f.ts - i.submitted_at))::DOUBLE PRECISION
              ) AS p95_secs,
-             MAX(EXTRACT(EPOCH FROM (f.ts - i.submitted_at))) AS max_secs
+             MAX(EXTRACT(EPOCH FROM (f.ts - i.submitted_at)))::DOUBLE PRECISION AS max_secs
            FROM fills f
            JOIN intents i ON i.client_id = f.client_id
           WHERE f.ts >= now() - interval '1 hour'

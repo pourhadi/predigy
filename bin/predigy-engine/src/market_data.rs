@@ -6,7 +6,7 @@
 //! - One `MarketDataRouter` per engine instance, one Kalshi WS
 //!   connection.
 //! - Maintains per-market `OrderBook` state (snapshots + deltas;
-//!   gap detection triggers REST resync).
+//!   sid-level gap detection triggers WS snapshot resync).
 //! - Tracks (sid → market_ticker) mapping since Kalshi events
 //!   are keyed by `sid` not by ticker.
 //! - Fans out `Event::BookUpdate` to every strategy supervisor
@@ -23,9 +23,8 @@ use predigy_engine_core::strategy::StrategyId;
 use predigy_kalshi_md::{
     Channel, Client as MdClient, Connection as MdConnection, Event as MdEvent,
 };
-use predigy_kalshi_rest::Client as RestClient;
 use predigy_kalshi_rest::Signer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -60,10 +59,9 @@ impl Subscriptions {
     }
 }
 
-/// Configuration for the router. We take the raw PEM bytes (not
-/// a `Signer`) because `Signer` doesn't implement `Clone` and the
-/// router needs two independent signers (one for the MD client,
-/// one for the REST client used during gap-resnapshots).
+/// Configuration for the router. We take the raw PEM bytes (not a `Signer`)
+/// because `Signer` doesn't implement `Clone` and the engine uses the same PEM
+/// for multiple venue connections.
 #[derive(Clone)]
 pub struct RouterConfig {
     pub kalshi_key_id: String,
@@ -86,11 +84,17 @@ struct RouterState {
     subs: Arc<RwLock<Subscriptions>>,
     /// Per-market book state. Built lazily on first snapshot.
     books: HashMap<String, OrderBook>,
-    /// (sid → ticker) for routing event-side sids back to ticker
-    /// subscriptions. Filled when the server sends `Subscribed`.
-    sid_to_ticker: HashMap<u64, String>,
-    /// REST client used for resnapshot after a sequence gap.
-    rest: Arc<RestClient>,
+    /// Client request id → tickers requested. `subscribed` only carries the
+    /// request id and sid; this lets us attach each orderbook sid to the
+    /// markets it covers.
+    req_to_tickers: HashMap<u64, Vec<String>>,
+    /// Orderbook sid → tickers observed/requested on that subscription.
+    sid_to_tickers: HashMap<u64, HashSet<String>>,
+    /// Last observed exchange sequence per orderbook sid. Kalshi sequences are
+    /// subscription-scoped, not per-market.
+    sid_last_seq: HashMap<u64, u64>,
+    /// Markets currently waiting for a WS `get_snapshot` resync per sid.
+    sid_snapshot_pending: HashMap<u64, HashSet<String>>,
     /// Tickers we've already subscribed to. Lets `AddTickers`
     /// skip duplicates (issuing a second subscribe for an already-
     /// subscribed ticker isn't an error but it wastes a req_id).
@@ -133,20 +137,9 @@ impl MarketDataRouter {
     /// strategy module then `start_subscriptions` once registration
     /// completes.
     pub async fn connect(config: RouterConfig) -> anyhow::Result<Self> {
-        // Build one signer for the WS client and another for the
-        // REST client. Two signers because Signer doesn't impl
-        // Clone; cheap to construct from the same PEM bytes.
         let md_signer = Signer::from_pem(&config.kalshi_key_id, &config.kalshi_pem)
             .map_err(|e| anyhow::anyhow!("md signer: {e}"))?;
-        let rest_signer = Signer::from_pem(&config.kalshi_key_id, &config.kalshi_pem)
-            .map_err(|e| anyhow::anyhow!("rest signer: {e}"))?;
         let md_client = MdClient::new(md_signer)?;
-        let rest = if let Some(base) = config.rest_endpoint.as_deref() {
-            RestClient::with_base(base, Some(rest_signer))?
-        } else {
-            RestClient::authed(rest_signer)?
-        };
-        let rest = Arc::new(rest);
         let connection = md_client.connect();
         let subs = Arc::new(RwLock::new(Subscriptions::default()));
 
@@ -155,8 +148,10 @@ impl MarketDataRouter {
         let router_state = RouterState {
             subs: subs.clone(),
             books: HashMap::new(),
-            sid_to_ticker: HashMap::new(),
-            rest,
+            req_to_tickers: HashMap::new(),
+            sid_to_tickers: HashMap::new(),
+            sid_last_seq: HashMap::new(),
+            sid_snapshot_pending: HashMap::new(),
             subscribed_tickers: std::collections::HashSet::new(),
         };
 
@@ -233,6 +228,7 @@ async fn router_task(
                     n_tickers = tickers.len(),
                     "router: subscribe submitted"
                 );
+                state.req_to_tickers.insert(req_id, tickers.clone());
                 for t in &tickers {
                     state.subscribed_tickers.insert(t.clone());
                 }
@@ -254,7 +250,7 @@ async fn router_task(
                     warn!("router: kalshi-md connection closed");
                     return;
                 };
-                if let Err(e) = handle_event(ev, &mut state).await {
+                if let Err(e) = handle_event(ev, &mut state, &mut connection).await {
                     warn!(error = %e, "router: event-handling error");
                 }
             }
@@ -306,6 +302,7 @@ async fn handle_command(
                 .await
             {
                 Ok(req_id) => {
+                    state.req_to_tickers.insert(req_id, new.clone());
                     info!(
                         req_id,
                         n_new_tickers = new.len(),
@@ -331,15 +328,30 @@ async fn handle_command(
     Ok(())
 }
 
-async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()> {
+async fn handle_event(
+    ev: MdEvent,
+    state: &mut RouterState,
+    connection: &mut MdConnection,
+) -> anyhow::Result<()> {
     match ev {
-        MdEvent::Subscribed { sid, channel, .. } => {
-            // Map sid → ticker. Channel info doesn't carry the
-            // ticker; we look it up by polling Kalshi's REST or
-            // by matching against subscribed tickers in order.
-            // Kalshi's WS does NOT echo the ticker on Subscribed,
-            // so we'll learn the mapping from the first
-            // Snapshot's `market` field instead.
+        MdEvent::Subscribed {
+            req_id,
+            sid,
+            channel,
+        } => {
+            if channel == Channel::OrderbookDelta.wire_name() {
+                if let Some(req_id) = req_id
+                    && let Some(tickers) = state.req_to_tickers.get(&req_id)
+                {
+                    state
+                        .sid_to_tickers
+                        .entry(sid)
+                        .or_default()
+                        .extend(tickers.iter().cloned());
+                }
+                state.sid_last_seq.remove(&sid);
+                state.sid_snapshot_pending.remove(&sid);
+            }
             debug!(sid, channel, "router: server confirmed subscribe");
         }
         MdEvent::Snapshot {
@@ -347,7 +359,22 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
             market,
             snapshot,
         } => {
-            state.sid_to_ticker.insert(sid, market.clone());
+            state
+                .sid_to_tickers
+                .entry(sid)
+                .or_default()
+                .insert(market.clone());
+            if let Some((expected, got)) = observe_sid_seq(state, sid, snapshot.seq) {
+                warn!(
+                    sid,
+                    market,
+                    expected,
+                    got,
+                    "router: sid sequence gap on snapshot; requesting WS snapshots"
+                );
+                let markets = known_sid_markets(state, sid);
+                request_sid_snapshot(state, connection, sid, markets).await?;
+            }
             // Borrow scopes split: apply mutation in one block,
             // clone the book, then fan out using the clone +
             // the immutable subscription registry.
@@ -359,9 +386,10 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
                 book.apply_snapshot(snapshot);
                 book.clone()
             };
+            mark_snapshot_ready(state, sid, &market);
             fan_out(&state.subs, &market, &book_clone).await;
         }
-        MdEvent::Delta { sid: _, delta } => {
+        MdEvent::Delta { sid, delta } => {
             // Route by `delta.market` (from the wire body), NOT
             // by sid. Kalshi multiplexes multiple tickers under
             // one subscription id; `sid_to_ticker` only stores
@@ -370,12 +398,41 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
             // the rest as `WrongMarket`. The wire body's
             // `market_ticker` is authoritative.
             let market = delta.market.clone();
+            state
+                .sid_to_tickers
+                .entry(sid)
+                .or_default()
+                .insert(market.clone());
+            if let Some((expected, got)) = observe_sid_seq(state, sid, delta.seq) {
+                warn!(
+                    sid,
+                    market, expected, got, "router: sid sequence gap; requesting WS snapshots"
+                );
+                let markets = known_sid_markets(state, sid);
+                request_sid_snapshot(state, connection, sid, markets).await?;
+                return Ok(());
+            }
+            if pending_snapshot(state, sid, &market) {
+                debug!(
+                    sid,
+                    market, "router: dropping delta while awaiting WS snapshot"
+                );
+                return Ok(());
+            }
+            if !state.books.contains_key(&market) {
+                warn!(
+                    sid,
+                    market, "router: delta before snapshot; requesting WS snapshot"
+                );
+                request_sid_snapshot(state, connection, sid, vec![market]).await?;
+                return Ok(());
+            }
             let outcome_clone = {
                 let book = state
                     .books
                     .entry(market.clone())
                     .or_insert_with(|| OrderBook::new(market.clone()));
-                let outcome = book.apply_delta(&delta);
+                let outcome = book.apply_delta_unsequenced(&delta);
                 let cloned = book.clone();
                 (outcome, cloned)
             };
@@ -386,11 +443,8 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
                 ApplyOutcome::Gap { expected, got } => {
                     warn!(
                         market,
-                        expected, got, "router: sequence gap; resnapshot via REST"
+                        expected, got, "router: unexpected per-book sequence gap"
                     );
-                    if let Err(e) = resnapshot_book(state, &market).await {
-                        warn!(market, error = %e, "router: resnapshot failed");
-                    }
                 }
                 ApplyOutcome::WrongMarket => {
                     warn!(market, "router: delta wrong-market; ignoring");
@@ -406,6 +460,10 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
             warn!(attempt, reason, "router: kalshi-md disconnected");
         }
         MdEvent::Reconnected => {
+            state.books.clear();
+            state.sid_to_tickers.clear();
+            state.sid_last_seq.clear();
+            state.sid_snapshot_pending.clear();
             info!("router: kalshi-md reconnected; books may be stale until next snapshot");
         }
         MdEvent::ServerError { req_id, code, msg } => {
@@ -459,20 +517,73 @@ async fn fan_out(subs: &Arc<RwLock<Subscriptions>>, market: &str, book: &OrderBo
     }
 }
 
-async fn resnapshot_book(state: &mut RouterState, market: &str) -> anyhow::Result<()> {
-    // Pull the latest book via REST and apply as a fresh snapshot.
-    let snap = state.rest.orderbook_snapshot(market).await?;
-    let book_clone = {
-        let book = state
-            .books
-            .entry(market.to_string())
-            .or_insert_with(|| OrderBook::new(market.to_string()));
-        // REST snapshots have no exchange seq, so apply_rest_snapshot
-        // resets last_seq=None — the next WS delta is accepted as
-        // the new baseline regardless of its seq.
-        book.apply_rest_snapshot(snap);
-        book.clone()
+fn observe_sid_seq(state: &mut RouterState, sid: u64, seq: u64) -> Option<(u64, u64)> {
+    let Some(last) = state.sid_last_seq.get(&sid).copied() else {
+        state.sid_last_seq.insert(sid, seq);
+        return None;
     };
-    fan_out(&state.subs, market, &book_clone).await;
+    if seq <= last {
+        return None;
+    }
+    state.sid_last_seq.insert(sid, seq);
+    let expected = last.saturating_add(1);
+    if seq > expected {
+        Some((expected, seq))
+    } else {
+        None
+    }
+}
+
+fn known_sid_markets(state: &RouterState, sid: u64) -> Vec<String> {
+    state
+        .sid_to_tickers
+        .get(&sid)
+        .map(|markets| markets.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn pending_snapshot(state: &RouterState, sid: u64, market: &str) -> bool {
+    state
+        .sid_snapshot_pending
+        .get(&sid)
+        .is_some_and(|pending| pending.contains(market))
+}
+
+fn mark_snapshot_ready(state: &mut RouterState, sid: u64, market: &str) {
+    if let Some(pending) = state.sid_snapshot_pending.get_mut(&sid) {
+        pending.remove(market);
+        if pending.is_empty() {
+            state.sid_snapshot_pending.remove(&sid);
+        }
+    }
+}
+
+async fn request_sid_snapshot(
+    state: &mut RouterState,
+    connection: &mut MdConnection,
+    sid: u64,
+    markets: Vec<String>,
+) -> anyhow::Result<()> {
+    if markets.is_empty() {
+        anyhow::bail!("sid {sid} has no known markets to resnapshot");
+    }
+    if state
+        .sid_snapshot_pending
+        .get(&sid)
+        .is_some_and(|pending| !pending.is_empty())
+    {
+        debug!(sid, "router: WS snapshot request already pending");
+        return Ok(());
+    }
+
+    let pending: HashSet<String> = markets.iter().cloned().collect();
+    let req_id = connection.get_snapshot(sid, &markets).await?;
+    state.sid_snapshot_pending.insert(sid, pending);
+    info!(
+        sid,
+        req_id,
+        n_markets = markets.len(),
+        "router: WS snapshot request submitted"
+    );
     Ok(())
 }

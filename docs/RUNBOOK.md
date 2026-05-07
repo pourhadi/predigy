@@ -69,6 +69,10 @@ positions are NOT auto-flattened.
 The dashboard's "kill switch" card on the web UI is wired to the
 same flag file via `POST /api/kill`.
 
+Security note: if the dashboard is bound to `0.0.0.0`, `/api/kill`
+is reachable from the LAN/Tailscale path unless protected externally.
+Treat it as a trading-control endpoint, not a read-only dashboard.
+
 ## Redeploy
 
 ```sh
@@ -115,6 +119,52 @@ grep "rejected by venue" ~/Library/Logs/predigy/engine.stderr.log | tail -5
 If `400 invalid_parameters` and the cid contains `.`, the
 period-strip in `engine_core::cid_safe_ticker` regressed. (This was
 the 2026-05-07 cutover bug.)
+
+### "Exits are not getting out"
+
+This is a critical live-trading condition. Check whether TP/SL/force-flat
+intents are being rejected by risk caps:
+
+```sh
+grep -E "emitting exit|force-flat|oms: rejected" ~/Library/Logs/predigy/engine.stderr.log | tail -80
+psql -d predigy -c "SELECT strategy, client_id, action, status, reason, submitted_at FROM intents WHERE client_id LIKE '%-exit:%' OR client_id LIKE '%-flat:%' ORDER BY submitted_at DESC LIMIT 30;"
+```
+
+Known blocker: current OMS cap projection treats exits as additive
+exposure. If logs show `notional cap` or `contract cap` rejections for
+exit intents, keep caps small and prioritize the fix in
+`docs/PROFITABILITY_AUDIT_PLAN.md`.
+
+### "Positions diverged from venue"
+
+As of the profitability audit, full broker reconciliation is not yet
+production-complete. Do not assume the engine will automatically repair
+missed WS fills or manual venue changes.
+
+Immediate checks:
+
+```sh
+psql -d predigy -c "SELECT strategy, ticker, side, current_qty, avg_entry_cents, fees_paid_cents FROM positions WHERE closed_at IS NULL ORDER BY strategy, ticker;"
+psql -d predigy -c "SELECT strategy, status, COUNT(*) FROM intents GROUP BY strategy, status ORDER BY strategy, status;"
+tail -n 120 ~/Library/Logs/predigy/engine.stderr.log
+```
+
+If venue state disagrees with Postgres, keep the kill switch armed and
+handle the position manually until reconciliation is implemented.
+
+### "Dashboard or engine is producing many Kalshi 429s"
+
+The 2026-05-07 audit found two sources of REST pressure: false per-market
+orderbook resnapshots in the engine and dashboard mark refresh bursts.
+Recent code changes target both sources, but keep watching for regression:
+
+```sh
+grep "resnapshot via REST" ~/Library/Logs/predigy/engine.stderr.log | tail -20
+grep "kalshi 429" ~/Library/Logs/predigy/dashboard.stderr.log | tail -20
+```
+
+Any recurrence means the engine/dashboard is spending rate budget that
+should be reserved for order entry and reconciliation.
 
 ### "Cross-arb isn't firing"
 

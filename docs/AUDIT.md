@@ -12,8 +12,55 @@
 > S7 (MM) + I1 (maker exec) gated on Kalshi access or $25K
 > capital. S6 (third-venue cross-arb) remains — needs new
 > Polymarket-class venue integration.
+>
+> **Profitability/safety audit update:** A later full-system audit found
+> scale-blocking implementation risks and unproven strategy expectancy.
+> The durable remediation plan is
+> [`PROFITABILITY_AUDIT_PLAN.md`](./PROFITABILITY_AUDIT_PLAN.md). Treat
+> that file as the current scale-up gate: no cap increases until Priority
+> 0 and Priority 1 safety items are fixed and live-observed cleanly.
 
 ---
+
+## 2026-05-07 Profitability Safety Overlay
+
+The shipped audit items above improved strategy breadth and exits, but
+they do not by themselves prove the system can trade profitably or safely
+at larger size. The follow-up audit found these scale blockers:
+
+- Exit/reduce orders can be rejected by notional or contract caps because
+  OMS cap projection treats all intents as additive exposure.
+- Strategy `tick_interval()` declarations exist, but the supervisor does
+  not currently provide an independent periodic tick scheduler.
+- Venue reconciliation is documented but not production-complete, so
+  missed WS fills or manual venue changes can leave DB state stale.
+- Duplicate fill handling must dedupe before mutating intent lifecycle
+  state.
+- Sid-level market-data sequencing is the right direction, but stale or
+  duplicate frames still need explicit drop semantics.
+- Daily-loss enforcement is realized-only and does not include unrealized
+  mark-to-market losses.
+- OMS order-rate fields exist but are not enforced.
+- Per-strategy kill switches cover only the legacy four strategy IDs.
+
+Strategy thesis ranking from the audit:
+
+| Strategy | Current posture | Rationale |
+|---|---|---|
+| `wx-stat` | Best directional candidate | NBM/weather probability is a real external information source if calibrated |
+| `implication-arb` | Keep tiny | Real no-arb math, pair-proof and partial-fill risk |
+| `internal-arb` | Keep tiny | Real no-arb math, multi-leg execution risk |
+| `settlement` | Keep measured | Plausible behavioral niche, adverse-selection heavy |
+| `cross-arb` | Measure / raise edge | Polymarket is signal only, not a hedge |
+| `stat` | Measure / raise edge | LLM probability edge is unproven after fees |
+| `book-imbalance` | Disable or shadow | Displayed size is weak alpha |
+| `variance-fade` | Disable or shadow | Fading moves without news filter is fragile |
+| `latency` | Disable or shadow | Public alerts plus polling/REST latency are weak |
+| `news-trader` | Shadow until upstream proven | Adapter only; classifier/source quality is the alpha |
+
+Minimum scale gate: at least 30 closed trades before weak conclusions,
+prefer 100 before material cap increases, and net expectancy must be
+positive after fees.
 
 ## A. Profit-take improvements
 

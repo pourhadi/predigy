@@ -14,11 +14,18 @@ Written 2026-05-07. Migration in progress.
 ## TL;DR
 
 - One process (`predigy-engine`) replaces 5+ separate trader binaries.
-- One Kalshi connection (FIX-primary, REST-fallback) instead of N.
+- One Kalshi market-data WS connection plus one authed fill/position WS
+  connection; order entry is currently REST-first until FIX access exists.
 - One Postgres database replaces the per-strategy JSON state files.
 - Strategy logic lives in module crates loaded into the engine.
 - Position management is global: cross-strategy Kelly, shared kill-switch,
   shared book view, shared model_p history.
+
+Current caveat: the 2026-05-07 profitability audit found scale blockers
+in exit cap handling, reconciliation, tick scheduling, mark-to-market
+risk, and stale-frame handling. See
+[`PROFITABILITY_AUDIT_PLAN.md`](./PROFITABILITY_AUDIT_PLAN.md) before
+raising caps.
 
 The migration is phased so the existing daemons keep running and
 making fills throughout. The new engine is built alongside, parity-
@@ -122,10 +129,12 @@ wrong shape for what we want next:
    open positions from shared in-memory state, decides whether to
    submit an `Intent`.
 3. **Intent → execution** — shared OMS dedupes via client-id,
-   routes to FIX (preferred) or REST (fallback), persists the
-   `intents` row.
-4. **Fill arrives** — FIX `ExecutionReport` (or REST `/fills` poll)
-   triggers a fill row + position update + portfolio re-mark.
+   persists the `intents` row, and the REST submitter drains live
+   `submitted` rows to Kalshi. FIX routing is planned but blocked on
+   Kalshi access.
+4. **Fill arrives** — the authed WS fill channel triggers a fill row +
+   position update. REST reconciliation/catch-up remains a required
+   hardening item.
 5. **Settlement** — when Kalshi reports settled, position closes,
    realised P&L lands in `pnl_daily`, model_p history joins with
    outcome for the calibration view.
@@ -376,8 +385,8 @@ the work.
       tool — diff engine shadow intents vs legacy stat-trader fills
       across a 24-48h window. Tool can be built without FIX, but
       the cutover decision waits.
-- [ ] **Phase 3.4 (BLOCKED on Phase 4)**: flip engine to Live
-      mode + retire legacy stat-trader. Requires the FIX path.
+- [x] **Phase 3.4**: flip engine to Live mode + retire legacy
+      stat-trader. Cutover happened via REST-primary execution, not FIX.
 
 ### Phase 4 — Engine venue path: REST-primary + WS-push fills
 
@@ -686,9 +695,9 @@ For each remaining strategy:
 2. **No fills for hours when there should be** → check FIX session
    state (`SELECT * FROM kill_switches WHERE armed=true`) and
    strategy heartbeats
-3. **Positions diverged from broker** → run reconciliation:
-   `predigy-engine reconcile` pulls the broker snapshot and
-   reports diffs
+3. **Positions diverged from broker** → full reconciliation is a
+   scale-blocking TODO. Compare Postgres positions/intents against
+   Kalshi manually and keep the kill switch armed until repaired.
 4. **Database disk full** → rotate old `model_p_snapshots`:
    `DELETE FROM model_p_snapshots WHERE ts < now() - INTERVAL '90 days'`
 
@@ -706,9 +715,10 @@ For each remaining strategy:
 - DB-based (preferred when engine is responsive):
   `INSERT INTO kill_switches (scope, armed, reason)
    VALUES ('global', true, 'manual: <reason>')`
-- Engine flushes positions and refuses new entries when armed
+- Engine refuses new entries when armed. Existing positions are not
+  auto-flattened by the current kill switch.
 - To clear: `DELETE FROM kill_switches WHERE scope='global'` AND
-  `rm ~/.config/predigy/kill-switch.flag`
+  truncate `~/.config/predigy/kill-switch.flag` to empty.
 
 ### Schema migrations
 
@@ -757,15 +767,18 @@ future-us doesn't redo them.
 - One process means shared in-memory state (book view, positions,
   model_p) without IPC overhead.
 - One Kalshi connection means rate-limit collisions go away.
-- One FIX session means sub-millisecond order ack on the hot path.
+- A future FIX session should give sub-millisecond order ack on the hot
+  path once Kalshi access is available.
 
-### 2026-05-07: FIX-primary, REST-fallback for orders
+### 2026-05-07: REST-first orders, FIX planned
 
 - FIX latency edge matters for cross-arb spread capture and
   latency-trader's news-driven fires.
-- REST stays as fallback because the hard parts of FIX (network
-  failures, session loss, dropped messages) are real and a
-  fallback path is defence-in-depth.
+- Current live order entry is REST. FIX remains blocked on Kalshi
+  institutional onboarding.
+- The REST path will remain useful after FIX for fallback and non-hot-path
+  order operations, but the engine must first complete reconciliation and
+  exit/risk hardening.
 - All non-hot-path operations (metadata refresh, settlement
   snapshots) stay REST because there's no latency benefit.
 

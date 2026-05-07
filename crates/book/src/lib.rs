@@ -130,10 +130,26 @@ impl OrderBook {
     /// Apply an incremental delta. Returns the outcome; on `Gap` the caller
     /// must resnapshot before further deltas will be accepted.
     pub fn apply_delta(&mut self, delta: &Delta) -> ApplyOutcome {
+        self.apply_delta_inner(delta, true)
+    }
+
+    /// Apply an incremental delta after the caller has already validated
+    /// sequence continuity at the transport/subscription layer.
+    ///
+    /// Kalshi's websocket `seq` is scoped to the subscription stream, not to
+    /// an individual market inside a multi-market subscription. Engine code
+    /// that subscribes many markets under one sid should use this method after
+    /// checking the sid-level sequence, otherwise unrelated interleaved market
+    /// updates look like per-market gaps.
+    pub fn apply_delta_unsequenced(&mut self, delta: &Delta) -> ApplyOutcome {
+        self.apply_delta_inner(delta, false)
+    }
+
+    fn apply_delta_inner(&mut self, delta: &Delta, check_sequence: bool) -> ApplyOutcome {
         if delta.market != self.market {
             return ApplyOutcome::WrongMarket;
         }
-        if let Some(last) = self.last_seq {
+        if check_sequence && let Some(last) = self.last_seq {
             let expected = last + 1;
             if delta.seq != expected {
                 return ApplyOutcome::Gap {
@@ -320,6 +336,19 @@ mod tests {
                 got: 110
             }
         );
+    }
+
+    #[test]
+    fn unsequenced_delta_accepts_subscription_scoped_seq_jumps() {
+        let mut b = OrderBook::new("X");
+        b.apply_snapshot(snap(10, vec![(40, 10)], vec![(60, 10)]));
+
+        assert_eq!(
+            b.apply_delta_unsequenced(&delta("X", 50, Side::Yes, 41, 5)),
+            ApplyOutcome::Ok
+        );
+        assert_eq!(b.last_seq(), Some(50));
+        assert_eq!(b.best_yes_bid(), Some((p(41), 5)));
     }
 
     #[test]
