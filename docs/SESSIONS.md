@@ -121,15 +121,33 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 ## Open work / next session priorities
 
 1. **Watch live trading for ≥24h.** Initial cutover surfaced one
-   bug (cid period-strip). Day-of-week + hour-of-day variance
-   means we want a full session of overnight + market hours.
-   Dashboard at <http://127.0.0.1:8080> — "engine positions" and
-   "recent exits" sections show what the strategies are doing.
-2. **Phase 4b (FIX)**: blocked on Kalshi institutional access.
+   bug (cid period-strip). Subsequent audit work (A/B/D/S1)
+   landed across 13 commits and is in the live binary as of
+   the most recent kickstart. Dashboard at <http://127.0.0.1:8080>
+   — engine positions, recent exits (now with bd/conv/inv/ts
+   tags), fill-latency telemetry per strategy.
+2. **Operator config tunables** now in env (per audit B1+B2+B3):
+   - `PREDIGY_STAT_*`, `PREDIGY_SETTLEMENT_*`, `PREDIGY_LATENCY_*`,
+     `PREDIGY_CROSS_ARB_*` — per-strategy knobs.
+   - `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS` — global cap.
+   - Defaults are conservative; raise after ≥1 week of clean
+     engine operation.
+3. **Phase 4b (FIX)**: blocked on Kalshi institutional access.
    Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action.
-3. **Audit follow-throughs** in `docs/AUDIT.md`: profit-take
-   improvements, scale-up paths, strategy arsenal expansion.
-4. **Phase 7 — retire legacy daemons** completely (delete
+4. **Audit deferred items** (`docs/AUDIT.md`):
+   - **S2 pre-settlement weather decay** — needs wx-stat curator
+     integration. Tractable next.
+   - **S4 order-book mean reversion** — tractable but overlaps
+     settlement's signal; needs careful ticker filter.
+   - **S5 semantic news latency** — needs Twitter/RSS feed +
+     Claude classifier infra.
+   - **S6 multi-venue cross-arb (Manifold)** — needs Manifold
+     WS integration.
+   - **S3 / S9 multi-leg arb** — coupled to I7 (atomic submit
+     infra). Build I7 first.
+   - **I7 atomic multi-leg submit** — defer until S3/S9 are
+     prioritized.
+5. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.

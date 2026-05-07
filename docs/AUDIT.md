@@ -4,6 +4,16 @@
 > profit-take, scale-up, and arsenal-expansion opportunities. Each
 > item is tagged with an estimated dev-cost (S / M / L) and an
 > operator-action requirement (A / —).
+>
+> **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A6,
+> B2, B3, I2, I3, I4, I5, I6, S1 all shipped (see commits 57a28fc
+> through 22e2578). A5 deferred with rationale below. B1, B7 are
+> operator-action items. B4 (FIX) + B5 (maker rebates) + S7 (MM)
+> + I1 (maker exec) gated on Kalshi access or $25K capital. I7
+> (atomic multi-leg) deferred — its only consumers (S3, S9) are
+> also deferred. S2, S4, S5, S6, S8, S9 remain — each needs new
+> infrastructure (curator integration, new feed, price-history
+> store) or coupled to deferred I7. Pick one when ready.
 
 ---
 
