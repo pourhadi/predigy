@@ -217,14 +217,14 @@ async fn apply_fill(pool: &PgPool, oms: &Arc<dyn Oms>, body: &FillBody) -> Resul
     // Read the originating intent's current cumulative_qty + qty
     // so we can decide PartialFill vs Filled and compute the new
     // absolute cumulative.
-    let intent_row: Option<(i32, i32)> =
-        sqlx::query_as("SELECT cumulative_qty, qty FROM intents WHERE client_id = $1")
+    let intent_row: Option<(i32, i32, String)> =
+        sqlx::query_as("SELECT cumulative_qty, qty, side FROM intents WHERE client_id = $1")
             .bind(&body.client_order_id)
             .fetch_optional(pool)
             .await
             .with_context(|| format!("read intent for cid {}", body.client_order_id))?;
 
-    let Some((cum_qty, target_qty)) = intent_row else {
+    let Some((cum_qty, target_qty, intent_side)) = intent_row else {
         // Fill arrived for an intent we don't know about. This
         // can happen during the migration (legacy stat-trader
         // submits the order; engine sees the fill via WS). Skip
@@ -240,7 +240,7 @@ async fn apply_fill(pool: &PgPool, oms: &Arc<dyn Oms>, body: &FillBody) -> Resul
     };
 
     let fill_qty = parse_count_fp(&body.count_fp)?;
-    let fill_price_cents = parse_price_dollars(&body.yes_price_dollars)?;
+    let fill_price_cents = fill_price_cents_for_intent_side(body, &intent_side)?;
     let fee_cents = match body.fee_cost.as_deref() {
         Some(s) => Some(parse_dollars_to_cents(s)?),
         None => None,
@@ -310,6 +310,31 @@ fn parse_price_dollars(s: &str) -> Result<i32> {
     i32::try_from(cents).map_err(|_| anyhow::anyhow!("price out of i32 range: {s}"))
 }
 
+fn fill_price_cents_for_intent_side(body: &FillBody, intent_side: &str) -> Result<i32> {
+    match intent_side {
+        "yes" => parse_price_dollars(&body.yes_price_dollars),
+        "no" => {
+            let yes_price_cents = parse_price_dollars(&body.yes_price_dollars)?;
+            match body.no_price_dollars.as_deref().filter(|s| !s.is_empty()) {
+                Some(no_price_dollars) => {
+                    let no_price_cents = parse_price_dollars(no_price_dollars)?;
+                    if yes_price_cents + no_price_cents != 100 {
+                        return Err(anyhow::anyhow!(
+                            "inconsistent WS fill prices for {}: yes={} no={}",
+                            body.trade_id,
+                            yes_price_cents,
+                            no_price_cents
+                        ));
+                    }
+                    Ok(no_price_cents)
+                }
+                None => Ok(100 - yes_price_cents),
+            }
+        }
+        other => Err(anyhow::anyhow!("unknown intent side for WS fill: {other}")),
+    }
+}
+
 /// Fee as decimal-dollar string → integer cents. Kalshi fees are
 /// always non-negative; signed math handled by the OMS.
 fn parse_dollars_to_cents(s: &str) -> Result<i32> {
@@ -341,6 +366,44 @@ mod tests {
     fn parse_price_dollars_rejects_out_of_range() {
         assert!(parse_price_dollars("1.50").is_err());
         assert!(parse_price_dollars("-0.10").is_err());
+    }
+
+    fn fill_body(yes_price_dollars: &str, no_price_dollars: Option<&str>) -> FillBody {
+        FillBody {
+            trade_id: "trade-test".into(),
+            order_id: "order-test".into(),
+            client_order_id: "cid-test".into(),
+            market_ticker: "KX-TEST".into(),
+            side: "yes".into(),
+            purchased_side: "no".into(),
+            action: "".into(),
+            yes_price_dollars: yes_price_dollars.into(),
+            no_price_dollars: no_price_dollars.map(str::to_string),
+            count_fp: "1.00".into(),
+            fee_cost: None,
+            is_taker: true,
+            post_position_fp: None,
+            ts: None,
+            ts_ms: None,
+        }
+    }
+
+    #[test]
+    fn no_side_ws_fill_uses_no_price_when_present() {
+        let body = fill_body("0.84", Some("0.16"));
+        assert_eq!(fill_price_cents_for_intent_side(&body, "no").unwrap(), 16);
+    }
+
+    #[test]
+    fn no_side_ws_fill_complements_yes_price_when_no_price_absent() {
+        let body = fill_body("0.84", None);
+        assert_eq!(fill_price_cents_for_intent_side(&body, "no").unwrap(), 16);
+    }
+
+    #[test]
+    fn no_side_ws_fill_rejects_inconsistent_prices() {
+        let body = fill_body("0.84", Some("0.13"));
+        assert!(fill_price_cents_for_intent_side(&body, "no").is_err());
     }
 
     #[test]

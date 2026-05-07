@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 
 type DailyPnlMarkRow = (
     i32,
+    String,
     i32,
     i64,
     i64,
@@ -970,6 +971,7 @@ async fn daily_pnl_with_marks(
 ) -> EngineResult<DailyPnlSnapshot> {
     let rows: Vec<DailyPnlMarkRow> = sqlx::query_as(
         "SELECT p.current_qty,
+                p.side,
                 p.avg_entry_cents,
                 p.realized_pnl_cents,
                 p.fees_paid_cents,
@@ -988,7 +990,7 @@ async fn daily_pnl_with_marks(
     let mut pnl = 0_i64;
     let mut missing_recent_mark = false;
     let now = chrono::Utc::now();
-    for (qty, avg_entry, realized, fees, bid, ask, mark_ts) in rows {
+    for (qty, side, avg_entry, realized, fees, bid, ask, mark_ts) in rows {
         pnl += realized - fees;
         if qty == 0 {
             continue;
@@ -998,7 +1000,7 @@ async fn daily_pnl_with_marks(
             missing_recent_mark = true;
             continue;
         }
-        let mark = if qty > 0 { bid } else { ask };
+        let mark = domain_mark_cents(&side, qty, bid, ask);
         if let Some(mark_cents) = mark {
             pnl +=
                 i64::from(mark_cents - avg_entry) * i64::from(qty.signum()) * i64::from(qty.abs());
@@ -1010,6 +1012,38 @@ async fn daily_pnl_with_marks(
         pnl_cents: pnl,
         missing_recent_mark,
     })
+}
+
+fn domain_mark_cents(
+    side: &str,
+    qty: i32,
+    best_yes_bid_cents: Option<i32>,
+    best_yes_ask_cents: Option<i32>,
+) -> Option<i32> {
+    match (side, qty.signum()) {
+        ("yes", 1) => best_yes_bid_cents,
+        ("yes", -1) => best_yes_ask_cents,
+        ("no", 1) => best_yes_ask_cents.map(|ask| 100 - ask),
+        ("no", -1) => best_yes_bid_cents.map(|bid| 100 - bid),
+        _ => None,
+    }
+}
+
+fn rest_fill_price_cents_for_intent_side(
+    fill: &FillRecord,
+    intent_side: &str,
+) -> EngineResult<i32> {
+    let price = match intent_side {
+        "yes" => dollars_str_to_cents(&fill.yes_price_dollars),
+        "no" => dollars_str_to_cents(&fill.no_price_dollars),
+        other => {
+            return Err(EngineError::Oms(format!(
+                "unknown intent side for REST fill {}: {other}",
+                fill.fill_id
+            )));
+        }
+    };
+    price.ok_or_else(|| EngineError::Oms(format!("invalid fill price for {}", fill.fill_id)))
 }
 
 async fn reconcile_order_status(
@@ -1132,12 +1166,7 @@ async fn apply_rest_fill(
             fill.count_fp, fill.fill_id
         ))
     })?;
-    let price = if intent_side == "no" {
-        dollars_str_to_cents(&fill.no_price_dollars)
-    } else {
-        dollars_str_to_cents(&fill.yes_price_dollars)
-    }
-    .ok_or_else(|| EngineError::Oms(format!("invalid fill price for {}", fill.fill_id)))?;
+    let price = rest_fill_price_cents_for_intent_side(fill, intent_side)?;
     let fee = fill
         .fee_cost
         .as_deref()
@@ -1486,5 +1515,68 @@ fn execution_status_str(s: ExecutionStatus) -> &'static str {
         ExecutionStatus::Cancelled => "cancelled",
         ExecutionStatus::Rejected => "rejected",
         ExecutionStatus::Expired => "expired",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{domain_mark_cents, rest_fill_price_cents_for_intent_side};
+    use predigy_kalshi_rest::types::FillRecord;
+
+    #[test]
+    fn domain_mark_uses_yes_book_for_yes_positions() {
+        assert_eq!(domain_mark_cents("yes", 3, Some(42), Some(44)), Some(42));
+        assert_eq!(domain_mark_cents("yes", -3, Some(42), Some(44)), Some(44));
+    }
+
+    #[test]
+    fn domain_mark_complements_yes_book_for_no_positions() {
+        assert_eq!(domain_mark_cents("no", 3, Some(84), Some(87)), Some(13));
+        assert_eq!(domain_mark_cents("no", -3, Some(84), Some(87)), Some(16));
+    }
+
+    #[test]
+    fn domain_mark_requires_relevant_book_side() {
+        assert_eq!(domain_mark_cents("no", 3, Some(84), None), None);
+        assert_eq!(domain_mark_cents("no", -3, None, Some(87)), None);
+        assert_eq!(domain_mark_cents("yes", 0, Some(42), Some(44)), None);
+    }
+
+    fn fill_record() -> FillRecord {
+        FillRecord {
+            fill_id: "fill-test".into(),
+            trade_id: Some("trade-test".into()),
+            order_id: "order-test".into(),
+            market_ticker: Some("KX-TEST".into()),
+            ticker: None,
+            side: "yes".into(),
+            action: "".into(),
+            count_fp: "1.00".into(),
+            yes_price_dollars: "0.84".into(),
+            no_price_dollars: "0.16".into(),
+            is_taker: Some(true),
+            fee_cost: None,
+            ts: None,
+            ts_ms: None,
+        }
+    }
+
+    #[test]
+    fn rest_fill_price_uses_intent_side_domain() {
+        let fill = fill_record();
+        assert_eq!(
+            rest_fill_price_cents_for_intent_side(&fill, "yes").unwrap(),
+            84
+        );
+        assert_eq!(
+            rest_fill_price_cents_for_intent_side(&fill, "no").unwrap(),
+            16
+        );
+    }
+
+    #[test]
+    fn rest_fill_price_rejects_unknown_side() {
+        let fill = fill_record();
+        assert!(rest_fill_price_cents_for_intent_side(&fill, "maybe").is_err());
     }
 }

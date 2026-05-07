@@ -16,7 +16,7 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-07, post-safety hardening)
+## What is running RIGHT NOW (2026-05-07, post-audit hardening)
 
 ```
 launchctl list | grep predigy
@@ -115,6 +115,9 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
   at 1¢ (any standing bid takes us). Latency has no book
   subscription so mark-aware exits aren't possible.
 - Requires `PREDIGY_NWS_USER_AGENT` in env or NWS feed won't spawn.
+- 2026-05-07 audit note: DB kill switch is armed for `latency` after a stale
+  NWS alert re-fired following restarts. Keep halted until event freshness and
+  restart-persistent de-dupe are fixed.
 
 ### `cross-arb` (Kalshi vs Polymarket convergence)
 
@@ -143,18 +146,24 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    `implication-arb`, `internal-arb`, and measured `settlement`.
    Shadow or tightly gate `book-imbalance`, `variance-fade`, `latency`,
    and `news-trader` until empirical edge exists.
-5. **Keep weather kill switches armed until deliberate resume.** The
+5. **Book-imbalance remains halted.** The 2026-05-07 live audit found it buying
+   both YES and NO on `KXVOTEHUBTRUMPUPDOWN-26MAY07`, plus insufficient-balance
+   rejects. NO-side WS fills and NO-side mark accounting were fixed in the
+   engine after the audit, but existing book-imbalance behavior still needs a
+   strategy-level same-market churn fix before disarming its DB kill switch.
+6. **Weather stat/wx-stat are intentionally resumed, but keep watching.** The
    wx-stat rule file was regenerated through the observed-extreme gate and
    corrected NBM aggregation. `predigy-import` no longer imports
    `wx-stat-rules.json` as `stat`, and the latest DB refresh disabled all
    legacy enabled rows from that source; `KXHIGHTSFO-26MAY07-T62` is disabled.
    `KXHIGHTPHX-26MAY08-T98` was corrected from YES 0.98 to NO 0.066, and the
-   bad 14-contract YES exposure was sold at 3c. Do not disarm `stat`/`wx-stat`
-   until the operator intentionally resumes weather entries.
-6. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
+   bad 14-contract YES exposure was sold at 3c.
+7. **Latency remains halted.** Fix stale NWS alert replay/freshness before
+   disarming its DB kill switch.
+8. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
    Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
    do not prioritize FIX above the safety blockers.
-7. **Phase 7 — retire legacy daemons** completely (delete
+9. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.
