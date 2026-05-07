@@ -93,14 +93,8 @@ impl EngineConfig {
                 Err(_) => None,
             },
             default_risk_caps: caps_from_env(),
-            log_dir: env_path(
-                "PREDIGY_LOG_DIR",
-                dirs_log_default(),
-            ),
-            kill_switch_file: env_path(
-                "PREDIGY_KILL_SWITCH_FILE",
-                dirs_kill_switch_default(),
-            ),
+            log_dir: env_path("PREDIGY_LOG_DIR", dirs_log_default()),
+            kill_switch_file: env_path("PREDIGY_KILL_SWITCH_FILE", dirs_kill_switch_default()),
             http_bind: std::env::var("PREDIGY_HTTP_BIND")
                 .unwrap_or_else(|_| "127.0.0.1:8080".into()),
             reconcile_interval: env_duration(
@@ -111,10 +105,7 @@ impl EngineConfig {
                 "PREDIGY_TICK_INTERVAL_SECS",
                 Duration::from_secs(15),
             ),
-            shutdown_grace: env_duration(
-                "PREDIGY_SHUTDOWN_GRACE_SECS",
-                Duration::from_secs(10),
-            ),
+            shutdown_grace: env_duration("PREDIGY_SHUTDOWN_GRACE_SECS", Duration::from_secs(10)),
         })
     }
 }
@@ -149,9 +140,7 @@ fn env_engine_mode(name: &str, default: EngineMode) -> EngineMode {
         Some("live" | "Live" | "LIVE") => EngineMode::Live,
         Some("shadow" | "Shadow" | "SHADOW") => EngineMode::Shadow,
         Some(other) => {
-            eprintln!(
-                "{name}={other:?} not recognized; using default {default:?}"
-            );
+            eprintln!("{name}={other:?} not recognized; using default {default:?}");
             default
         }
         None => default,
@@ -176,22 +165,34 @@ fn dirs_kill_switch_default() -> PathBuf {
 
 fn caps_from_env() -> RiskCaps {
     let mut caps = RiskCaps::shake_down();
-    if let Ok(v) = std::env::var("PREDIGY_MAX_NOTIONAL_CENTS").and_then(|s| s.parse::<i64>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(v) = std::env::var("PREDIGY_MAX_NOTIONAL_CENTS")
+        .and_then(|s| s.parse::<i64>().map_err(|_| std::env::VarError::NotPresent))
+    {
         caps.max_notional_cents = v;
     }
-    if let Ok(v) = std::env::var("PREDIGY_MAX_DAILY_LOSS_CENTS").and_then(|s| s.parse::<i64>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(v) = std::env::var("PREDIGY_MAX_DAILY_LOSS_CENTS")
+        .and_then(|s| s.parse::<i64>().map_err(|_| std::env::VarError::NotPresent))
+    {
         caps.max_daily_loss_cents = v;
     }
-    if let Ok(v) = std::env::var("PREDIGY_MAX_CONTRACTS_PER_SIDE").and_then(|s| s.parse::<i32>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(v) = std::env::var("PREDIGY_MAX_CONTRACTS_PER_SIDE")
+        .and_then(|s| s.parse::<i32>().map_err(|_| std::env::VarError::NotPresent))
+    {
         caps.max_contracts_per_side = v;
     }
-    if let Ok(v) = std::env::var("PREDIGY_MAX_IN_FLIGHT").and_then(|s| s.parse::<i32>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(v) = std::env::var("PREDIGY_MAX_IN_FLIGHT")
+        .and_then(|s| s.parse::<i32>().map_err(|_| std::env::VarError::NotPresent))
+    {
         caps.max_in_flight = v;
     }
-    if let Ok(v) = std::env::var("PREDIGY_MAX_ORDERS_PER_WINDOW").and_then(|s| s.parse::<u32>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(v) = std::env::var("PREDIGY_MAX_ORDERS_PER_WINDOW")
+        .and_then(|s| s.parse::<u32>().map_err(|_| std::env::VarError::NotPresent))
+    {
         caps.max_orders_per_window = v;
     }
-    if let Ok(v) = std::env::var("PREDIGY_RATE_WINDOW_MS").and_then(|s| s.parse::<u64>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(v) = std::env::var("PREDIGY_RATE_WINDOW_MS")
+        .and_then(|s| s.parse::<u64>().map_err(|_| std::env::VarError::NotPresent))
+    {
         caps.rate_window_ms = v;
     }
     caps
@@ -224,7 +225,9 @@ mod tests {
 
     #[test]
     fn env_duration_parses_seconds() {
-        unsafe { std::env::set_var("PRED_TEST_DUR", "30"); }
+        unsafe {
+            std::env::set_var("PRED_TEST_DUR", "30");
+        }
         assert_eq!(
             env_duration("PRED_TEST_DUR", Duration::from_secs(0)),
             Duration::from_secs(30)
@@ -233,7 +236,9 @@ mod tests {
             env_duration("PRED_TEST_DUR_MISSING", Duration::from_secs(7)),
             Duration::from_secs(7)
         );
-        unsafe { std::env::remove_var("PRED_TEST_DUR"); }
+        unsafe {
+            std::env::remove_var("PRED_TEST_DUR");
+        }
     }
 
     #[test]

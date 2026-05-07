@@ -48,8 +48,8 @@
 use async_trait::async_trait;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
-use predigy_engine_core::events::{Event, ExternalEvent};
 use predigy_engine_core::events::predigy_core_compat::NwsAlertPayload;
+use predigy_engine_core::events::{Event, ExternalEvent};
 use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
@@ -361,8 +361,13 @@ mod tests {
         let mut s = LatencyStrategy::new(vec![r]);
         // Alert is in TX, rule requires OK.
         assert!(
-            s.evaluate(&alert_in("Tornado Warning", "Travis, TX", "Severe", &["TX"]))
-                .is_none()
+            s.evaluate(&alert_in(
+                "Tornado Warning",
+                "Travis, TX",
+                "Severe",
+                &["TX"]
+            ))
+            .is_none()
         );
     }
 
@@ -372,8 +377,13 @@ mod tests {
         r.required_states = vec!["OK".into(), "TX".into()];
         let mut s = LatencyStrategy::new(vec![r]);
         assert!(
-            s.evaluate(&alert_in("Tornado Warning", "Travis, TX", "Severe", &["TX"]))
-                .is_some()
+            s.evaluate(&alert_in(
+                "Tornado Warning",
+                "Travis, TX",
+                "Severe",
+                &["TX"]
+            ))
+            .is_some()
         );
     }
 

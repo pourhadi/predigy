@@ -134,7 +134,10 @@ async fn run(
         //    book updates start flowing before the strategy sees
         //    the PairUpdate.
         if !added.is_empty() {
-            let tickers: Vec<String> = added.iter().map(|p| p.kalshi_ticker.as_str().to_string()).collect();
+            let tickers: Vec<String> = added
+                .iter()
+                .map(|p| p.kalshi_ticker.as_str().to_string())
+                .collect();
             let cmd = RouterCommand::AddTickers {
                 strategy: config.strategy,
                 markets: tickers,
@@ -188,7 +191,10 @@ async fn run(
 
         // Update bookkeeping.
         for p in &added {
-            current.insert(p.kalshi_ticker.as_str().to_string(), p.poly_asset_id.clone());
+            current.insert(
+                p.kalshi_ticker.as_str().to_string(),
+                p.poly_asset_id.clone(),
+            );
         }
         for t in &removed {
             current.remove(t.as_str());

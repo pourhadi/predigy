@@ -20,14 +20,16 @@ use predigy_book::{ApplyOutcome, OrderBook};
 use predigy_core::market::MarketTicker;
 use predigy_engine_core::events::Event;
 use predigy_engine_core::strategy::StrategyId;
-use predigy_kalshi_md::{Channel, Client as MdClient, Connection as MdConnection, Event as MdEvent};
+use predigy_kalshi_md::{
+    Channel, Client as MdClient, Connection as MdConnection, Event as MdEvent,
+};
 use predigy_kalshi_rest::Client as RestClient;
 use predigy_kalshi_rest::Signer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Output channel each strategy supervisor exposes for its
@@ -50,10 +52,7 @@ impl Subscriptions {
     }
 
     fn senders_for(&self, ticker: &str) -> Vec<(StrategyId, StrategyEventTx)> {
-        self.by_ticker
-            .get(ticker)
-            .cloned()
-            .unwrap_or_default()
+        self.by_ticker.get(ticker).cloned().unwrap_or_default()
     }
 
     fn unique_tickers(&self) -> Vec<String> {
@@ -162,11 +161,7 @@ impl MarketDataRouter {
         };
 
         let task = tokio::spawn(router_task(connection, router_state, cmd_rx));
-        Ok(Self {
-            subs,
-            cmd_tx,
-            task,
-        })
+        Ok(Self { subs, cmd_tx, task })
     }
 
     /// Cloneable handle for issuing dynamic-subscription commands
@@ -229,10 +224,7 @@ async fn router_task(
         }
         // Subscribe to orderbook deltas + ticker.
         match connection
-            .subscribe(
-                &[Channel::OrderbookDelta, Channel::Ticker],
-                &tickers,
-            )
+            .subscribe(&[Channel::OrderbookDelta, Channel::Ticker], &tickers)
             .await
         {
             Ok(req_id) => {
@@ -390,8 +382,7 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
                 ApplyOutcome::Gap { expected, got } => {
                     warn!(
                         market,
-                        expected, got,
-                        "router: sequence gap; resnapshot via REST"
+                        expected, got, "router: sequence gap; resnapshot via REST"
                     );
                     if let Err(e) = resnapshot_book(state, &market).await {
                         warn!(market, error = %e, "router: resnapshot failed");
@@ -417,10 +408,17 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
             warn!(?req_id, code, msg, "router: kalshi-md server error");
         }
         MdEvent::Malformed { raw, error } => {
-            warn!(error, raw_excerpt = &raw.chars().take(100).collect::<String>().as_str(), "router: malformed frame");
+            warn!(
+                error,
+                raw_excerpt = &raw.chars().take(100).collect::<String>().as_str(),
+                "router: malformed frame"
+            );
         }
         MdEvent::UnhandledType { raw } => {
-            debug!(raw_excerpt = &raw.chars().take(100).collect::<String>().as_str(), "router: unhandled message type");
+            debug!(
+                raw_excerpt = &raw.chars().take(100).collect::<String>().as_str(),
+                "router: unhandled message type"
+            );
         }
         MdEvent::Fill { .. } | MdEvent::MarketPosition { .. } => {
             // Authed channels — strategies don't consume directly;
@@ -430,11 +428,7 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
     Ok(())
 }
 
-async fn fan_out(
-    subs: &Arc<RwLock<Subscriptions>>,
-    market: &str,
-    book: &OrderBook,
-) {
+async fn fan_out(subs: &Arc<RwLock<Subscriptions>>, market: &str, book: &OrderBook) {
     let senders = {
         let s = subs.read().await;
         s.senders_for(market)

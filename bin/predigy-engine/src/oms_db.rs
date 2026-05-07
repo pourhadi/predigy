@@ -111,10 +111,7 @@ impl DbBackedOms {
     /// per-side and notional caps. Returns the relevant numbers
     /// without locking — the actual write transaction will
     /// re-verify.
-    async fn current_exposure(
-        &self,
-        intent: &Intent,
-    ) -> EngineResult<ExposureSnapshot> {
+    async fn current_exposure(&self, intent: &Intent) -> EngineResult<ExposureSnapshot> {
         let strategy = intent.strategy;
         let ticker = intent.market.as_str();
         let side = side_to_str(&intent);
@@ -231,12 +228,11 @@ impl Oms for DbBackedOms {
         }
 
         // Idempotency check — does this client_id already exist?
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM intents WHERE client_id = $1",
-        )
-        .bind(&intent.client_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM intents WHERE client_id = $1")
+                .bind(&intent.client_id)
+                .fetch_optional(&self.pool)
+                .await?;
         if let Some((status,)) = existing {
             debug!(client_id = %intent.client_id, %status, "oms: idempotent re-submit");
             return Ok(SubmitOutcome::Idempotent {
@@ -365,17 +361,19 @@ impl Oms for DbBackedOms {
         // `fills.venue_fill_id` UNIQUE index would catch it at
         // insert time, but doing the check first means we don't
         // run the (more expensive) position upsert for nothing.
-        if matches!(ev.status, ExecutionStatus::Filled | ExecutionStatus::PartialFill) {
+        if matches!(
+            ev.status,
+            ExecutionStatus::Filled | ExecutionStatus::PartialFill
+        ) {
             if let (Some(qty), Some(price)) = (ev.last_fill_qty, ev.last_fill_price_cents) {
                 let fee = ev.last_fill_fee_cents.unwrap_or(0);
 
                 if let Some(fid) = ev.venue_fill_id.as_deref() {
-                    let already: Option<(i64,)> = sqlx::query_as(
-                        "SELECT id FROM fills WHERE venue_fill_id = $1",
-                    )
-                    .bind(fid)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+                    let already: Option<(i64,)> =
+                        sqlx::query_as("SELECT id FROM fills WHERE venue_fill_id = $1")
+                            .bind(fid)
+                            .fetch_optional(&mut *tx)
+                            .await?;
                     if already.is_some() {
                         debug!(
                             client_id = %ev.client_id,
@@ -423,7 +421,8 @@ impl Oms for DbBackedOms {
 
                 // Position lifecycle: insert if new, update qty
                 // and avg if existing. Closing leg sets closed_at.
-                upsert_position(&mut tx, &strategy, &ticker, &side, &action, qty, price, fee).await?;
+                upsert_position(&mut tx, &strategy, &ticker, &side, &action, qty, price, fee)
+                    .await?;
             }
         }
 
@@ -493,9 +492,8 @@ async fn upsert_position(
             // Combined: pnl = (close_price - entry) * cur_qty.signum() * abs(closed).
             // The sign comes from the SIDE WE WERE ON (cur_qty),
             // not the closing-fill direction (signed_qty).
-            let realised = (fill_price_cents - cur_avg) as i64
-                * cur_qty.signum() as i64
-                * i64::from(fill_qty);
+            let realised =
+                (fill_price_cents - cur_avg) as i64 * cur_qty.signum() as i64 * i64::from(fill_qty);
             sqlx::query(
                 "UPDATE positions
                     SET current_qty = 0,

@@ -22,12 +22,10 @@
 //! ext-feeds (preserves the layered crate graph).
 
 use anyhow::{Context as _, Result};
-use predigy_engine_core::events::{Event, ExternalEvent};
 use predigy_engine_core::events::predigy_core_compat::NwsAlertPayload;
+use predigy_engine_core::events::{Event, ExternalEvent};
 use predigy_engine_core::strategy::StrategyId;
-use predigy_ext_feeds::{
-    spawn_nws, NwsAlert, NwsAlertsConfig, MIN_POLL_INTERVAL,
-};
+use predigy_ext_feeds::{MIN_POLL_INTERVAL, NwsAlert, NwsAlertsConfig, spawn_nws};
 use predigy_poly_md::{Client as PolyClient, Event as PolyEvent};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -114,7 +112,9 @@ impl ExternalFeeds {
 
         if let Some(cfg) = nws {
             if let Some(consumers) = subscribers.get("nws_alerts") {
-                if !consumers.is_empty() {
+                if consumers.is_empty() {
+                    info!("external_feeds: NWS configured but no subscribers; skipping");
+                } else {
                     let consumers = consumers.clone();
                     let cfg = NwsAlertsConfig {
                         states: cfg.states.clone(),
@@ -123,31 +123,23 @@ impl ExternalFeeds {
                         base_url: None,
                         seen_path: cfg.seen_path.clone(),
                     };
-                    let (rx, _feed_handle) = spawn_nws(cfg)
-                        .map_err(|e| anyhow::anyhow!("spawn_nws: {e}"))?;
+                    let (rx, _feed_handle) =
+                        spawn_nws(cfg).map_err(|e| anyhow::anyhow!("spawn_nws: {e}"))?;
                     let consumers_arc = Arc::new(consumers);
-                    let handle =
-                        tokio::spawn(nws_dispatcher_task(rx, consumers_arc));
+                    let handle = tokio::spawn(nws_dispatcher_task(rx, consumers_arc));
                     tasks.push(handle);
                     info!("external_feeds: NWS dispatcher started");
-                } else {
-                    info!("external_feeds: NWS configured but no subscribers; skipping");
                 }
             }
         }
 
         if let Some(consumers) = subscribers.get("polymarket") {
             if !consumers.is_empty() {
-                let client = PolyClient::new()
-                    .map_err(|e| anyhow::anyhow!("poly client: {e}"))?;
+                let client = PolyClient::new().map_err(|e| anyhow::anyhow!("poly client: {e}"))?;
                 let connection = client.connect();
                 let (cmd_tx, cmd_rx) = mpsc::channel::<PolyFeedCommand>(64);
                 let consumers_arc = Arc::new(consumers.clone());
-                let handle = tokio::spawn(poly_dispatcher_task(
-                    connection,
-                    cmd_rx,
-                    consumers_arc,
-                ));
+                let handle = tokio::spawn(poly_dispatcher_task(connection, cmd_rx, consumers_arc));
                 tasks.push(handle);
                 poly_tx = Some(cmd_tx);
                 info!("external_feeds: Polymarket dispatcher started");
@@ -255,10 +247,7 @@ async fn poly_dispatcher_task(
     }
 }
 
-async fn handle_poly_event(
-    ev: PolyEvent,
-    consumers: &Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>,
-) {
+async fn handle_poly_event(ev: PolyEvent, consumers: &Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>) {
     let payload = match ev {
         PolyEvent::Book(b) => {
             // Derive best bid/best ask from the L2 levels. Polymarket
@@ -269,16 +258,12 @@ async fn handle_poly_event(
                 .bids
                 .iter()
                 .filter_map(|l| l.price.parse::<f64>().ok())
-                .fold(None, |acc, p| {
-                    Some(acc.map_or(p, |a: f64| a.max(p)))
-                });
+                .fold(None, |acc, p| Some(acc.map_or(p, |a: f64| a.max(p))));
             let best_ask = b
                 .asks
                 .iter()
                 .filter_map(|l| l.price.parse::<f64>().ok())
-                .fold(None, |acc, p| {
-                    Some(acc.map_or(p, |a: f64| a.min(p)))
-                });
+                .fold(None, |acc, p| Some(acc.map_or(p, |a: f64| a.min(p))));
             ExternalEvent::PolymarketBook {
                 asset_id: b.asset_id,
                 best_bid,
@@ -409,9 +394,9 @@ pub fn build_subscriber_map(
 /// Tiny helper used by main.rs to translate a load error into the
 /// engine's `Result` type.
 pub fn require_nws_or_log(cfg: Option<NwsConfig>) -> Result<NwsConfig> {
-    cfg.with_context(|| {
-        "PREDIGY_NWS_USER_AGENT not set; NWS-dependent strategies (latency) won't fire"
-    })
+    cfg.with_context(
+        || "PREDIGY_NWS_USER_AGENT not set; NWS-dependent strategies (latency) won't fire",
+    )
 }
 
 #[cfg(test)]

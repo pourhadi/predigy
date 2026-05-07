@@ -6,8 +6,8 @@
 //! That keeps SQL out of strategy code and keeps the SQL we DO
 //! write checkable at compile time.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 
 /// Wrapper around the Postgres pool. Cheap to clone.

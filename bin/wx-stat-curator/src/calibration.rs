@@ -114,9 +114,8 @@ impl Calibration {
     pub fn load(path: &Path) -> Result<Option<Self>, std::io::Error> {
         match std::fs::read(path) {
             Ok(bytes) => {
-                let cal: Calibration = serde_json::from_slice(&bytes).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
+                let cal: Calibration = serde_json::from_slice(&bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 Ok(Some(cal))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -140,10 +139,8 @@ impl Calibration {
 
     /// Insert a fitted bucket.
     pub fn set(&mut self, key: BucketKey, coeffs: PlattCoeffs, n_samples: u32) {
-        self.buckets.insert(
-            key.to_serial(),
-            BucketEntry { coeffs, n_samples },
-        );
+        self.buckets
+            .insert(key.to_serial(), BucketEntry { coeffs, n_samples });
     }
 
     /// Lookup coefficients. Falls back to the identity if no
@@ -163,9 +160,9 @@ impl Calibration {
     /// Iterate fitted buckets. Useful for the operator-facing
     /// summary table.
     pub fn iter(&self) -> impl Iterator<Item = (BucketKey, BucketEntry)> + '_ {
-        self.buckets.iter().filter_map(|(k, v)| {
-            BucketKey::from_serial(k).map(|key| (key, *v))
-        })
+        self.buckets
+            .iter()
+            .filter_map(|(k, v)| BucketKey::from_serial(k).map(|key| (key, *v)))
     }
 }
 
@@ -241,9 +238,9 @@ pub fn fit_platt(samples: &[(f64, f64)]) -> Option<PlattCoeffs> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
-    use rand::Rng;
 
     #[test]
     fn identity_round_trip() {
@@ -338,7 +335,10 @@ mod tests {
             loaded.lookup(&BucketKey::new("LAX", 7)),
             PlattCoeffs { a: 0.31, b: 0.89 }
         );
-        assert_eq!(loaded.fitted_at_iso.as_deref(), Some("2026-05-07T03:00:00Z"));
+        assert_eq!(
+            loaded.fitted_at_iso.as_deref(),
+            Some("2026-05-07T03:00:00Z")
+        );
     }
 
     #[test]
@@ -397,7 +397,11 @@ mod tests {
             let raw_p = sigmoid(logit_raw);
             let logit_true = true_a + true_b * logit_raw;
             let true_p = sigmoid(logit_true);
-            let outcome: f64 = if rng.r#gen::<f64>() < true_p { 1.0 } else { 0.0 };
+            let outcome: f64 = if rng.r#gen::<f64>() < true_p {
+                1.0
+            } else {
+                0.0
+            };
             samples.push((raw_p, outcome));
         }
         let fit = fit_platt(&samples).unwrap();
@@ -415,7 +419,9 @@ mod tests {
 
     #[test]
     fn fit_platt_returns_none_for_too_small_sample() {
-        let samples: Vec<(f64, f64)> = (0..5).map(|i| (0.5, if i % 2 == 0 { 1.0 } else { 0.0 })).collect();
+        let samples: Vec<(f64, f64)> = (0..5)
+            .map(|i| (0.5, if i % 2 == 0 { 1.0 } else { 0.0 }))
+            .collect();
         assert!(fit_platt(&samples).is_none());
     }
 

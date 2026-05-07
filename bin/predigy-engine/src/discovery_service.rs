@@ -34,8 +34,8 @@ use anyhow::{Context as _, Result};
 use predigy_engine_core::discovery::{DiscoveredMarket, DiscoverySubscription};
 use predigy_engine_core::events::Event;
 use predigy_engine_core::strategy::StrategyId;
-use predigy_kalshi_rest::types::MarketSummary;
 use predigy_kalshi_rest::Client as RestClient;
+use predigy_kalshi_rest::types::MarketSummary;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -147,8 +147,7 @@ impl DiscoveryWorker {
             //    book updates start flowing before the strategy
             //    sees the DiscoveryDelta.
             if !added.is_empty() {
-                let new_tickers: Vec<String> =
-                    added.iter().map(|m| m.ticker.clone()).collect();
+                let new_tickers: Vec<String> = added.iter().map(|m| m.ticker.clone()).collect();
                 let cmd = RouterCommand::AddTickers {
                     strategy: self.strategy,
                     markets: new_tickers,

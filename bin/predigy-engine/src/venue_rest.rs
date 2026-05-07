@@ -75,8 +75,7 @@ impl VenueRest {
             RestClient::with_base(base, Some(signer))
                 .map_err(|e| anyhow::anyhow!("venue_rest client: {e}"))?
         } else {
-            RestClient::authed(signer)
-                .map_err(|e| anyhow::anyhow!("venue_rest client: {e}"))?
+            RestClient::authed(signer).map_err(|e| anyhow::anyhow!("venue_rest client: {e}"))?
         };
         let rest = Arc::new(rest);
         let task = tokio::spawn(submitter_task(pool, rest, config.poll_interval));
@@ -134,11 +133,7 @@ async fn drain_submits(pool: &PgPool, rest: &Arc<RestClient>) -> Result<()> {
     Ok(())
 }
 
-async fn submit_one(
-    pool: &PgPool,
-    rest: &Arc<RestClient>,
-    row: &SubmittedIntent,
-) -> Result<()> {
+async fn submit_one(pool: &PgPool, rest: &Arc<RestClient>, row: &SubmittedIntent) -> Result<()> {
     let req = build_create_request(row)?;
     let attempt_payload = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
 
@@ -264,11 +259,7 @@ async fn cancel_one(
         Ok(resp) => {
             let payload = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
             mark_cancelled(pool, client_id, payload).await?;
-            info!(
-                client_id,
-                venue_order_id,
-                "venue_rest: order cancelled"
-            );
+            info!(client_id, venue_order_id, "venue_rest: order cancelled");
             Ok(())
         }
         Err(RestError::Api { status, body }) => {
@@ -285,16 +276,13 @@ async fn cancel_one(
                 mark_cancelled(pool, client_id, payload).await?;
                 debug!(
                     client_id,
-                    venue_order_id,
-                    "venue_rest: cancel got 404; marking cancelled"
+                    venue_order_id, "venue_rest: cancel got 404; marking cancelled"
                 );
                 Ok(())
             } else if status >= 500 || status == 429 {
                 debug!(
                     client_id,
-                    venue_order_id,
-                    status,
-                    "venue_rest: transient cancel error; will retry"
+                    venue_order_id, status, "venue_rest: transient cancel error; will retry"
                 );
                 Ok(())
             } else {
@@ -447,11 +435,7 @@ async fn mark_acked(
     Ok(())
 }
 
-async fn mark_rejected(
-    pool: &PgPool,
-    client_id: &str,
-    payload: serde_json::Value,
-) -> Result<()> {
+async fn mark_rejected(pool: &PgPool, client_id: &str, payload: serde_json::Value) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE intents
@@ -475,11 +459,7 @@ async fn mark_rejected(
     Ok(())
 }
 
-async fn mark_cancelled(
-    pool: &PgPool,
-    client_id: &str,
-    payload: serde_json::Value,
-) -> Result<()> {
+async fn mark_cancelled(pool: &PgPool, client_id: &str, payload: serde_json::Value) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "UPDATE intents
@@ -540,7 +520,10 @@ mod tests {
         assert_eq!(req.action, OrderAction::Buy);
         assert_eq!(req.price, "0.4200");
         assert_eq!(req.count, "2.00");
-        assert!(matches!(req.time_in_force, TimeInForceV2::ImmediateOrCancel));
+        assert!(matches!(
+            req.time_in_force,
+            TimeInForceV2::ImmediateOrCancel
+        ));
     }
 
     #[test]

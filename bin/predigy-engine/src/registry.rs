@@ -13,8 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-type StrategyFactory =
-    Box<dyn Fn() -> Box<dyn Strategy> + Send + Sync + 'static>;
+type StrategyFactory = Box<dyn Fn() -> Box<dyn Strategy> + Send + Sync + 'static>;
 
 pub struct StrategyHandle {
     pub id: StrategyId,
@@ -92,8 +91,6 @@ impl StrategyRegistry {
 
     pub async fn instantiate_all(&self) -> Vec<(StrategyId, Box<dyn Strategy>)> {
         let map = self.handles.lock().await;
-        map.iter()
-            .map(|(id, h)| (*id, h.instantiate()))
-            .collect()
+        map.iter().map(|(id, h)| (*id, h.instantiate())).collect()
     }
 }

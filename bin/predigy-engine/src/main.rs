@@ -29,19 +29,19 @@ use predigy_engine::{
     config::EngineConfig,
     discovery_service::DiscoveryService,
     exec_data::{ExecDataConfig, ExecDataConsumer},
-    external_feeds::{build_subscriber_map, nws_config_from_env, ExternalFeeds},
+    external_feeds::{ExternalFeeds, build_subscriber_map, nws_config_from_env},
     market_data::{MarketDataRouter, RouterConfig},
     oms_db::DbBackedOms,
-    pair_file_service::{pair_file_from_env, PairFileConfig, PairFileService},
+    pair_file_service::{PairFileConfig, PairFileService, pair_file_from_env},
     registry::StrategyRegistry,
     supervisor::{RestartPolicy, Supervisor},
     venue_rest::{VenueRest, VenueRestConfig},
 };
+use predigy_engine_core::Db;
 use predigy_engine_core::discovery::DiscoverySubscription;
 use predigy_engine_core::oms::KillSwitchView;
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
-use predigy_engine_core::Db;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use predigy_strategy_cross_arb::{CrossArbConfig, CrossArbStrategy};
 use predigy_strategy_latency::LatencyStrategy;
@@ -58,8 +58,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    let config = EngineConfig::from_env()
-        .context("loading engine config from env")?;
+    let config = EngineConfig::from_env().context("loading engine config from env")?;
     info!(
         database_url = %config.database_url,
         kalshi_endpoint = ?config.kalshi_rest_endpoint,
@@ -193,7 +192,10 @@ async fn main() -> Result<()> {
         let factory = strategy_factory(id);
         let strategy = factory();
         let state = StrategyState::new(db.clone(), id.0);
-        let markets = strategy.subscribed_markets(&state).await.unwrap_or_default();
+        let markets = strategy
+            .subscribed_markets(&state)
+            .await
+            .unwrap_or_default();
         let subs = strategy.discovery_subscriptions();
         if !subs.is_empty() {
             discovery_subs.insert(id, subs);
@@ -257,19 +259,18 @@ async fn main() -> Result<()> {
         let cross_arb_sup = supervisors
             .iter()
             .find(|s| s.id == predigy_strategy_cross_arb::STRATEGY_ID);
-        match (cross_arb_sup, external_feeds.as_ref().and_then(|f| f.poly_tx.clone())) {
+        match (
+            cross_arb_sup,
+            external_feeds.as_ref().and_then(|f| f.poly_tx.clone()),
+        ) {
             (Some(sup), Some(poly_tx)) => {
                 let cfg = PairFileConfig {
                     path,
                     poll_interval: Duration::from_secs(30),
                     strategy: sup.id,
                 };
-                let svc = PairFileService::start(
-                    cfg,
-                    router.command_tx(),
-                    poly_tx,
-                    sup.event_tx.clone(),
-                );
+                let svc =
+                    PairFileService::start(cfg, router.command_tx(), poly_tx, sup.event_tx.clone());
                 info!("predigy-engine: pair-file service started");
                 Some(svc)
             }
@@ -401,10 +402,10 @@ async fn register_strategies(registry: &StrategyRegistry) {
 fn strategy_factory(
     id: predigy_engine_core::strategy::StrategyId,
 ) -> Box<dyn Fn() -> Box<dyn Strategy> + Send + Sync> {
+    use predigy_strategy_cross_arb::STRATEGY_ID as CROSS_ARB_ID;
     use predigy_strategy_latency::STRATEGY_ID as LATENCY_ID;
     use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
-    use predigy_strategy_cross_arb::STRATEGY_ID as CROSS_ARB_ID;
     if id == STAT_ID {
         Box::new(|| Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>)
     } else if id == SETTLEMENT_ID {
@@ -416,9 +417,7 @@ fn strategy_factory(
             .expect("LATENCY_ID registered without a rule-file path; engine startup invariant");
         Box::new(move || build_latency_strategy(&path))
     } else if id == CROSS_ARB_ID {
-        Box::new(|| {
-            Box::new(CrossArbStrategy::new(CrossArbConfig::default())) as Box<dyn Strategy>
-        })
+        Box::new(|| Box::new(CrossArbStrategy::new(CrossArbConfig::default())) as Box<dyn Strategy>)
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
     }
@@ -519,8 +518,7 @@ async fn sync_kill_switch(
             view.arm();
             warn!(
                 file_armed,
-                db_armed,
-                "kill-switch: ARMED (engine refusing new entries)"
+                db_armed, "kill-switch: ARMED (engine refusing new entries)"
             );
         } else {
             view.clear();
@@ -531,9 +529,7 @@ async fn sync_kill_switch(
 
 async fn wait_for_shutdown() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("install SIGINT handler");
+        signal::ctrl_c().await.expect("install SIGINT handler");
     };
     #[cfg(unix)]
     let term = async {

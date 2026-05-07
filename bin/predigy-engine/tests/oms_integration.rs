@@ -25,14 +25,13 @@ use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
 use predigy_engine_core::oms::{
     ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, RejectionReason, RiskCaps, SubmitOutcome,
 };
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 fn test_database_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql:///predigy_test".into())
+    std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| "postgresql:///predigy_test".into())
 }
 
 // Global mutex to serialise tests against the shared DB.
@@ -118,18 +117,20 @@ async fn submit_persists_intent_and_emits_event() {
 
     let ks = Arc::new(KillSwitchView::new());
     let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
-    let outcome = oms.submit(buy_yes("test:A:0001", "KX-INT-A", 1, 30)).await.unwrap();
+    let outcome = oms
+        .submit(buy_yes("test:A:0001", "KX-INT-A", 1, 30))
+        .await
+        .unwrap();
     match outcome {
         SubmitOutcome::Submitted { client_id, .. } => assert_eq!(client_id, "test:A:0001"),
         other => panic!("expected Submitted, got {other:?}"),
     }
-    let row: (String, i32, String) = sqlx::query_as(
-        "SELECT status, qty, ticker FROM intents WHERE client_id = $1",
-    )
-    .bind("test:A:0001")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row: (String, i32, String) =
+        sqlx::query_as("SELECT status, qty, ticker FROM intents WHERE client_id = $1")
+            .bind("test:A:0001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     // Shadow mode is the default; engine never reaches the venue,
     // so the intent stays at 'shadow'. Tests that verify the live
     // venue path use new_with_mode(EngineMode::Live).
@@ -137,13 +138,12 @@ async fn submit_persists_intent_and_emits_event() {
     assert_eq!(row.1, 1);
     assert_eq!(row.2, "KX-INT-A");
 
-    let evs: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = $1",
-    )
-    .bind("test:A:0001")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let evs: (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = $1")
+            .bind("test:A:0001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(evs.0, 1);
 }
 
@@ -160,7 +160,10 @@ async fn duplicate_client_id_returns_idempotent() {
     matches!(first, SubmitOutcome::Submitted { .. });
     let second = oms.submit(intent).await.unwrap();
     match second {
-        SubmitOutcome::Idempotent { client_id, current_status } => {
+        SubmitOutcome::Idempotent {
+            client_id,
+            current_status,
+        } => {
             assert_eq!(client_id, "test:B:0001");
             // Shadow-mode default; the first submit landed at
             // status='shadow' so the second sees 'shadow'.
@@ -179,7 +182,10 @@ async fn kill_switch_armed_rejects() {
     ks.arm();
     let oms = DbBackedOms::new(pool, permissive_caps(), ks);
 
-    let outcome = oms.submit(buy_yes("test:C:0001", "KX-INT-C", 1, 30)).await.unwrap();
+    let outcome = oms
+        .submit(buy_yes("test:C:0001", "KX-INT-C", 1, 30))
+        .await
+        .unwrap();
     match outcome {
         SubmitOutcome::Rejected {
             reason: RejectionReason::KillSwitchArmed { .. },
@@ -199,7 +205,10 @@ async fn contract_cap_rejects() {
     let oms = DbBackedOms::new(pool, caps, ks);
 
     // 3 contracts on a side capped at 2.
-    let outcome = oms.submit(buy_yes("test:D:0001", "KX-INT-D", 3, 30)).await.unwrap();
+    let outcome = oms
+        .submit(buy_yes("test:D:0001", "KX-INT-D", 3, 30))
+        .await
+        .unwrap();
     match outcome {
         SubmitOutcome::Rejected {
             reason: RejectionReason::ContractCapExceeded { current, limit, .. },
@@ -236,7 +245,10 @@ async fn negative_qty_rejects() {
     let ks = Arc::new(KillSwitchView::new());
     let oms = DbBackedOms::new(pool, permissive_caps(), ks);
 
-    let outcome = oms.submit(buy_yes("test:F:0001", "KX-INT-F", 0, 30)).await.unwrap();
+    let outcome = oms
+        .submit(buy_yes("test:F:0001", "KX-INT-F", 0, 30))
+        .await
+        .unwrap();
     match outcome {
         SubmitOutcome::Rejected {
             reason: RejectionReason::InvalidIntent { .. },
@@ -284,25 +296,23 @@ async fn execution_filled_creates_position_and_fill() {
     assert_eq!(pos.2, 2);
 
     // Fill row written.
-    let fill: (i32, i32, i32) = sqlx::query_as(
-        "SELECT qty, price_cents, fee_cents FROM fills WHERE client_id = $1",
-    )
-    .bind(cid)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let fill: (i32, i32, i32) =
+        sqlx::query_as("SELECT qty, price_cents, fee_cents FROM fills WHERE client_id = $1")
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(fill.0, 5);
     assert_eq!(fill.1, 28);
     assert_eq!(fill.2, 2);
 
     // Intent updated to filled.
-    let intent_status: (String,) = sqlx::query_as(
-        "SELECT status FROM intents WHERE client_id = $1",
-    )
-    .bind(cid)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let intent_status: (String,) =
+        sqlx::query_as("SELECT status FROM intents WHERE client_id = $1")
+            .bind(cid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(intent_status.0, "filled");
 }
 
@@ -344,7 +354,9 @@ async fn short_position_close_realised_pnl_correct_sign() {
     .unwrap();
 
     // Buy back at 20¢ (a profit on a short — bought lower than sold).
-    oms.submit(buy_yes("test:S:close", "KX-INT-S", 5, 20)).await.unwrap();
+    oms.submit(buy_yes("test:S:close", "KX-INT-S", 5, 20))
+        .await
+        .unwrap();
     oms.apply_execution(ExecutionUpdate {
         client_id: "test:S:close".into(),
         venue_order_id: Some("v-S2".into()),
@@ -379,7 +391,9 @@ async fn partial_fill_then_full_fill_accumulates_position() {
     let ks = Arc::new(KillSwitchView::new());
     let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
 
-    oms.submit(buy_yes("test:P:0001", "KX-INT-P", 10, 30)).await.unwrap();
+    oms.submit(buy_yes("test:P:0001", "KX-INT-P", 10, 30))
+        .await
+        .unwrap();
     // Partial fill: 4 contracts at 28¢.
     oms.apply_execution(ExecutionUpdate {
         client_id: "test:P:0001".into(),
@@ -425,13 +439,11 @@ async fn partial_fill_then_full_fill_accumulates_position() {
     assert_eq!(pos.1, 30);
 
     // Two fill rows.
-    let n_fills: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::BIGINT FROM fills WHERE client_id = $1",
-    )
-    .bind("test:P:0001")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let n_fills: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM fills WHERE client_id = $1")
+        .bind("test:P:0001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(n_fills.0, 2);
 }
 
@@ -449,13 +461,11 @@ async fn live_mode_submits_at_status_submitted() {
     oms.submit(buy_yes("test:LIVE:0001", "KX-INT-LIVE", 1, 30))
         .await
         .unwrap();
-    let row: (String,) = sqlx::query_as(
-        "SELECT status FROM intents WHERE client_id = $1",
-    )
-    .bind("test:LIVE:0001")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row: (String,) = sqlx::query_as("SELECT status FROM intents WHERE client_id = $1")
+        .bind("test:LIVE:0001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(row.0, "submitted");
 
     // intent_events also reflects 'submitted'.
@@ -477,23 +487,22 @@ async fn cancel_marks_intent_and_appends_event() {
     let ks = Arc::new(KillSwitchView::new());
     let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
 
-    oms.submit(buy_yes("test:X:0001", "KX-INT-X", 1, 30)).await.unwrap();
+    oms.submit(buy_yes("test:X:0001", "KX-INT-X", 1, 30))
+        .await
+        .unwrap();
     oms.cancel("test:X:0001").await.unwrap();
-    let row: (String,) = sqlx::query_as(
-        "SELECT status FROM intents WHERE client_id = $1",
-    )
-    .bind("test:X:0001")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row: (String,) = sqlx::query_as("SELECT status FROM intents WHERE client_id = $1")
+        .bind("test:X:0001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(row.0, "cancel_requested");
-    let n: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = $1",
-    )
-    .bind("test:X:0001")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let n: (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = $1")
+            .bind("test:X:0001")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     // submitted + cancel_requested = 2 events.
     assert_eq!(n.0, 2);
 }
@@ -507,7 +516,9 @@ async fn fill_then_close_settles_realised_pnl() {
     let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
 
     // Open at 30¢.
-    oms.submit(buy_yes("test:H:open", "KX-INT-H", 5, 30)).await.unwrap();
+    oms.submit(buy_yes("test:H:open", "KX-INT-H", 5, 30))
+        .await
+        .unwrap();
     oms.apply_execution(ExecutionUpdate {
         client_id: "test:H:open".into(),
         venue_order_id: Some("venue-H1".into()),
@@ -602,13 +613,15 @@ async fn duplicate_venue_fill_id_is_idempotent() {
     oms.apply_execution(fill).await.unwrap();
 
     // Exactly one row in `fills`.
-    let fill_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::BIGINT FROM fills WHERE venue_fill_id = 'trade-dup-A'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(fill_count.0, 1, "duplicate fill must collapse to a single row");
+    let fill_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*)::BIGINT FROM fills WHERE venue_fill_id = 'trade-dup-A'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        fill_count.0, 1,
+        "duplicate fill must collapse to a single row"
+    );
 
     // Position reflects a single 3-contract fill (not 6).
     let pos: (i32, i32) = sqlx::query_as(

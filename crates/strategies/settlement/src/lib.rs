@@ -210,7 +210,11 @@ impl SettlementStrategy {
         })
     }
 
-    fn apply_discovery(&mut self, added: &[predigy_engine_core::discovery::DiscoveredMarket], removed: &[MarketTicker]) {
+    fn apply_discovery(
+        &mut self,
+        added: &[predigy_engine_core::discovery::DiscoveredMarket],
+        removed: &[MarketTicker],
+    ) {
         for m in added {
             let ticker = MarketTicker::new(&m.ticker);
             self.close_times.insert(ticker, m.settle_unix);
@@ -357,7 +361,10 @@ mod tests {
         seed_close(&mut s, &m, 1_777_910_000);
         let book = book_with((92, 1000), (7, 100));
         // 1h before close (3600s) > close_window (600s).
-        assert!(s.evaluate(&m, &book, 1_777_906_400, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&m, &book, 1_777_906_400, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -366,7 +373,10 @@ mod tests {
         let m = MarketTicker::new("KX-TEST");
         seed_close(&mut s, &m, 1_777_910_000);
         let book = book_with((92, 1000), (7, 100));
-        assert!(s.evaluate(&m, &book, 1_777_910_500, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&m, &book, 1_777_910_500, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -376,7 +386,10 @@ mod tests {
         seed_close(&mut s, &m, 1_777_910_000);
         // no_bid 1¢ → yes_ask 99¢ > max(96).
         let book = book_with((97, 1000), (1, 100));
-        assert!(s.evaluate(&m, &book, 1_777_909_700, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&m, &book, 1_777_909_700, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -386,7 +399,10 @@ mod tests {
         seed_close(&mut s, &m, 1_777_910_000);
         // no_bid 50¢ → yes_ask 50¢ < min(88).
         let book = book_with((48, 1000), (50, 100));
-        assert!(s.evaluate(&m, &book, 1_777_909_700, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&m, &book, 1_777_909_700, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -396,7 +412,10 @@ mod tests {
         seed_close(&mut s, &m, 1_777_910_000);
         // Bid 200, ask 100 → ratio 2 < 5.
         let book = book_with((92, 200), (7, 100));
-        assert!(s.evaluate(&m, &book, 1_777_909_700, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&m, &book, 1_777_909_700, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -427,7 +446,10 @@ mod tests {
         let mut s = SettlementStrategy::new(cfg());
         let m = MarketTicker::new("KX-UNKNOWN");
         let book = book_with((92, 1000), (7, 100));
-        assert!(s.evaluate(&m, &book, 1_777_909_700, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&m, &book, 1_777_909_700, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -457,7 +479,7 @@ mod tests {
         let m = MarketTicker::new("KX-TEST-X");
         s.close_times.insert(m.clone(), 1_777_910_000);
         s.last_fired.insert(m.clone(), Instant::now());
-        s.apply_discovery(&[], &[m.clone()]);
+        s.apply_discovery(&[], std::slice::from_ref(&m));
         assert!(!s.close_times.contains_key(&m));
         assert!(!s.last_fired.contains_key(&m));
     }

@@ -79,9 +79,8 @@ pub fn append_records(dir: &Path, records: &[PredictionRecord]) -> std::io::Resu
     let path: PathBuf = dir.join(format!("{date}.jsonl"));
     let mut out = String::new();
     for r in records {
-        let line = serde_json::to_string(r).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let line = serde_json::to_string(r)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         out.push_str(&line);
         out.push('\n');
     }

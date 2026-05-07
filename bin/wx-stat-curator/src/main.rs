@@ -657,13 +657,12 @@ fn format_now_utc_iso() -> String {
     let mut year: u16 = 1970;
     let mut remaining = days_since_epoch;
     loop {
-        let dy = if (year.is_multiple_of(4) && !year.is_multiple_of(100))
-            || year.is_multiple_of(400)
-        {
-            366
-        } else {
-            365
-        };
+        let dy =
+            if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) {
+                366
+            } else {
+                365
+            };
         if remaining < dy {
             break;
         }
@@ -676,8 +675,7 @@ fn format_now_utc_iso() -> String {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
             2 => {
-                if (year.is_multiple_of(4) && !year.is_multiple_of(100))
-                    || year.is_multiple_of(400)
+                if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
                 {
                     29
                 } else {

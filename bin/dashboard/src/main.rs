@@ -344,7 +344,11 @@ async fn serve_kill(
                  reason = EXCLUDED.reason",
         )
         .bind(req.armed)
-        .bind(if req.armed { "manual: dashboard arm" } else { "manual: dashboard clear" })
+        .bind(if req.armed {
+            "manual: dashboard arm"
+        } else {
+            "manual: dashboard clear"
+        })
         .execute(pool)
         .await;
         if let Err(e) = db_result {

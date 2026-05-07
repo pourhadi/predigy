@@ -112,10 +112,7 @@ async fn main() -> Result<()> {
     let cutoff_unix = now_unix() - args.settlement_lag_days.saturating_mul(86_400);
     let eligible: Vec<&PredictionRecord> = predictions
         .iter()
-        .filter(|p| {
-            settlement_unix(&p.settlement_date)
-                .is_some_and(|t| t <= cutoff_unix)
-        })
+        .filter(|p| settlement_unix(&p.settlement_date).is_some_and(|t| t <= cutoff_unix))
         .collect();
     info!(
         n_eligible = eligible.len(),
@@ -171,9 +168,7 @@ async fn main() -> Result<()> {
         };
         let observed_k = (observed_f - 32.0) * 5.0 / 9.0 + 273.15;
         let exceeded = (observed_k as f32) > p.threshold_k;
-        let outcome = if (exceeded && p.yes_when_above)
-            || (!exceeded && !p.yes_when_above)
-        {
+        let outcome = if (exceeded && p.yes_when_above) || (!exceeded && !p.yes_when_above) {
             1.0_f64
         } else {
             0.0_f64
@@ -199,8 +194,11 @@ async fn main() -> Result<()> {
 
     // Fit per bucket where sample count meets floor.
     let mut cal = Calibration::empty();
-    let mut fit_summary: Vec<(BucketKey, u32, Option<wx_stat_curator::calibration::PlattCoeffs>)> =
-        Vec::new();
+    let mut fit_summary: Vec<(
+        BucketKey,
+        u32,
+        Option<wx_stat_curator::calibration::PlattCoeffs>,
+    )> = Vec::new();
     for (bucket, samples) in &buckets {
         let n: u32 = u32::try_from(samples.len()).unwrap_or(u32::MAX);
         if n < args.min_samples_per_bucket {
@@ -240,10 +238,17 @@ async fn main() -> Result<()> {
 }
 
 fn print_summary(
-    summary: &[(BucketKey, u32, Option<wx_stat_curator::calibration::PlattCoeffs>)],
+    summary: &[(
+        BucketKey,
+        u32,
+        Option<wx_stat_curator::calibration::PlattCoeffs>,
+    )],
 ) {
-    let mut rows: Vec<&(BucketKey, u32, Option<wx_stat_curator::calibration::PlattCoeffs>)> =
-        summary.iter().collect();
+    let mut rows: Vec<&(
+        BucketKey,
+        u32,
+        Option<wx_stat_curator::calibration::PlattCoeffs>,
+    )> = summary.iter().collect();
     rows.sort_by(|a, b| (a.0.airport.as_str(), a.0.month).cmp(&(b.0.airport.as_str(), b.0.month)));
     eprintln!();
     eprintln!(
@@ -292,7 +297,8 @@ fn settlement_unix(iso_date: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    let is_leap = |yr: u16| (yr.is_multiple_of(4) && !yr.is_multiple_of(100)) || yr.is_multiple_of(400);
+    let is_leap =
+        |yr: u16| (yr.is_multiple_of(4) && !yr.is_multiple_of(100)) || yr.is_multiple_of(400);
     let dim = |yr: u16, mo: u8| -> u32 {
         match mo {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,

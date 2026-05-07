@@ -89,7 +89,9 @@ impl Supervisor {
         drop(self.event_tx);
         match tokio::time::timeout(grace, self.handle).await {
             Ok(Ok(())) => info!(strategy = ?self.id, "supervisor: clean shutdown"),
-            Ok(Err(e)) => warn!(strategy = ?self.id, error = %e, "supervisor: task panicked during shutdown"),
+            Ok(Err(e)) => {
+                warn!(strategy = ?self.id, error = %e, "supervisor: task panicked during shutdown");
+            }
             Err(_) => warn!(strategy = ?self.id, "supervisor: shutdown deadline exceeded"),
         }
     }
@@ -177,7 +179,10 @@ async fn submit_one(oms: &Arc<dyn Oms>, intent: predigy_engine_core::Intent) -> 
             tracing::info!(%client_id, ?venue, "oms: submitted");
             Ok(())
         }
-        SubmitOutcome::Idempotent { client_id, current_status } => {
+        SubmitOutcome::Idempotent {
+            client_id,
+            current_status,
+        } => {
             tracing::debug!(%client_id, %current_status, "oms: idempotent re-submit (no-op)");
             Ok(())
         }

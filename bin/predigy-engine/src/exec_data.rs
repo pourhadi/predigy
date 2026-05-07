@@ -69,11 +69,7 @@ impl std::fmt::Debug for ExecDataConsumer {
 
 impl ExecDataConsumer {
     /// Connect, subscribe to authed channels, and start consuming.
-    pub async fn connect(
-        config: ExecDataConfig,
-        pool: PgPool,
-        oms: Arc<dyn Oms>,
-    ) -> Result<Self> {
+    pub async fn connect(config: ExecDataConfig, pool: PgPool, oms: Arc<dyn Oms>) -> Result<Self> {
         let signer = Signer::from_pem(&config.kalshi_key_id, &config.kalshi_pem)
             .map_err(|e| anyhow::anyhow!("exec_data signer: {e}"))?;
         let md_client = match config.ws_endpoint {
@@ -91,11 +87,7 @@ impl ExecDataConsumer {
     }
 }
 
-async fn consumer_task(
-    mut connection: MdConnection,
-    pool: PgPool,
-    oms: Arc<dyn Oms>,
-) {
+async fn consumer_task(mut connection: MdConnection, pool: PgPool, oms: Arc<dyn Oms>) {
     // Initial subscribe — the authed channels cover ALL the
     // account's markets, so an empty market_tickers list is the
     // right shape (the kalshi-md crate explicitly accepts that
@@ -221,21 +213,16 @@ async fn handle_event(ev: MdEvent, pool: &PgPool, oms: &Arc<dyn Oms>) -> Result<
 /// `fills.venue_fill_id` unique index. Replayed WS fills (across
 /// reconnects, or arriving alongside a REST poll) collapse to a
 /// single applied fill.
-async fn apply_fill(
-    pool: &PgPool,
-    oms: &Arc<dyn Oms>,
-    body: &FillBody,
-) -> Result<()> {
+async fn apply_fill(pool: &PgPool, oms: &Arc<dyn Oms>, body: &FillBody) -> Result<()> {
     // Read the originating intent's current cumulative_qty + qty
     // so we can decide PartialFill vs Filled and compute the new
     // absolute cumulative.
-    let intent_row: Option<(i32, i32)> = sqlx::query_as(
-        "SELECT cumulative_qty, qty FROM intents WHERE client_id = $1",
-    )
-    .bind(&body.client_order_id)
-    .fetch_optional(pool)
-    .await
-    .with_context(|| format!("read intent for cid {}", body.client_order_id))?;
+    let intent_row: Option<(i32, i32)> =
+        sqlx::query_as("SELECT cumulative_qty, qty FROM intents WHERE client_id = $1")
+            .bind(&body.client_order_id)
+            .fetch_optional(pool)
+            .await
+            .with_context(|| format!("read intent for cid {}", body.client_order_id))?;
 
     let Some((cum_qty, target_qty)) = intent_row else {
         // Fill arrived for an intent we don't know about. This
@@ -305,9 +292,7 @@ async fn apply_fill(
 /// decimal-dollar fixed-point; we round down to whole contracts
 /// (partial-contract fills don't exist on Kalshi).
 fn parse_count_fp(s: &str) -> Result<i32> {
-    let f: f64 = s
-        .parse()
-        .with_context(|| format!("parse count_fp '{s}'"))?;
+    let f: f64 = s.parse().with_context(|| format!("parse count_fp '{s}'"))?;
     let n = f.floor() as i64;
     i32::try_from(n).map_err(|_| anyhow::anyhow!("count_fp out of i32 range: {s}"))
 }
@@ -328,9 +313,7 @@ fn parse_price_dollars(s: &str) -> Result<i32> {
 /// Fee as decimal-dollar string → integer cents. Kalshi fees are
 /// always non-negative; signed math handled by the OMS.
 fn parse_dollars_to_cents(s: &str) -> Result<i32> {
-    let f: f64 = s
-        .parse()
-        .with_context(|| format!("parse dollars '{s}'"))?;
+    let f: f64 = s.parse().with_context(|| format!("parse dollars '{s}'"))?;
     let cents = (f * 100.0).round() as i64;
     i32::try_from(cents).map_err(|_| anyhow::anyhow!("fee out of i32 range: {s}"))
 }

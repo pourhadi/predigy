@@ -18,15 +18,18 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::Deserialize;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "predigy-import", about = "Mirror existing JSON state into Postgres.")]
+#[command(
+    name = "predigy-import",
+    about = "Mirror existing JSON state into Postgres."
+)]
 struct Args {
     /// Connection string. With peer auth on UNIX socket the
     /// canonical value is `postgresql:///predigy` (no host).
@@ -106,9 +109,9 @@ async fn main() -> Result<()> {
 
     // ---- Rules: stat-rules.json, wx-stat-rules.json, wx-rules.json ----
     let rule_files = [
-        ("stat",    "stat-rules.json",     RuleFormat::StatRule),
-        ("stat",    "wx-stat-rules.json",  RuleFormat::StatRule),
-        ("latency", "wx-rules.json",       RuleFormat::LatencyRule),
+        ("stat", "stat-rules.json", RuleFormat::StatRule),
+        ("stat", "wx-stat-rules.json", RuleFormat::StatRule),
+        ("latency", "wx-rules.json", RuleFormat::LatencyRule),
     ];
     let mut rules_inserted = 0u64;
     for (strategy, file, fmt) in rule_files {
@@ -207,8 +210,8 @@ async fn collect_rule_tickers(config_dir: &Path, out: &mut HashSet<String>) -> R
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
-        let parsed: Vec<StatRuleJson> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let parsed: Vec<StatRuleJson> =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         for r in parsed {
             out.insert(r.kalshi_market);
         }
@@ -301,12 +304,7 @@ struct LatencyRuleJson {
     target_market: Option<String>,
 }
 
-async fn import_rules(
-    pool: &PgPool,
-    strategy: &str,
-    path: &Path,
-    fmt: RuleFormat,
-) -> Result<u64> {
+async fn import_rules(pool: &PgPool, strategy: &str, path: &Path, fmt: RuleFormat) -> Result<u64> {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),

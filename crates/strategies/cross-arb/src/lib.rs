@@ -174,12 +174,7 @@ impl CrossArbStrategy {
         }
     }
 
-    fn evaluate(
-        &mut self,
-        market: &MarketTicker,
-        book: &OrderBook,
-        now: Instant,
-    ) -> Vec<Intent> {
+    fn evaluate(&mut self, market: &MarketTicker, book: &OrderBook, now: Instant) -> Vec<Intent> {
         let Some(asset_id) = self.market_map.get(market).cloned() else {
             return Vec::new();
         };
@@ -263,9 +258,7 @@ impl Strategy for CrossArbStrategy {
         _state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
         match ev {
-            Event::BookUpdate { market, book } => {
-                Ok(self.evaluate(market, book, Instant::now()))
-            }
+            Event::BookUpdate { market, book } => Ok(self.evaluate(market, book, Instant::now())),
             Event::External(ExternalEvent::PolymarketBook {
                 asset_id,
                 best_bid,
@@ -480,11 +473,7 @@ mod tests {
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
         let now = Instant::now();
-        let first = s.evaluate(
-            &MarketTicker::new("X"),
-            &book(&[(20, 5)], &[(30, 50)]),
-            now,
-        );
+        let first = s.evaluate(&MarketTicker::new("X"), &book(&[(20, 5)], &[(30, 50)]), now);
         assert!(!first.is_empty());
         let second = s.evaluate(
             &MarketTicker::new("X"),
@@ -516,7 +505,8 @@ mod tests {
         let mut s = CrossArbStrategy::new(cfg());
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.5), Some(0.5));
-        s.last_submit_at.insert(MarketTicker::new("X"), Instant::now());
+        s.last_submit_at
+            .insert(MarketTicker::new("X"), Instant::now());
         s.apply_pair_update(&[], &[MarketTicker::new("X")]);
         assert_eq!(s.pair_count(), 0);
         assert!(!s.poly_ref.contains_key("0xabc"));

@@ -34,7 +34,10 @@ pub enum EngineError {
     Risk(String),
 
     #[error("strategy {strategy}: {reason}")]
-    Strategy { strategy: &'static str, reason: String },
+    Strategy {
+        strategy: &'static str,
+        reason: String,
+    },
 
     #[error("config: {0}")]
     Config(String),

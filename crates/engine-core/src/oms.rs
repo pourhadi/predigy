@@ -33,10 +33,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub enum SubmitOutcome {
     /// Intent persisted, sent to the venue, awaiting ack.
-    Submitted { client_id: String, venue: VenueChoice },
+    Submitted {
+        client_id: String,
+        venue: VenueChoice,
+    },
     /// Intent already exists with this client_id; OMS treats as
     /// idempotent no-op. The strategy can ignore.
-    Idempotent { client_id: String, current_status: String },
+    Idempotent {
+        client_id: String,
+        current_status: String,
+    },
     /// Intent rejected by risk / kill-switch BEFORE reaching the
     /// venue. The strategy decides whether to log + retry later.
     Rejected { reason: RejectionReason },
@@ -50,31 +56,76 @@ pub enum VenueChoice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RejectionReason {
-    KillSwitchArmed { scope: String },
-    DailyLossExceeded { strategy: &'static str },
-    NotionalExceeded { scope: String, current_cents: i64, limit_cents: i64 },
-    ContractCapExceeded { ticker: String, side: String, current: i32, limit: i32 },
-    TooManyInFlight { strategy: &'static str, in_flight: i32, limit: i32 },
-    RateLimited { window_ms: u64 },
-    UnknownMarket { ticker: String },
-    InvalidIntent { reason: String },
+    KillSwitchArmed {
+        scope: String,
+    },
+    DailyLossExceeded {
+        strategy: &'static str,
+    },
+    NotionalExceeded {
+        scope: String,
+        current_cents: i64,
+        limit_cents: i64,
+    },
+    ContractCapExceeded {
+        ticker: String,
+        side: String,
+        current: i32,
+        limit: i32,
+    },
+    TooManyInFlight {
+        strategy: &'static str,
+        in_flight: i32,
+        limit: i32,
+    },
+    RateLimited {
+        window_ms: u64,
+    },
+    UnknownMarket {
+        ticker: String,
+    },
+    InvalidIntent {
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for RejectionReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RejectionReason::KillSwitchArmed { scope } => write!(f, "kill switch armed: {scope}"),
-            RejectionReason::DailyLossExceeded { strategy } => write!(f, "{strategy} daily loss cap reached"),
-            RejectionReason::NotionalExceeded { scope, current_cents, limit_cents } => {
-                write!(f, "{scope} notional cap: ${} > ${}", current_cents/100, limit_cents/100)
+            RejectionReason::DailyLossExceeded { strategy } => {
+                write!(f, "{strategy} daily loss cap reached")
             }
-            RejectionReason::ContractCapExceeded { ticker, side, current, limit } => {
+            RejectionReason::NotionalExceeded {
+                scope,
+                current_cents,
+                limit_cents,
+            } => {
+                write!(
+                    f,
+                    "{scope} notional cap: ${} > ${}",
+                    current_cents / 100,
+                    limit_cents / 100
+                )
+            }
+            RejectionReason::ContractCapExceeded {
+                ticker,
+                side,
+                current,
+                limit,
+            } => {
                 write!(f, "{ticker}.{side} contract cap: {current} > {limit}")
             }
-            RejectionReason::TooManyInFlight { strategy, in_flight, limit } => {
+            RejectionReason::TooManyInFlight {
+                strategy,
+                in_flight,
+                limit,
+            } => {
                 write!(f, "{strategy} too many in-flight: {in_flight}/{limit}")
             }
-            RejectionReason::RateLimited { window_ms } => write!(f, "rate-limited ({window_ms}ms window)"),
+            RejectionReason::RateLimited { window_ms } => {
+                write!(f, "rate-limited ({window_ms}ms window)")
+            }
             RejectionReason::UnknownMarket { ticker } => write!(f, "unknown market {ticker}"),
             RejectionReason::InvalidIntent { reason } => write!(f, "invalid: {reason}"),
         }
@@ -106,8 +157,8 @@ impl RiskCaps {
     /// Override per-strategy as confidence grows.
     pub fn shake_down() -> Self {
         Self {
-            max_notional_cents: 500,             // $5
-            max_daily_loss_cents: 200,           // $2
+            max_notional_cents: 500,   // $5
+            max_daily_loss_cents: 200, // $2
             max_contracts_per_side: 3,
             max_in_flight: 10,
             max_orders_per_window: 5,

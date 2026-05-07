@@ -30,7 +30,7 @@ pub mod oms;
 pub mod state;
 pub mod strategy;
 
-pub use db::{Db, DailyPnl, LatestModelP, OpenPosition, RuleRow};
+pub use db::{DailyPnl, Db, LatestModelP, OpenPosition, RuleRow};
 pub use discovery::{DiscoveredMarket, DiscoverySubscription};
 pub use error::{EngineError, EngineResult};
 pub use events::{Event, ExternalEvent, KalshiPolyPair};

@@ -97,10 +97,7 @@ impl StatStrategy {
         &mut self,
         state: &mut StrategyState,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let rows = state
-            .db
-            .active_rules(STRATEGY_ID.0)
-            .await?;
+        let rows = state.db.active_rules(STRATEGY_ID.0).await?;
         let n = rows.len();
         let mut next: HashMap<String, CachedRule> = HashMap::with_capacity(n);
         for r in rows {
@@ -171,9 +168,9 @@ impl Strategy for StatStrategy {
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
         // Rule cache refresh — periodic + lazy. Always refresh on
         // first call.
-        let needs_refresh = self.last_rule_refresh.is_none_or(|t| {
-            t.elapsed() >= self.config.rule_refresh_interval
-        });
+        let needs_refresh = self
+            .last_rule_refresh
+            .is_none_or(|t| t.elapsed() >= self.config.rule_refresh_interval);
         if needs_refresh {
             self.refresh_rules(state).await?;
         }
@@ -188,9 +185,9 @@ impl Strategy for StatStrategy {
                 // refreshed above. No intents from a bare tick.
                 Ok(Vec::new())
             }
-            Event::External(_)
-            | Event::DiscoveryDelta { .. }
-            | Event::PairUpdate { .. } => Ok(Vec::new()),
+            Event::External(_) | Event::DiscoveryDelta { .. } | Event::PairUpdate { .. } => {
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -229,12 +226,9 @@ fn build_intent(
         Side::Yes => rule.model_p,
         Side::No => 1.0 - rule.model_p,
     };
-    let kelly_f = predigy_signals::kelly::fraction_with_factor(
-        bet_p,
-        ask_dollars,
-        config.kelly_factor,
-    )
-    .ok()?;
+    let kelly_f =
+        predigy_signals::kelly::fraction_with_factor(bet_p, ask_dollars, config.kelly_factor)
+            .ok()?;
     if kelly_f <= 0.0 {
         return None;
     }
@@ -409,10 +403,8 @@ mod tests {
     #[test]
     fn evaluate_respects_cooldown() {
         let mut s = StatStrategy::new(cfg());
-        s.rules.insert(
-            "KX-TEST-G".into(),
-            cached_rule(0.70, Side::Yes, 5),
-        );
+        s.rules
+            .insert("KX-TEST-G".into(), cached_rule(0.70, Side::Yes, 5));
         let market = MarketTicker::new("KX-TEST-G");
         let book = book_with_quotes(None, Some(50)); // YES ask = 50
 
@@ -420,7 +412,10 @@ mod tests {
         let first = s.evaluate(&market, &book, now);
         assert!(first.is_some());
         let second = s.evaluate(&market, &book, now);
-        assert!(second.is_none(), "second fire within cooldown should be suppressed");
+        assert!(
+            second.is_none(),
+            "second fire within cooldown should be suppressed"
+        );
 
         // Fast-forward past the cooldown.
         let later = now + Duration::from_secs(120);
