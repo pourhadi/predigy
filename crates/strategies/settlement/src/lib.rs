@@ -108,6 +108,21 @@ pub struct SettlementConfig {
     /// Postgres. Settlement positions are short-lived
     /// (<10 min), so a 30s cadence is fine.
     pub position_refresh_interval: Duration,
+    /// **Audit S1 — settlement-time fade**: symmetric mirror of
+    /// the long-side strategy. When yes_ask climbs above
+    /// `fade_min_price_cents` in the close window with the
+    /// inverted book asymmetry (heavy ask stack, thin bid),
+    /// the market is overconfident; sell-YES (= go short)
+    /// expecting reversion or a venue pause.
+    pub fade_min_price_cents: u8,
+    pub fade_max_price_cents: u8,
+    /// Ratio that ask-stack must exceed bid-stack by to fire
+    /// the fade. Mirrors `bid_to_ask_ratio` for the long side.
+    pub fade_ask_to_bid_ratio: u32,
+    /// Per-fire size for fade entries.
+    pub fade_size: u32,
+    /// `0` disables fade entirely.
+    pub fade_enabled: bool,
 }
 
 impl SettlementConfig {
@@ -157,6 +172,30 @@ impl SettlementConfig {
                 c.profit_lock_min_secs_to_close = n;
             }
         }
+        // S1 fade overrides:
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_FADE_ENABLED") {
+            c.fade_enabled = matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_FADE_MIN_PRICE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.fade_min_price_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_FADE_MAX_PRICE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.fade_max_price_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_FADE_ASK_TO_BID_RATIO") {
+            if let Ok(n) = v.parse() {
+                c.fade_ask_to_bid_ratio = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_FADE_SIZE") {
+            if let Ok(n) = v.parse() {
+                c.fade_size = n;
+            }
+        }
         c
     }
 }
@@ -181,6 +220,17 @@ impl Default for SettlementConfig {
             profit_lock_threshold_cents: 5,
             profit_lock_min_secs_to_close: 180,
             position_refresh_interval: Duration::from_secs(30),
+            // S1: defaults intentionally tighter than the
+            // long-side band. Fade only fires on really
+            // egregious overconfidence (98–99¢) — the venue's
+            // settlement-race risk on a short YES position is
+            // asymmetric (we'd owe $1 if it settles up). Off by
+            // default; operator opts in via env var or config.
+            fade_min_price_cents: 98,
+            fade_max_price_cents: 99,
+            fade_ask_to_bid_ratio: 5,
+            fade_size: 1,
+            fade_enabled: false,
         }
     }
 }
@@ -298,6 +348,90 @@ impl SettlementStrategy {
                 best_bid_price.cents(),
                 self.config.bid_to_ask_ratio,
                 secs_to_close,
+            )),
+        })
+    }
+
+    /// **Audit S1** — fade entry, symmetric mirror of `evaluate`.
+    /// When the YES touch is overconfident (99¢ with thin bids
+    /// vs heavy asks), sell-YES IOC. Returns Some on a fire.
+    fn evaluate_fade(
+        &mut self,
+        market: &MarketTicker,
+        book: &OrderBook,
+        now_unix: i64,
+        now_instant: Instant,
+    ) -> Option<Intent> {
+        if !self.config.fade_enabled {
+            return None;
+        }
+        // Reuse the same per-market cooldown as the long side.
+        if let Some(&last) = self.last_fired.get(market)
+            && now_instant.duration_since(last) < self.config.cooldown
+        {
+            return None;
+        }
+        // Time-to-close gate (same as long side).
+        let close_time = self.close_times.get(market).copied()?;
+        let secs_to_close = close_time.saturating_sub(now_unix);
+        if secs_to_close <= 0
+            || u64::try_from(secs_to_close).unwrap_or(u64::MAX)
+                >= self.config.close_window.as_secs()
+        {
+            return None;
+        }
+        // Best bid + ask via complement.
+        let (best_bid_price, best_bid_qty) = book.best_yes_bid()?;
+        let (best_no_bid_price, best_no_bid_qty) = book.best_no_bid()?;
+        let yes_ask_cents = 100u8.checked_sub(best_no_bid_price.cents())?;
+        // Price band — overconfident YES territory.
+        if yes_ask_cents < self.config.fade_min_price_cents
+            || yes_ask_cents > self.config.fade_max_price_cents
+        {
+            return None;
+        }
+        // Inverted asymmetry: ask-stack (= no_bid_qty by book
+        // convention) must dominate bid-stack.
+        if best_no_bid_qty < best_bid_qty.saturating_mul(self.config.fade_ask_to_bid_ratio) {
+            return None;
+        }
+        // Sanity: book must not be inverted.
+        if best_bid_price.cents() + yes_ask_cents < 100 {
+            return None;
+        }
+
+        // Submit at the YES bid (we sell into the existing
+        // bid). Action=Sell, Side=Yes — Kalshi V2 maps to
+        // (side=Bid, action=Sell) on the wire. Limit price = the
+        // bid we'd hit.
+        let qty = i32::try_from(self.config.fade_size).ok()?;
+        if qty <= 0 {
+            return None;
+        }
+        let limit_cents = i32::from(best_bid_price.cents()).clamp(1, 99);
+        let minute = (now_unix / 60) as u32;
+        let client_id = format!(
+            "settlement-fade:{ticker}:{ask:02}:{size:04}:{minute:08x}",
+            ticker = cid_safe_ticker(market.as_str()),
+            ask = yes_ask_cents,
+            size = self.config.fade_size,
+        );
+        self.last_fired.insert(market.clone(), now_instant);
+        Some(Intent {
+            client_id,
+            strategy: STRATEGY_ID.0,
+            market: market.clone(),
+            side: Side::Yes,
+            action: IntentAction::Sell,
+            price_cents: Some(limit_cents),
+            qty,
+            order_type: OrderType::Limit,
+            tif: Tif::Ioc,
+            reason: Some(format!(
+                "settlement-fade: yes_ask={yes_ask_cents}¢ \
+                 ask_qty={best_no_bid_qty} bid_qty={best_bid_qty} \
+                 ratio≥{} ttc={secs_to_close}s",
+                self.config.fade_ask_to_bid_ratio,
             )),
         })
     }
@@ -518,9 +652,21 @@ impl Strategy for SettlementStrategy {
                         market = %market.as_str(),
                         price_cents = ?entry.price_cents,
                         qty = entry.qty,
-                        "settlement: firing"
+                        "settlement: firing (long)"
                     );
                     intents.push(entry);
+                }
+                // S1 — fade entry. Symmetric to the long branch
+                // but at the overconfident-YES end of the
+                // distribution. Fires only when fade_enabled.
+                if let Some(fade) = self.evaluate_fade(market, book, now_unix, now_instant) {
+                    debug!(
+                        market = %market.as_str(),
+                        price_cents = ?fade.price_cents,
+                        qty = fade.qty,
+                        "settlement: firing (fade)"
+                    );
+                    intents.push(fade);
                 }
                 if let Some(exit) = self.evaluate_exit(market, book, now_unix, now_instant) {
                     intents.push(exit);
@@ -577,11 +723,17 @@ mod tests {
             bid_to_ask_ratio: 5,
             size: 1,
             cooldown: Duration::from_secs(60),
-            // A6 disabled by default in tests; A6 tests set
-            // explicit values to exercise the branch.
+            // A6 + S1 disabled by default in tests; the
+            // dedicated tests set explicit values to exercise
+            // the branches.
             profit_lock_threshold_cents: 0,
             profit_lock_min_secs_to_close: 180,
             position_refresh_interval: Duration::from_secs(30),
+            fade_min_price_cents: 98,
+            fade_max_price_cents: 99,
+            fade_ask_to_bid_ratio: 5,
+            fade_size: 1,
+            fade_enabled: false,
         }
     }
 
@@ -881,5 +1033,94 @@ mod tests {
             s.evaluate_exit(&m, &book, now_unix, Instant::now())
                 .is_none()
         );
+    }
+
+    // ─── S1 settlement-time fade tests ───────────────────────
+
+    #[test]
+    fn fade_disabled_by_default() {
+        let mut s = SettlementStrategy::new(cfg());
+        let m = MarketTicker::new("KX-FD-A");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        // yes_ask = 100 - no_bid(1) = 99. ask_qty 1000 >>
+        // 5*100 bid_qty.
+        let book = book_with((50, 100), (1, 1000));
+        assert!(
+            s.evaluate_fade(&m, &book, now_unix, Instant::now())
+                .is_none(),
+            "fade disabled when fade_enabled=false"
+        );
+    }
+
+    #[test]
+    fn fade_fires_when_enabled_and_conditions_met() {
+        let mut c = cfg();
+        c.fade_enabled = true;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-FD-B");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        // yes_ask = 100 - no_bid(1) = 99. ask_qty 1000 >> 5×100.
+        let book = book_with((50, 100), (1, 1000));
+        let intent = s
+            .evaluate_fade(&m, &book, now_unix, Instant::now())
+            .expect("fade fires");
+        assert_eq!(intent.side, Side::Yes);
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.qty, 1);
+        // We submit at the YES bid (50¢ — sell into existing
+        // bid).
+        assert_eq!(intent.price_cents, Some(50));
+        assert_eq!(intent.tif, Tif::Ioc);
+        assert!(intent.client_id.starts_with("settlement-fade:"));
+    }
+
+    #[test]
+    fn fade_skips_when_price_below_band() {
+        let mut c = cfg();
+        c.fade_enabled = true;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-FD-C");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        // yes_ask = 100 - no_bid(5) = 95. Below fade band 98.
+        let book = book_with((50, 100), (5, 1000));
+        assert!(
+            s.evaluate_fade(&m, &book, now_unix, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fade_skips_when_book_balanced() {
+        let mut c = cfg();
+        c.fade_enabled = true;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-FD-D");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        // ask_qty (200) is not 5× bid_qty (100).
+        let book = book_with((50, 100), (1, 200));
+        assert!(
+            s.evaluate_fade(&m, &book, now_unix, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fade_cooldown_blocks_repeat() {
+        let mut c = cfg();
+        c.fade_enabled = true;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-FD-E");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        let book = book_with((50, 100), (1, 1000));
+        let now = Instant::now();
+        let _ = s
+            .evaluate_fade(&m, &book, now_unix, now)
+            .expect("first fires");
+        assert!(s.evaluate_fade(&m, &book, now_unix, now).is_none());
     }
 }
