@@ -1706,6 +1706,7 @@ dependencies = [
  "predigy-kalshi-md",
  "predigy-kalshi-rest",
  "predigy-poly-md",
+ "predigy-strategy-book-imbalance",
  "predigy-strategy-cross-arb",
  "predigy-strategy-implication-arb",
  "predigy-strategy-internal-arb",
@@ -1906,6 +1907,22 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-strategy-book-imbalance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-book",
+ "predigy-core",
+ "predigy-engine-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

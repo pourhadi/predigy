@@ -6,11 +6,11 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S9 all shipped
-> (see commits 57a28fc through this one). B1, B7 are
+> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S4, S9 all
+> shipped (see commits 57a28fc through this one). B1, B7 are
 > operator-action items. B4 (FIX) + B5 (maker rebates) +
 > S7 (MM) + I1 (maker exec) gated on Kalshi access or $25K
-> capital. S4, S5, S6, S8 still pending.
+> capital. S5, S6, S8 still pending.
 
 ---
 
@@ -316,19 +316,49 @@ book, cooldown blocks repeats, family with <2 tickers rejected
 at load, ticker→families reverse index built correctly across
 overlapping families.
 
-### S4 — Order-book mean reversion (cost: M)
+### S4 — Order-book mean reversion (cost: M) **SHIPPED 2026-05-07**
 
-When the touch is one-sided (e.g. yes_bid stack 100×, no_bid
-stack 5×), price often mean-reverts toward midpoint over the next
-1–5 min. Scalp the imbalance.
+New `predigy-strategy-book-imbalance`
+(`STRATEGY_ID="book-imbalance"`) fades the dominant side of a
+heavily-imbalanced touch:
 
-Pure microstructure; works at any market hour. Doesn't depend on
-external information. Conceptually similar to settlement but
-applies to ANY market with sufficient depth, not just sports
-near close.
+- imbalance = `(yes_bid_qty − no_bid_qty) / (yes_bid_qty + no_bid_qty)`
+- When `|imbalance| ≥ threshold` (default 0.7) AND total qty ≥
+  `min_total_qty` (default 50), fire a fade IOC limit at the
+  weak side's ask.
+- yes_bid stack dominant → buy NO at `100 − yes_bid`
+- no_bid stack dominant → buy YES at `100 − no_bid`
+- Per-market cooldown (default 60s) prevents re-firing while the
+  position is still open.
+- Take-ask gating (`min_take_ask_cents` 5, `max_take_ask_cents`
+  90) keeps the strategy out of the rails.
 
-Risk: in trending markets the imbalance can persist or grow.
-Need a cooldown + strict stop-loss.
+Operational:
+- `PREDIGY_BOOK_IMBALANCE_CONFIG` (path) — required.
+- `_THRESHOLD`, `_MIN_TOTAL_QTY`, `_MIN_EDGE_CENTS`,
+  `_MAX_TAKE_ASK_CENTS`, `_MIN_TAKE_ASK_CENTS`, `_SIZE`,
+  `_COOLDOWN_MS`, `_REFRESH_MS` — tunables.
+
+Per-market threshold override via `imbalance_threshold_override`
+in the JSON: tighter on noisy markets, looser on highest-volume
+families.
+
+Tests (8 unit, all passing):
+- fades dominant YES bid stack → buy NO
+- fades dominant NO bid stack → buy YES
+- skips balanced book
+- skips when total qty below floor
+- skips when ticker not in config
+- cooldown blocks repeats
+- skips when ask outside [min, max] take floor
+- per-market threshold override applied at evaluate time
+
+What S4 v1 deliberately doesn't do:
+- No active mark-aware exits. The OMS's session-flatten +
+  kill-switch handle forced flats. Layer TP/SL when empirical
+  performance justifies it.
+- No book-depth aggregation (touch-only). Stack-of-stacks would
+  improve robustness but doesn't fundamentally change the signal.
 
 ### S5 — News-event semantic latency expansion (cost: L)
 
