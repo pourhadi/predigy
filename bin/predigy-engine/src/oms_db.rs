@@ -89,10 +89,16 @@ impl DbBackedOms {
     /// for risk-cap state but rejecting bad intents early saves
     /// round trips.
     fn pre_check(&self, intent: &Intent) -> Result<(), RejectionReason> {
-        if self.kill_switch.is_armed() {
-            return Err(RejectionReason::KillSwitchArmed {
-                scope: "global".into(),
-            });
+        // Audit I2 — gate on global OR per-strategy. The
+        // RejectionReason carries the binding scope so the
+        // operator can see which switch fired in logs / DB.
+        if self.kill_switch.is_armed_for(intent.strategy) {
+            let scope = if self.kill_switch.is_armed() {
+                "global".to_string()
+            } else {
+                format!("strategy:{}", intent.strategy)
+            };
+            return Err(RejectionReason::KillSwitchArmed { scope });
         }
         if intent.qty <= 0 {
             return Err(RejectionReason::InvalidIntent {

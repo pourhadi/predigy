@@ -562,6 +562,38 @@ async fn sync_kill_switch(
             info!("kill-switch: cleared");
         }
     }
+
+    // Audit I2 — per-strategy switches. Pull all non-global
+    // rows; populate the view for each strategy id we know
+    // about. Only the four trader strategies are relevant; the
+    // OMS only consults `is_armed_for(strategy)` for those.
+    type StatePair = (&'static str, bool);
+    let known: &[&'static str] = &[
+        predigy_strategy_stat::STRATEGY_ID.0,
+        predigy_strategy_settlement::STRATEGY_ID.0,
+        predigy_strategy_latency::STRATEGY_ID.0,
+        predigy_strategy_cross_arb::STRATEGY_ID.0,
+    ];
+    match sqlx::query_as::<_, (String, bool)>(
+        "SELECT scope, armed FROM kill_switches WHERE scope <> 'global'",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            // Map scope -> armed for the strategies we know.
+            let mut updates: Vec<StatePair> = Vec::new();
+            for known_id in known {
+                let armed = rows
+                    .iter()
+                    .find(|(scope, _)| scope == *known_id)
+                    .map_or(false, |(_, a)| *a);
+                updates.push((*known_id, armed));
+            }
+            view.set_strategy_states(&updates);
+        }
+        Err(e) => warn!(error = %e, "kill-switch: per-strategy db query failed"),
+    }
 }
 
 async fn wait_for_shutdown() {

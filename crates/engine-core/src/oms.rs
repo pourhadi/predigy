@@ -253,25 +253,81 @@ impl ReconciliationDiff {
 /// Constructed by the engine and shared (via `Arc`) with the
 /// OMS implementation so kill-switch flips take effect on the
 /// next intent submission without a DB query in the hot path.
+///
+/// **Audit I2** — per-strategy + global. The OMS rejects an
+/// intent if the global switch is armed OR the per-strategy
+/// switch matching the intent's `strategy` is armed. Operator
+/// can pause one strategy without affecting the others.
 #[derive(Debug)]
 pub struct KillSwitchView {
     armed: std::sync::atomic::AtomicBool,
+    /// Per-strategy switches keyed by `Strategy::id().0`. Lookup
+    /// is read-mostly (one read per submit); writes happen only
+    /// on the kill-switch watcher's tick (every 5s). A `RwLock`
+    /// is the right shape — cheap reads, occasional writes.
+    per_strategy: std::sync::RwLock<std::collections::HashMap<&'static str, bool>>,
 }
 
 impl KillSwitchView {
     pub fn new() -> Self {
         Self {
             armed: std::sync::atomic::AtomicBool::new(false),
+            per_strategy: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
+
+    /// Arm the global switch.
     pub fn arm(&self) {
         self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Clear the global switch.
     pub fn clear(&self) {
         self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+    /// Whether the global switch is armed.
     pub fn is_armed(&self) -> bool {
         self.armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Arm the switch for one strategy. Other strategies stay
+    /// unaffected.
+    pub fn arm_strategy(&self, strategy: &'static str) {
+        if let Ok(mut g) = self.per_strategy.write() {
+            g.insert(strategy, true);
+        }
+    }
+    /// Clear the switch for one strategy.
+    pub fn clear_strategy(&self, strategy: &'static str) {
+        if let Ok(mut g) = self.per_strategy.write() {
+            g.insert(strategy, false);
+        }
+    }
+
+    /// Bulk-update the per-strategy state from a snapshot
+    /// (typically the kill-switch watcher's DB pull). Strategies
+    /// missing from the snapshot are NOT cleared; absence and
+    /// `false` mean the same thing for the OMS lookup.
+    pub fn set_strategy_states(&self, scopes: &[(&'static str, bool)]) {
+        if let Ok(mut g) = self.per_strategy.write() {
+            for (s, armed) in scopes {
+                g.insert(*s, *armed);
+            }
+        }
+    }
+
+    /// Whether the kill switch is armed for a given strategy
+    /// (per-strategy OR global). Used by the OMS in pre_check
+    /// to gate every intent.
+    pub fn is_armed_for(&self, strategy: &'static str) -> bool {
+        if self.is_armed() {
+            return true;
+        }
+        if let Ok(g) = self.per_strategy.read() {
+            return g.get(strategy).copied().unwrap_or(false);
+        }
+        // Lock poisoned: fail closed (treat as armed) so a
+        // panicking writer doesn't accidentally enable trading.
+        true
     }
 }
 
