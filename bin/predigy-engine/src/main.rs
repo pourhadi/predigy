@@ -27,6 +27,7 @@
 use anyhow::{Context as _, Result};
 use predigy_engine::{
     config::EngineConfig,
+    discovery_service::DiscoveryService,
     exec_data::{ExecDataConfig, ExecDataConsumer},
     market_data::{MarketDataRouter, RouterConfig},
     oms_db::DbBackedOms,
@@ -34,12 +35,16 @@ use predigy_engine::{
     supervisor::{RestartPolicy, Supervisor},
     venue_rest::{VenueRest, VenueRestConfig},
 };
+use predigy_engine_core::discovery::DiscoverySubscription;
 use predigy_engine_core::oms::KillSwitchView;
 use predigy_engine_core::state::StrategyState;
-use predigy_engine_core::strategy::Strategy;
+use predigy_engine_core::strategy::{Strategy, StrategyId};
 use predigy_engine_core::Db;
+use predigy_kalshi_rest::{Client as RestClient, Signer};
+use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
 use predigy_strategy_stat::{StatConfig, StatStrategy};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -169,20 +174,21 @@ async fn main() -> Result<()> {
     // 8. Spawn one supervisor per strategy. Each supervisor owns
     //    its strategy instance + its event channel + its
     //    StrategyState (DB handle). The router pushes
-    //    Event::BookUpdate into the supervisor's queue.
+    //    Event::BookUpdate into the supervisor's queue. We also
+    //    capture each strategy's declared discovery subscriptions
+    //    so the discovery service can be started below.
     let db = Db::connect(&config.database_url).await?;
     let mut supervisors: Vec<Supervisor> = Vec::new();
+    let mut discovery_subs: HashMap<StrategyId, Vec<DiscoverySubscription>> = HashMap::new();
     for (id, _) in registry.instantiate_all().await {
-        // Reconstruct via the registry's factory so each
-        // supervisor owns a fresh strategy instance.
-        // We use a dedicated factory per id rather than the
-        // registry's `instantiate_all` because the supervisor
-        // takes a factory closure that can be called repeatedly
-        // for restarts.
         let factory = strategy_factory(id);
         let strategy = factory();
         let state = StrategyState::new(db.clone(), id.0);
         let markets = strategy.subscribed_markets(&state).await.unwrap_or_default();
+        let subs = strategy.discovery_subscriptions();
+        if !subs.is_empty() {
+            discovery_subs.insert(id, subs);
+        }
         let supervisor = Supervisor::spawn(
             id,
             Arc::from(factory),
@@ -196,10 +202,40 @@ async fn main() -> Result<()> {
         info!(
             strategy = id.0,
             n_markets = markets.len(),
+            n_discovery_subs = discovery_subs.get(&id).map_or(0, Vec::len),
             "predigy-engine: strategy supervisor spawned + registered with router"
         );
         supervisors.push(supervisor);
     }
+
+    // 8a. Discovery service — periodic Kalshi REST scan that
+    //     auto-registers tickers with the router and pushes
+    //     Event::DiscoveryDelta into strategies. Spawned only if
+    //     at least one supervised strategy declared a discovery
+    //     subscription; settlement is the canonical case (its
+    //     market set rotates every few hours as games come into
+    //     scope).
+    let discovery_service = if discovery_subs.is_empty() {
+        None
+    } else {
+        let signer = Signer::from_pem(&config.kalshi_key_id, &pem)
+            .map_err(|e| anyhow::anyhow!("discovery signer: {e}"))?;
+        let rest_client = if let Some(base) = config.kalshi_rest_endpoint.as_deref() {
+            RestClient::with_base(base, Some(signer))
+        } else {
+            RestClient::authed(signer)
+        }
+        .map_err(|e| anyhow::anyhow!("discovery rest client: {e}"))?;
+        let rest_arc = Arc::new(rest_client);
+        let supervisor_refs: Vec<&Supervisor> = supervisors.iter().collect();
+        let svc = DiscoveryService::start(
+            rest_arc,
+            router.command_tx(),
+            &supervisor_refs,
+            &discovery_subs,
+        );
+        Some(svc)
+    };
 
     // 9. Wait on shutdown signal.
     info!(
@@ -211,6 +247,9 @@ async fn main() -> Result<()> {
     // 10. Drain.
     info!("predigy-engine: shutdown initiated; draining");
     watcher_handle.abort();
+    if let Some(svc) = discovery_service {
+        svc.shutdown(config.shutdown_grace).await;
+    }
     for sup in supervisors {
         sup.shutdown(config.shutdown_grace).await;
     }
@@ -227,11 +266,17 @@ async fn main() -> Result<()> {
 /// them in. Adding a new strategy = add it here + add the dep.
 async fn register_strategies(registry: &StrategyRegistry) {
     use predigy_engine::registry::StrategyHandle;
+    use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
 
     registry
         .register(StrategyHandle::new(STAT_ID, || {
             Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>
+        }))
+        .await;
+    registry
+        .register(StrategyHandle::new(SETTLEMENT_ID, || {
+            Box::new(SettlementStrategy::new(SettlementConfig::default())) as Box<dyn Strategy>
         }))
         .await;
 }
@@ -241,9 +286,14 @@ async fn register_strategies(registry: &StrategyRegistry) {
 fn strategy_factory(
     id: predigy_engine_core::strategy::StrategyId,
 ) -> Box<dyn Fn() -> Box<dyn Strategy> + Send + Sync> {
+    use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
     if id == STAT_ID {
         Box::new(|| Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>)
+    } else if id == SETTLEMENT_ID {
+        Box::new(|| {
+            Box::new(SettlementStrategy::new(SettlementConfig::default())) as Box<dyn Strategy>
+        })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
     }

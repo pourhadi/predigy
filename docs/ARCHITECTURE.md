@@ -493,13 +493,64 @@ glitches. It's not throwaway work.
 
 ### Phase 5 — Port remaining strategies
 
-For each of cross-arb, latency, settlement, wx-stat, wx-curator,
-stat-curator, cross-arb-curator:
+Strategy ports (one crate per strategy under `crates/strategies/`):
 
-- [ ] Implement strategy module against the trait
-- [ ] Run dual-write for 24-48h
-- [ ] Verify parity
-- [ ] Flip reads, retire old binary
+- [x] **stat-trader** → `crates/strategies/stat` (Phase 3.2,
+      shipped 2026-05-06).
+- [x] **settlement-trader** → `crates/strategies/settlement`
+      (Phase 5, shipped 2026-05-07). Pure discovery-driven —
+      operator no longer seeds tickers at boot. Ships with the
+      engine's new discovery service infrastructure (see below).
+- [ ] cross-arb (Polymarket-coupled; needs poly-md handle on
+      StrategyState — Phase 6 work).
+- [ ] latency (NWS-alert driven; needs ext-feeds wiring on
+      StrategyState).
+- [ ] wx-stat / wx-curator / stat-curator / cross-arb-curator
+      (curators run on a different cadence; possibly stay
+      external for now).
+
+#### Discovery service (shipped 2026-05-07)
+
+Periodic Kalshi-REST scan that auto-feeds dynamic market sets to
+strategies. Architecture:
+
+- `engine_core::DiscoverySubscription` — declarative config a
+  strategy emits at registration (series, interval,
+  max-secs-to-settle, require_quote).
+- `Strategy::discovery_subscriptions()` — default empty;
+  strategies override to opt in.
+- `Event::DiscoveryDelta { added, removed }` — fired into the
+  supervisor on each tick where the universe changed.
+- `bin/predigy-engine/src/discovery_service.rs` — spawns one
+  worker per (strategy, subscription) pair; paginates the Kalshi
+  REST scan, filters by `expected_expiration_time` (preferred for
+  per-event games) falling back to `close_time`, diffs against
+  the prior tick.
+- `MarketDataRouter::AddTickers` command + `command_tx()`
+  handle — discovery worker auto-registers new tickers with the
+  router so book updates start flowing before the strategy sees
+  the discovery delta.
+- `kalshi-rest`'s `send_with_retry` (PR #29) handles 429s
+  transparently underneath all REST calls — no per-caller retry
+  logic needed.
+
+The settlement strategy is the canonical consumer. With the
+discovery service running, the engine picks up newly-listed games
+within one polling interval (60s default); operator restart is no
+longer the bottleneck for sports-market entries.
+
+#### Migration plan per strategy
+
+For each remaining strategy:
+
+1. Implement strategy module against the trait.
+2. Run dual-write for 24–48h: legacy daemon keeps trading; engine
+   runs in `EngineMode::Shadow` so it persists intents at
+   `status='shadow'` without sending to the venue. Compare the
+   two ledgers offline.
+3. Verify parity (same fires, same sizes, same client_ids).
+4. Flip the engine to `Live` for that strategy + disable the
+   legacy launchd job.
 
 ### Phase 6 — Active position management
 
