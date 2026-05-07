@@ -1711,6 +1711,7 @@ dependencies = [
  "predigy-strategy-implication-arb",
  "predigy-strategy-internal-arb",
  "predigy-strategy-latency",
+ "predigy-strategy-news-trader",
  "predigy-strategy-settlement",
  "predigy-strategy-stat",
  "predigy-strategy-variance-fade",
@@ -1986,6 +1987,21 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-strategy-news-trader"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-core",
+ "predigy-engine-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

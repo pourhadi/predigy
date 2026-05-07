@@ -66,6 +66,10 @@ use predigy_strategy_variance_fade::{
     VarianceFadeConfig, VarianceFadeStrategy,
     config_file_from_env as variance_fade_config_from_env,
 };
+use predigy_strategy_news_trader::{
+    NewsTraderConfig, NewsTraderStrategy,
+    items_file_from_env as news_trader_items_from_env,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -532,6 +536,21 @@ async fn register_strategies(registry: &StrategyRegistry) {
             }))
             .await;
     }
+
+    // News-trader (S5): consumes pre-classified news items from
+    // an operator-managed JSONL. The classifier is a separate
+    // process (Claude/custom-ML/manual). Skip if the items file
+    // env var is unset.
+    use predigy_strategy_news_trader::STRATEGY_ID as NEWS_TRADER_ID;
+    if let Some(path) = news_trader_items_from_env() {
+        registry
+            .register(StrategyHandle::new(NEWS_TRADER_ID, move || {
+                Box::new(NewsTraderStrategy::new(NewsTraderConfig::from_env(
+                    path.clone(),
+                ))) as Box<dyn Strategy>
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -597,6 +616,15 @@ fn strategy_factory(
         );
         Box::new(move || {
             Box::new(VarianceFadeStrategy::new(VarianceFadeConfig::from_env(
+                path.clone(),
+            ))) as Box<dyn Strategy>
+        })
+    } else if id == predigy_strategy_news_trader::STRATEGY_ID {
+        let path = news_trader_items_from_env().expect(
+            "news-trader registered without an items-file path; engine startup invariant",
+        );
+        Box::new(move || {
+            Box::new(NewsTraderStrategy::new(NewsTraderConfig::from_env(
                 path.clone(),
             ))) as Box<dyn Strategy>
         })

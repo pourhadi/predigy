@@ -33,6 +33,7 @@ predigy-strategy-internal-arb = { workspace = true }
 predigy-strategy-implication-arb = { workspace = true }
 predigy-strategy-book-imbalance = { workspace = true }
 predigy-strategy-variance-fade = { workspace = true }
+predigy-strategy-news-trader = { workspace = true }
 uuid = { workspace = true }
 
 sqlx = { workspace = true }

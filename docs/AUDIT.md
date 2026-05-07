@@ -6,13 +6,12 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S4, S8, S9 all
-> shipped (see commits 57a28fc through this one). B1, B7 are
+> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S4, S5, S8, S9
+> all shipped (see commits 57a28fc through this one). B1, B7 are
 > operator-action items. B4 (FIX) + B5 (maker rebates) +
 > S7 (MM) + I1 (maker exec) gated on Kalshi access or $25K
-> capital. S5 (news-classifier) and S6 (third-venue cross-arb)
-> remain — both need new external feeds and operator decisions
-> about API providers.
+> capital. S6 (third-venue cross-arb) remains — needs new
+> Polymarket-class venue integration.
 
 ---
 
@@ -362,24 +361,74 @@ What S4 v1 deliberately doesn't do:
 - No book-depth aggregation (touch-only). Stack-of-stacks would
   improve robustness but doesn't fundamentally change the signal.
 
-### S5 — News-event semantic latency expansion (cost: L)
+### S5 — News-event semantic latency expansion (cost: L) **SHIPPED 2026-05-07** (foundation)
 
-Current `latency` strategy fires on NWS event-type substrings
-(`"Tornado"`, `"Heat Advisory"`). The signal pipeline is
-`NwsAlert → string-match → fire`.
+New `predigy-strategy-news-trader` (`STRATEGY_ID="news-trader"`)
+ships the foundation by **decoupling the classifier from the
+strategy**: any upstream pipeline that produces classified items
+(Claude, custom ML, paid news vendor, manual operator) can feed
+the strategy via a JSONL file.
 
-Extending to free-text news (Twitter, RSS, Bloomberg) needs a
-classifier: text → market-relevance label. Claude is the right
-tool. Architecture:
+Schema:
 
-- New ext-feeds module per source (twitter, rss, bloomberg).
-- A classifier service (or per-event Claude call) tags each
-  incoming item with `(market_ticker, side, expected_prob_shift)`.
-- `latency` consumes the classifier output as a new
-  `ExternalEvent::ClassifiedNews` variant.
+```json
+{"item_id": "twitter-1234", "ticker": "KX-XYZ",
+ "side": "yes", "action": "buy", "max_price_cents": 60,
+ "size": 5, "source": "twitter:@bigaccount",
+ "headline": "...", "classified_at": "...",
+ "confidence": 0.85}
+```
 
-Cost is real (Anthropic per-call); may be feasible only on
-high-impact-per-call sources.
+Mechanism:
+- Tick poll of the items file. New lines (relative to in-memory
+  `seen` set) get processed once each.
+- `item_id` is the dedup key end-to-end; OMS layer also dedupes
+  on cid so the system is doubly idempotent across restarts.
+- Items below `min_confidence` skipped; items with
+  `max_price_cents` outside `[min_take_ask, max_take_ask]`
+  skipped.
+- IOC limit at `max_price_cents` for `size` contracts on
+  `(ticker, side)`.
+
+Why decouple the classifier:
+- The operator can iterate on classifier choices (Claude prompt
+  tuning, model selection, paid-vendor evaluation) without
+  touching the engine.
+- Multiple classifiers can write to the same JSONL — the
+  strategy is the single integration point.
+- Manual fallback: when the classifier service is down, the
+  operator can append items by hand for high-confidence breaking
+  news.
+- No Anthropic SDK dependency in the engine binary; the engine
+  stays focused on order-management.
+
+Operational:
+- `PREDIGY_NEWS_TRADER_ITEMS_FILE` (path) — required.
+- `PREDIGY_NEWS_TRADER_MIN_CONFIDENCE` (default 0.0).
+- `PREDIGY_NEWS_TRADER_MIN_TAKE_ASK_CENTS` / `_MAX_..._CENTS`
+  / `_REFRESH_MS` — tunables.
+
+Tests (8 unit, all passing):
+- drain returns new items, skips ones already seen
+- drain dedupes across re-reads of the same file
+- drain skips malformed JSON lines (logs warn, continues)
+- drain handles blank lines + `#` comments
+- build_intent passes a clean item (correct side, action, qty,
+  price, IOC TIF, cid)
+- build_intent skips items below min_confidence
+- build_intent skips items with price outside take-floor
+- build_intent skips items with unrecognized action string
+- item_id is preserved (truncated at 20 chars) in the cid for
+  operator greppability; cid_safe_ticker still strips periods
+
+Follow-ups (not blocking S5 deployment):
+- Concrete classifier services per source (`scripts/news_classifier_rss.py`,
+  `scripts/news_classifier_twitter.py`) that produce JSONL into
+  the watched file. Operator-pluggable; not required to live in
+  the engine.
+- Engine-side news cost accounting (LLM-call $/day) — out of
+  scope for the strategy; lives in the classifier service when
+  it's added.
 
 ### S6 — Cross-arb expansion to other venues (cost: L)
 
