@@ -53,11 +53,21 @@ export PREDIGY_ENGINE_AUTO_MIGRATE="${PREDIGY_ENGINE_AUTO_MIGRATE:-true}"
 # the engine in one click.
 export PREDIGY_KILL_SWITCH_FILE="${PREDIGY_KILL_SWITCH_FILE:-${CONFIG_DIR}/kill-switch.flag}"
 
-# Plumb optional latency / cross-arb settings if set.
+# Plumb optional strategy settings if set. The engine binary
+# uses these to gate strategy registration; missing env =
+# strategy not registered.
 [ -n "${PREDIGY_LATENCY_RULE_FILE:-}" ] && export PREDIGY_LATENCY_RULE_FILE
 [ -n "${PREDIGY_CROSS_ARB_PAIR_FILE:-}" ] && export PREDIGY_CROSS_ARB_PAIR_FILE
 [ -n "${PREDIGY_NWS_USER_AGENT:-}" ] && export PREDIGY_NWS_USER_AGENT
 [ -n "${PREDIGY_NWS_STATES:-}" ] && export PREDIGY_NWS_STATES
+# Audit S2 / S3 / S4 / S5 / S8 / S9 — six new strategy config
+# vars (each gates its own strategy registration).
+[ -n "${PREDIGY_WX_STAT_RULE_FILE:-}" ] && export PREDIGY_WX_STAT_RULE_FILE
+[ -n "${PREDIGY_INTERNAL_ARB_CONFIG:-}" ] && export PREDIGY_INTERNAL_ARB_CONFIG
+[ -n "${PREDIGY_IMPLICATION_ARB_CONFIG:-}" ] && export PREDIGY_IMPLICATION_ARB_CONFIG
+[ -n "${PREDIGY_BOOK_IMBALANCE_CONFIG:-}" ] && export PREDIGY_BOOK_IMBALANCE_CONFIG
+[ -n "${PREDIGY_VARIANCE_FADE_CONFIG:-}" ] && export PREDIGY_VARIANCE_FADE_CONFIG
+[ -n "${PREDIGY_NEWS_TRADER_ITEMS_FILE:-}" ] && export PREDIGY_NEWS_TRADER_ITEMS_FILE
 
 cd "$PREDIGY_HOME"
 

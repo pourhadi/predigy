@@ -361,11 +361,15 @@ async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()
             };
             fan_out(&state.subs, &market, &book_clone).await;
         }
-        MdEvent::Delta { sid, delta } => {
-            let Some(market) = state.sid_to_ticker.get(&sid).cloned() else {
-                debug!(sid, "router: delta for unknown sid; skipping");
-                return Ok(());
-            };
+        MdEvent::Delta { sid: _, delta } => {
+            // Route by `delta.market` (from the wire body), NOT
+            // by sid. Kalshi multiplexes multiple tickers under
+            // one subscription id; `sid_to_ticker` only stores
+            // ONE ticker per sid (last-write-wins) so it routes
+            // every delta to that one ticker's book and rejects
+            // the rest as `WrongMarket`. The wire body's
+            // `market_ticker` is authoritative.
+            let market = delta.market.clone();
             let outcome_clone = {
                 let book = state
                     .books

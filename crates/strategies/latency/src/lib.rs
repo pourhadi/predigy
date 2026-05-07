@@ -319,10 +319,19 @@ impl LatencyStrategy {
             // Idempotency: alert.id is unique per NWS alert; using
             // it in client_id means a duplicate fan-out (alert
             // edited by NWS) collapses cleanly via the OMS.
+            //
+            // NWS alert ids are URN-format with periods + colons
+            // (e.g. `urn:oid:2.49.0.1.840.0.13fe...`). Kalshi V2
+            // rejects cids with `.`; the existing `cid_safe_ticker`
+            // strips periods, but it's only applied to the ticker
+            // portion. Apply it to alert_short too — and any other
+            // forbidden chars get replaced with hyphens to be
+            // defensive.
+            let alert_short_raw: String = alert.id.chars().take(20).collect();
+            let alert_short = cid_safe_ticker(&alert_short_raw);
             let client_id = format!(
                 "latency:{ticker}:{alert_short}:{idx}",
                 ticker = cid_safe_ticker(&rule.kalshi_market),
-                alert_short = alert.id.chars().take(20).collect::<String>(),
             );
             let intent = Intent {
                 client_id,
