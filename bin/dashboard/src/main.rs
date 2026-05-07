@@ -1183,15 +1183,24 @@ async fn serve_eval_summary(
         .db
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no DB pool".into()))?;
-    let win = parse_window(q.since.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let win = parse_window(q.since.as_deref()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let db = predigy_engine_core::Db::from_pool(pool.clone());
     let trades = predigy_eval_lib::load_trades(&db, win, None)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_trades: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load_trades: {e}"),
+            )
+        })?;
     let activity = predigy_eval_lib::ledger::load_intent_activity(&db, win, None)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_intent_activity: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load_intent_activity: {e}"),
+            )
+        })?;
     let metrics = predigy_eval_lib::compute_metrics(&trades, &activity, win.start, win.end);
     let mut diagnoses: HashMap<String, Vec<predigy_eval_lib::Diagnosis>> = HashMap::new();
     for (s, m) in &metrics {
@@ -1213,12 +1222,16 @@ async fn serve_eval_ledger(
         .db
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no DB pool".into()))?;
-    let win = parse_window(q.since.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let win = parse_window(q.since.as_deref()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let db = predigy_engine_core::Db::from_pool(pool.clone());
     let trades = predigy_eval_lib::load_trades(&db, win, Some(&strategy))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_trades: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load_trades: {e}"),
+            )
+        })?;
     Ok(Json(serde_json::json!({ "trades": trades })))
 }
 
@@ -1231,18 +1244,29 @@ async fn serve_eval_diagnose(
         .db
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no DB pool".into()))?;
-    let win = parse_window(q.since.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let win = parse_window(q.since.as_deref()).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let db = predigy_engine_core::Db::from_pool(pool.clone());
     let trades = predigy_eval_lib::load_trades(&db, win, Some(&strategy))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_trades: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load_trades: {e}"),
+            )
+        })?;
     let activity = predigy_eval_lib::ledger::load_intent_activity(&db, win, Some(&strategy))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_intent_activity: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("load_intent_activity: {e}"),
+            )
+        })?;
     let metrics = predigy_eval_lib::compute_metrics(&trades, &activity, win.start, win.end);
     let m = metrics.get(&strategy);
-    let diags = m.map(|m| predigy_eval_lib::diagnose(m, &trades)).unwrap_or_default();
+    let diags = m
+        .map(|m| predigy_eval_lib::diagnose(m, &trades))
+        .unwrap_or_default();
     Ok(Json(serde_json::json!({
         "strategy": strategy,
         "metrics": m,

@@ -47,7 +47,8 @@ impl Trade {
     /// returns `None` since gross PnL isn't realized yet.
     #[must_use]
     pub fn net_pnl_cents(&self) -> Option<i64> {
-        self.closed_at.map(|_| self.realized_pnl_cents - self.fees_paid_cents)
+        self.closed_at
+            .map(|_| self.realized_pnl_cents - self.fees_paid_cents)
     }
 
     #[must_use]
@@ -177,7 +178,10 @@ mod tests {
 
     #[test]
     fn parses_take_profit() {
-        assert_eq!(ExitReason::parse_reason("stat-exit:KX:Y:tp:01abc"), ExitReason::TakeProfit);
+        assert_eq!(
+            ExitReason::parse_reason("stat-exit:KX:Y:tp:01abc"),
+            ExitReason::TakeProfit
+        );
     }
 
     #[test]

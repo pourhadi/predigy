@@ -45,30 +45,28 @@ use predigy_engine_core::oms::KillSwitchView;
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use predigy_kalshi_rest::{Client as RestClient, Signer};
-use predigy_strategy_cross_arb::{CrossArbConfig, CrossArbStrategy};
-use predigy_strategy_latency::LatencyStrategy;
-use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
-use predigy_strategy_stat::{StatConfig, StatStrategy};
-use predigy_strategy_wx_stat::{WxStatConfig, WxStatStrategy, rule_file_from_env as wx_stat_rule_file_from_env};
-use predigy_strategy_internal_arb::{
-    InternalArbConfig, InternalArbStrategy,
-    config_file_from_env as internal_arb_config_from_env,
+use predigy_strategy_book_imbalance::{
+    ImbalanceConfig, ImbalanceStrategy, config_file_from_env as book_imbalance_config_from_env,
 };
+use predigy_strategy_cross_arb::{CrossArbConfig, CrossArbStrategy};
 use predigy_strategy_implication_arb::{
     ImplicationArbConfig, ImplicationArbStrategy,
     config_file_from_env as implication_arb_config_from_env,
 };
-use predigy_strategy_book_imbalance::{
-    ImbalanceConfig, ImbalanceStrategy,
-    config_file_from_env as book_imbalance_config_from_env,
+use predigy_strategy_internal_arb::{
+    InternalArbConfig, InternalArbStrategy, config_file_from_env as internal_arb_config_from_env,
 };
-use predigy_strategy_variance_fade::{
-    VarianceFadeConfig, VarianceFadeStrategy,
-    config_file_from_env as variance_fade_config_from_env,
-};
+use predigy_strategy_latency::LatencyStrategy;
 use predigy_strategy_news_trader::{
-    NewsTraderConfig, NewsTraderStrategy,
-    items_file_from_env as news_trader_items_from_env,
+    NewsTraderConfig, NewsTraderStrategy, items_file_from_env as news_trader_items_from_env,
+};
+use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
+use predigy_strategy_stat::{StatConfig, StatStrategy};
+use predigy_strategy_variance_fade::{
+    VarianceFadeConfig, VarianceFadeStrategy, config_file_from_env as variance_fade_config_from_env,
+};
+use predigy_strategy_wx_stat::{
+    WxStatConfig, WxStatStrategy, rule_file_from_env as wx_stat_rule_file_from_env,
 };
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
@@ -289,11 +287,13 @@ async fn main() -> Result<()> {
     // event_tx so the dispatcher can route AddTickers commands
     // back to the right queue.
     drop(self_sub_tx);
-    let strategy_event_txs: HashMap<StrategyId, tokio::sync::mpsc::Sender<predigy_engine_core::events::Event>> =
-        supervisors
-            .iter()
-            .map(|s| (s.id, s.event_tx.clone()))
-            .collect();
+    let strategy_event_txs: HashMap<
+        StrategyId,
+        tokio::sync::mpsc::Sender<predigy_engine_core::events::Event>,
+    > = supervisors
+        .iter()
+        .map(|s| (s.id, s.event_tx.clone()))
+        .collect();
     let self_sub_dispatcher =
         SelfSubscribeDispatcher::start(self_sub_rx, router.command_tx(), strategy_event_txs);
 
@@ -487,7 +487,8 @@ async fn register_strategies(registry: &StrategyRegistry) {
     if let Some(path) = wx_stat_rule_file_from_env() {
         registry
             .register(StrategyHandle::new(WX_STAT_ID, move || {
-                Box::new(WxStatStrategy::new(WxStatConfig::from_env(path.clone()))) as Box<dyn Strategy>
+                Box::new(WxStatStrategy::new(WxStatConfig::from_env(path.clone())))
+                    as Box<dyn Strategy>
             }))
             .await;
     }
@@ -499,7 +500,9 @@ async fn register_strategies(registry: &StrategyRegistry) {
     if let Some(path) = internal_arb_config_from_env() {
         registry
             .register(StrategyHandle::new(INTERNAL_ARB_ID, move || {
-                Box::new(InternalArbStrategy::new(InternalArbConfig::from_env(path.clone()))) as Box<dyn Strategy>
+                Box::new(InternalArbStrategy::new(InternalArbConfig::from_env(
+                    path.clone(),
+                ))) as Box<dyn Strategy>
             }))
             .await;
     }
@@ -510,9 +513,9 @@ async fn register_strategies(registry: &StrategyRegistry) {
     if let Some(path) = implication_arb_config_from_env() {
         registry
             .register(StrategyHandle::new(IMPL_ARB_ID, move || {
-                Box::new(ImplicationArbStrategy::new(
-                    ImplicationArbConfig::from_env(path.clone()),
-                )) as Box<dyn Strategy>
+                Box::new(ImplicationArbStrategy::new(ImplicationArbConfig::from_env(
+                    path.clone(),
+                ))) as Box<dyn Strategy>
             }))
             .await;
     }
@@ -590,9 +593,8 @@ fn strategy_factory(
             Box::new(WxStatStrategy::new(WxStatConfig::from_env(path.clone()))) as Box<dyn Strategy>
         })
     } else if id == predigy_strategy_internal_arb::STRATEGY_ID {
-        let path = internal_arb_config_from_env().expect(
-            "internal-arb registered without a config-file path; engine startup invariant",
-        );
+        let path = internal_arb_config_from_env()
+            .expect("internal-arb registered without a config-file path; engine startup invariant");
         Box::new(move || {
             Box::new(InternalArbStrategy::new(InternalArbConfig::from_env(
                 path.clone(),
@@ -603,9 +605,9 @@ fn strategy_factory(
             "implication-arb registered without a config-file path; engine startup invariant",
         );
         Box::new(move || {
-            Box::new(ImplicationArbStrategy::new(
-                ImplicationArbConfig::from_env(path.clone()),
-            )) as Box<dyn Strategy>
+            Box::new(ImplicationArbStrategy::new(ImplicationArbConfig::from_env(
+                path.clone(),
+            ))) as Box<dyn Strategy>
         })
     } else if id == predigy_strategy_book_imbalance::STRATEGY_ID {
         let path = book_imbalance_config_from_env().expect(
@@ -626,9 +628,8 @@ fn strategy_factory(
             ))) as Box<dyn Strategy>
         })
     } else if id == predigy_strategy_news_trader::STRATEGY_ID {
-        let path = news_trader_items_from_env().expect(
-            "news-trader registered without an items-file path; engine startup invariant",
-        );
+        let path = news_trader_items_from_env()
+            .expect("news-trader registered without an items-file path; engine startup invariant");
         Box::new(move || {
             Box::new(NewsTraderStrategy::new(NewsTraderConfig::from_env(
                 path.clone(),

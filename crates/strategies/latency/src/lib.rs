@@ -445,10 +445,12 @@ impl LatencyStrategy {
                 }
             });
 
-            let tier3_active = self.config.max_hold_secs > 0 && age_secs >= self.config.max_hold_secs;
+            let tier3_active =
+                self.config.max_hold_secs > 0 && age_secs >= self.config.max_hold_secs;
             let tier2_active = self.config.tier2_secs > 0 && age_secs >= self.config.tier2_secs;
-            let tier1_active =
-                self.config.tier1_secs > 0 && age_secs >= self.config.tier1_secs && pnl_per.unwrap_or(0) > 0;
+            let tier1_active = self.config.tier1_secs > 0
+                && age_secs >= self.config.tier1_secs
+                && pnl_per.unwrap_or(0) > 0;
 
             let (tier_tag, limit_cents) = if tier3_active {
                 ("t3", self.config.force_flat_floor_cents.clamp(1, 99))

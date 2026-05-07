@@ -235,7 +235,12 @@ impl ImbalanceStrategy {
         self.last_config_refresh = Some(Instant::now());
     }
 
-    fn evaluate(&mut self, market: &MarketTicker, book: &OrderBook, now: Instant) -> Option<Intent> {
+    fn evaluate(
+        &mut self,
+        market: &MarketTicker,
+        book: &OrderBook,
+        now: Instant,
+    ) -> Option<Intent> {
         let key = market.as_str().to_string();
         let entry = self.markets.get(&key)?;
         let threshold = entry.threshold;
@@ -271,8 +276,7 @@ impl ImbalanceStrategy {
             Side::No => yes_bid?.0.cents(),
         };
         let ask_cents = 100u8.checked_sub(opposite_bid_cents)?;
-        if ask_cents < self.config.min_take_ask_cents
-            || ask_cents > self.config.max_take_ask_cents
+        if ask_cents < self.config.min_take_ask_cents || ask_cents > self.config.max_take_ask_cents
         {
             debug!(
                 ticker = %key,
@@ -471,7 +475,10 @@ mod tests {
         s.reload_markets();
         // Balanced 50/50.
         let book = book_with_stacks(40, 50, 50, 50);
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -483,7 +490,10 @@ mod tests {
         s.reload_markets();
         // Tiny stacks: 5 vs 1 → high ratio but tiny total (6 < 50).
         let book = book_with_stacks(40, 5, 50, 1);
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -495,7 +505,10 @@ mod tests {
         s.reload_markets();
         let book = book_with_stacks(40, 100, 50, 5);
         // Different ticker.
-        assert!(s.evaluate(&MarketTicker::new("KX-OTHER"), &book, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-OTHER"), &book, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -524,7 +537,10 @@ mod tests {
         // would be 95. Make NO dominant so we buy YES at
         // 100 - no_bid. With no_bid 5, yes_ask = 95 → above 90.
         let book = book_with_stacks(2, 5, 5, 100);
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -546,11 +562,17 @@ mod tests {
         // threshold.)
         let book = book_with_stacks(40, 60, 50, 30);
         // EASY threshold 0.4 — 0.333 still below; no fire.
-        assert!(s.evaluate(&MarketTicker::new("KX-EASY"), &book, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-EASY"), &book, Instant::now())
+                .is_none()
+        );
         // Now imbalance = (80 - 20)/100 = 0.6. Easy at 0.4 fires;
         // strict at 0.95 doesn't.
         let book2 = book_with_stacks(40, 80, 50, 20);
-        assert!(s.evaluate(&MarketTicker::new("KX-EASY"), &book2, Instant::now()).is_some());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-EASY"), &book2, Instant::now())
+                .is_some()
+        );
         // Reset cooldown by waiting on STRICT.
         let book3 = book_with_stacks(40, 80, 50, 20);
         assert!(

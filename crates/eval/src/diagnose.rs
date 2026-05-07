@@ -66,7 +66,8 @@ pub fn diagnose(metrics: &StrategyMetrics, trades: &[Trade]) -> Vec<Diagnosis> {
             out.push(d);
         }
     }
-    out.sort_by(|a, b| b.severity.cmp(&a.severity));
+    // Critical first, then Warn, then Info — descending severity.
+    out.sort_by_key(|d| std::cmp::Reverse(d.severity));
     out
 }
 
@@ -86,10 +87,7 @@ const RULES: &[Rule] = &[
 
 const MIN_SAMPLE_FOR_CONFIDENCE: u64 = 30;
 
-fn rule_d1_unprofitable_over_sample(
-    m: &StrategyMetrics,
-    _t: &[Trade],
-) -> Option<Diagnosis> {
+fn rule_d1_unprofitable_over_sample(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagnosis> {
     if m.n_trades_closed < MIN_SAMPLE_FOR_CONFIDENCE {
         return None;
     }
@@ -146,10 +144,7 @@ fn rule_d1_unprofitable_over_sample(
     })
 }
 
-fn rule_d2_negative_expectancy(
-    m: &StrategyMetrics,
-    _t: &[Trade],
-) -> Option<Diagnosis> {
+fn rule_d2_negative_expectancy(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagnosis> {
     if m.n_trades_closed < 10 {
         return None;
     }
@@ -185,7 +180,8 @@ fn rule_d2_negative_expectancy(
             },
             current_value: serde_json::json!("(operator: current min_edge_cents)"),
             proposed_value: serde_json::json!(proposed_min_edge),
-            rationale: "Tightening the entry edge filter biases toward higher-expectancy fires.".into(),
+            rationale: "Tightening the entry edge filter biases toward higher-expectancy fires."
+                .into(),
             confidence: Confidence::Medium,
         }],
     })
@@ -243,7 +239,11 @@ fn rule_d4_stop_loss_dominant(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagn
     if m.n_trades_closed < 10 {
         return None;
     }
-    let n_sl = m.exits_by_reason.get(&ExitReason::StopLoss).copied().unwrap_or(0);
+    let n_sl = m
+        .exits_by_reason
+        .get(&ExitReason::StopLoss)
+        .copied()
+        .unwrap_or(0);
     let ratio = n_sl as f64 / m.n_trades_closed as f64;
     if ratio < 0.5 {
         return None;
@@ -266,20 +266,18 @@ fn rule_d4_stop_loss_dominant(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagn
             "n_total_closed": m.n_trades_closed,
             "exits_by_reason": &m.exits_by_reason,
         }),
-        recommendations: vec![
-            Recommendation {
-                strategy: m.strategy.clone(),
-                action: ActionKind::Investigate {
-                    what: "Tighten entry edge OR widen stop-loss; pick based on \
+        recommendations: vec![Recommendation {
+            strategy: m.strategy.clone(),
+            action: ActionKind::Investigate {
+                what: "Tighten entry edge OR widen stop-loss; pick based on \
                            whether edge or noise is the binding constraint."
-                        .into(),
-                },
-                current_value: serde_json::json!(null),
-                proposed_value: serde_json::json!(null),
-                rationale: "Direction is data-dependent — operator judgment".into(),
-                confidence: Confidence::Low,
+                    .into(),
             },
-        ],
+            current_value: serde_json::json!(null),
+            proposed_value: serde_json::json!(null),
+            rationale: "Direction is data-dependent — operator judgment".into(),
+            confidence: Confidence::Low,
+        }],
     })
 }
 
@@ -354,7 +352,9 @@ fn rule_d6_exits_not_firing(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagnos
             },
             current_value: serde_json::json!(null),
             proposed_value: serde_json::json!(null),
-            rationale: "Hold-time outliers usually indicate a stuck position the strategy can't close.".into(),
+            rationale:
+                "Hold-time outliers usually indicate a stuck position the strategy can't close."
+                    .into(),
             confidence: Confidence::Medium,
         }],
     })
@@ -363,9 +363,7 @@ fn rule_d6_exits_not_firing(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagnos
 const SLIPPAGE_THRESHOLD_CENTS: f64 = 1.5;
 
 fn rule_d7_slippage_high(m: &StrategyMetrics, _t: &[Trade]) -> Option<Diagnosis> {
-    let Some(slip) = m.avg_slippage_cents else {
-        return None;
-    };
+    let slip = m.avg_slippage_cents?;
     if slip < SLIPPAGE_THRESHOLD_CENTS {
         return None;
     }

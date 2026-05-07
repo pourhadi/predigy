@@ -59,9 +59,7 @@ use async_trait::async_trait;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 use predigy_engine_core::events::Event;
-use predigy_engine_core::intent::{
-    Intent, IntentAction, OrderType, Tif, cid_safe_ticker,
-};
+use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use serde::{Deserialize, Serialize};

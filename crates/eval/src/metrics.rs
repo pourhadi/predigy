@@ -83,7 +83,13 @@ pub fn compute_metrics(
 
     let mut out = HashMap::with_capacity(by_strategy.len());
     for (strategy, ts) in by_strategy {
-        let m = compute_one(&strategy, &ts, activity.get(&strategy), window_start, window_end);
+        let m = compute_one(
+            &strategy,
+            &ts,
+            activity.get(&strategy),
+            window_start,
+            window_end,
+        );
         out.insert(strategy, m);
     }
     out
@@ -121,7 +127,11 @@ fn compute_one(
     let max_loss = losers.iter().copied().min().unwrap_or(0);
     let expectancy = mean(&pnl_per_trade);
     let stddev = stddev(&pnl_per_trade);
-    let sharpe = if stddev > 0.0 { expectancy / stddev } else { 0.0 };
+    let sharpe = if stddev > 0.0 {
+        expectancy / stddev
+    } else {
+        0.0
+    };
 
     // Edge analysis. We compare per-contract intended edge to
     // per-contract realized PnL on closed trades. Closed-trade

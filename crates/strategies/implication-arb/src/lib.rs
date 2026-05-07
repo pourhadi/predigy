@@ -237,7 +237,11 @@ impl ImplicationArbStrategy {
                 child: p.child,
             });
         }
-        info!(n_pairs = pairs.len(), n_tickers = idx.len(), "implication-arb: config loaded");
+        info!(
+            n_pairs = pairs.len(),
+            n_tickers = idx.len(),
+            "implication-arb: config loaded"
+        );
         self.pairs = pairs;
         self.ticker_to_pairs = idx;
         self.last_config_refresh = Some(Instant::now());
@@ -302,8 +306,8 @@ impl ImplicationArbStrategy {
         let no_child_price = predigy_core::price::Price::from_cents(no_child_ask).ok()?;
         let parent_fee =
             i32::try_from(predigy_core::fees::taker_fee(parent_price, probe)).unwrap_or(i32::MAX);
-        let child_fee = i32::try_from(predigy_core::fees::taker_fee(no_child_price, probe))
-            .unwrap_or(i32::MAX);
+        let child_fee =
+            i32::try_from(predigy_core::fees::taker_fee(no_child_price, probe)).unwrap_or(i32::MAX);
         let size_i32 = i32::try_from(self.config.size).unwrap_or(0);
         if size_i32 == 0 {
             return None;
@@ -411,12 +415,7 @@ impl Strategy for ImplicationArbStrategy {
         let mut tickers: Vec<MarketTicker> = parsed
             .pairs
             .iter()
-            .flat_map(|p| {
-                [
-                    MarketTicker::new(&p.parent),
-                    MarketTicker::new(&p.child),
-                ]
-            })
+            .flat_map(|p| [MarketTicker::new(&p.parent), MarketTicker::new(&p.child)])
             .collect();
         tickers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         tickers.dedup_by(|a, b| a.as_str() == b.as_str());

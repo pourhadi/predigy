@@ -89,10 +89,7 @@ impl StrategyState {
     /// by the engine binary when constructing per-supervisor
     /// states.
     #[must_use]
-    pub fn with_self_subscribe_tx(
-        mut self,
-        tx: mpsc::Sender<SelfSubscribeRequest>,
-    ) -> Self {
+    pub fn with_self_subscribe_tx(mut self, tx: mpsc::Sender<SelfSubscribeRequest>) -> Self {
         self.self_subscribe_tx = Some(tx);
         self
     }

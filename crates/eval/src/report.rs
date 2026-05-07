@@ -31,13 +31,19 @@ pub fn render_markdown_report(
 
     // Top-level summary table.
     out.push_str("## Summary\n\n");
-    out.push_str("| Strategy | Closed | Win% | Net PnL | Gross | Fees | Expectancy | Sharpe | Diagnoses |\n");
+    out.push_str(
+        "| Strategy | Closed | Win% | Net PnL | Gross | Fees | Expectancy | Sharpe | Diagnoses |\n",
+    );
     out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
     for s in &strategies {
         let m = &metrics[*s];
         let critical_count = diagnoses
             .get(*s)
-            .map(|ds| ds.iter().filter(|d| d.severity == Severity::Critical).count())
+            .map(|ds| {
+                ds.iter()
+                    .filter(|d| d.severity == Severity::Critical)
+                    .count()
+            })
             .unwrap_or(0);
         let warn_count = diagnoses
             .get(*s)
@@ -86,8 +92,11 @@ fn render_strategy_section(out: &mut String, m: &StrategyMetrics, ds: Option<&Ve
     let _ = writeln!(out, "## `{}`", m.strategy);
     out.push('\n');
 
-    let _ = writeln!(out, "**PnL** — gross {}¢, fees {}¢, net **{:+}¢**.",
-        m.gross_pnl_cents, m.fees_paid_cents, m.net_pnl_cents);
+    let _ = writeln!(
+        out,
+        "**PnL** — gross {}¢, fees {}¢, net **{:+}¢**.",
+        m.gross_pnl_cents, m.fees_paid_cents, m.net_pnl_cents
+    );
     let _ = writeln!(
         out,
         "**Trades** — {} closed, {} open, win rate {:.1}% ({} W / {} L / {} BE).",
@@ -137,7 +146,8 @@ fn render_strategy_section(out: &mut String, m: &StrategyMetrics, ds: Option<&Ve
 
     if !m.exits_by_reason.is_empty() {
         out.push_str("\n**Exit-reason mix** — ");
-        let mut entries: Vec<(&crate::types::ExitReason, &u64)> = m.exits_by_reason.iter().collect();
+        let mut entries: Vec<(&crate::types::ExitReason, &u64)> =
+            m.exits_by_reason.iter().collect();
         entries.sort_by(|a, b| b.1.cmp(a.1));
         let total: u64 = m.exits_by_reason.values().sum();
         let parts: Vec<String> = entries
@@ -193,13 +203,25 @@ fn format_action(a: &crate::recommend::ActionKind) -> String {
         AddTrailingStop { trigger, distance } => {
             format!("Enable trailing stop (trigger={trigger}¢, distance={distance}¢)")
         }
-        LowerThreshold { which, current, proposed } => {
+        LowerThreshold {
+            which,
+            current,
+            proposed,
+        } => {
             format!("Lower {which} from {current:.2} → {proposed:.2}")
         }
-        RaiseThreshold { which, current, proposed } => {
+        RaiseThreshold {
+            which,
+            current,
+            proposed,
+        } => {
             format!("Raise {which} from {current:.2} → {proposed:.2}")
         }
-        RaiseRiskCap { which, current, proposed } => {
+        RaiseRiskCap {
+            which,
+            current,
+            proposed,
+        } => {
             format!("Raise {which} from {current} → {proposed}")
         }
         DisableStrategy { reason } => format!("Disable strategy ({reason})"),

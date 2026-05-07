@@ -40,8 +40,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Apply migrations to predigy_test
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d predigy_test \
-            -v ON_ERROR_STOP=1 -f migrations/0001_initial.sql
+          for migration in migrations/*.sql; do
+            echo "applying $migration"
+            PGPASSWORD=postgres psql -h localhost -U postgres -d predigy_test \
+              -v ON_ERROR_STOP=1 -f "$migration"
+          done
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked

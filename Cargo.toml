@@ -107,6 +107,28 @@ too_many_lines = "allow"
 needless_continue = "allow"
 trivially_copy_pass_by_ref = "allow"
 elidable_lifetime_names = "allow"
+# Pedantic lints we treat as stylistic rather than correctness:
+#   cast_precision_loss — cents → f64 for percentages is fine
+#   enum_glob_use       — `use Action::*;` inside a function is clearer
+#   doc_lazy_continuation / doc_overindented_list_items — rustdoc cosmetics
+#   float_cmp           — explicit equality on integer-derived f64s is fine
+#   redundant_closure   — sometimes the closure form is clearer
+#   useless_vec         — `vec!` in tests / one-shot lists is fine
+#   unwrap_or_default   — `.unwrap_or(0)` is more explicit
+#   if_same_then_else   — sometimes branches share intent but should stay distinct
+cast_precision_loss = "allow"
+enum_glob_use = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+float_cmp = "allow"
+redundant_closure = "allow"
+useless_vec = "allow"
+unwrap_or_default = "allow"
+if_same_then_else = "allow"
+# Allowing this avoids polluting public-API signatures with `<S = RandomState>`
+# generic parameters. Operator-facing libraries here aren't going to be
+# called with a non-default hasher.
+implicit_hasher = "allow"
 manual_div_ceil = "allow"
 useless_let_if_seq = "allow"
 needless_lifetimes = "allow"

@@ -110,10 +110,7 @@ pub async fn load_trades(
 ///
 /// This is a per-trade lookup; we batch by `(strategy, ticker)`
 /// to keep queries linear.
-async fn enrich_with_intents(
-    pool: &sqlx::PgPool,
-    trades: &mut [Trade],
-) -> Result<(), sqlx::Error> {
+async fn enrich_with_intents(pool: &sqlx::PgPool, trades: &mut [Trade]) -> Result<(), sqlx::Error> {
     for t in trades.iter_mut() {
         // Entry intent: earliest matching the position's open.
         let entry: Option<(i32, Option<String>, Option<uuid::Uuid>)> = sqlx::query_as(
@@ -183,10 +180,7 @@ async fn enrich_with_intents(
     Ok(())
 }
 
-async fn enrich_with_fills(
-    pool: &sqlx::PgPool,
-    trades: &mut [Trade],
-) -> Result<(), sqlx::Error> {
+async fn enrich_with_fills(pool: &sqlx::PgPool, trades: &mut [Trade]) -> Result<(), sqlx::Error> {
     for t in trades.iter_mut() {
         let row: (i64,) = sqlx::query_as(
             r"
@@ -257,7 +251,8 @@ pub async fn load_intent_activity(
     .fetch_all(pool)
     .await?;
 
-    let mut out: std::collections::HashMap<String, IntentActivity> = std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<String, IntentActivity> =
+        std::collections::HashMap::new();
     for row in rows {
         let strategy: String = row.get("strategy");
         let status: String = row.get("status");

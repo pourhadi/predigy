@@ -250,7 +250,11 @@ impl InternalArbStrategy {
                 extra_fee_padding_cents: f.extra_fee_padding_cents,
             });
         }
-        info!(n_families = families.len(), n_tickers = idx.len(), "internal-arb: config loaded");
+        info!(
+            n_families = families.len(),
+            n_tickers = idx.len(),
+            "internal-arb: config loaded"
+        );
         self.families = families;
         self.ticker_to_families = idx;
         self.last_config_refresh = Some(Instant::now());
@@ -288,9 +292,7 @@ impl InternalArbStrategy {
         let mut min_qty: u32 = u32::MAX;
         let mut leg_asks: Vec<(String, u8)> = Vec::with_capacity(family.tickers.len());
         for t in &family.tickers {
-            let Some(&ask_cents) = self.yes_ask_cents.get(t) else {
-                return None;
-            };
+            let &ask_cents = self.yes_ask_cents.get(t)?;
             let qty = *self.yes_ask_qty.get(t).unwrap_or(&0);
             if qty == 0 {
                 return None;
@@ -305,22 +307,22 @@ impl InternalArbStrategy {
         for (_, ask_cents) in &leg_asks {
             let probe = predigy_core::price::Qty::new(self.config.size).ok()?;
             let p = predigy_core::price::Price::from_cents(*ask_cents).ok()?;
-            total_taker_fee += i32::try_from(predigy_core::fees::taker_fee(p, probe))
-                .unwrap_or(i32::MAX);
+            total_taker_fee +=
+                i32::try_from(predigy_core::fees::taker_fee(p, probe)).unwrap_or(i32::MAX);
         }
         // The arb condition: total_ask + total_fee + min_edge ≤ 100¢ (net of
         // size — fees are already per-1-contract above).
         // Per-contract net cost = total_ask + total_fee/size + total_pad/size
         // For size 1, the inequality simplifies; for size > 1, fees scale
         // linearly so this still holds:
-        let per_unit_cost = total_ask + (total_taker_fee / self.config.size as i32)
+        let per_unit_cost = total_ask
+            + (total_taker_fee / self.config.size as i32)
             + (total_fee_pad / self.config.size as i32);
         let edge_cents = 100 - per_unit_cost;
         if edge_cents < self.config.min_edge_cents {
             debug!(
                 family = family.family_id,
-                total_ask, total_taker_fee, edge_cents,
-                "internal-arb: edge below threshold"
+                total_ask, total_taker_fee, edge_cents, "internal-arb: edge below threshold"
             );
             return None;
         }
@@ -415,7 +417,11 @@ impl Strategy for InternalArbStrategy {
             Event::BookUpdate { market, book } => {
                 self.record_book(market, book);
                 let key = market.as_str().to_string();
-                let candidate_indexes = self.ticker_to_families.get(&key).cloned().unwrap_or_default();
+                let candidate_indexes = self
+                    .ticker_to_families
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_default();
                 let now = Instant::now();
                 for idx in candidate_indexes {
                     if let Some(group) = self.evaluate_family(idx, now) {

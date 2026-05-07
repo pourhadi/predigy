@@ -21,17 +21,50 @@ pub struct Recommendation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ActionKind {
-    RaiseMinEdge { current: i32, proposed: i32 },
-    LowerMinEdge { current: i32, proposed: i32 },
-    TightenStopLoss { current: i32, proposed: i32 },
-    WidenStopLoss { current: i32, proposed: i32 },
-    AddTrailingStop { trigger: i32, distance: i32 },
-    LowerThreshold { which: String, current: f64, proposed: f64 },
-    RaiseThreshold { which: String, current: f64, proposed: f64 },
-    RaiseRiskCap { which: String, current: i64, proposed: i64 },
-    DisableStrategy { reason: String },
-    EnableStrategy { reason: String },
-    Investigate { what: String },
+    RaiseMinEdge {
+        current: i32,
+        proposed: i32,
+    },
+    LowerMinEdge {
+        current: i32,
+        proposed: i32,
+    },
+    TightenStopLoss {
+        current: i32,
+        proposed: i32,
+    },
+    WidenStopLoss {
+        current: i32,
+        proposed: i32,
+    },
+    AddTrailingStop {
+        trigger: i32,
+        distance: i32,
+    },
+    LowerThreshold {
+        which: String,
+        current: f64,
+        proposed: f64,
+    },
+    RaiseThreshold {
+        which: String,
+        current: f64,
+        proposed: f64,
+    },
+    RaiseRiskCap {
+        which: String,
+        current: i64,
+        proposed: i64,
+    },
+    DisableStrategy {
+        reason: String,
+    },
+    EnableStrategy {
+        reason: String,
+    },
+    Investigate {
+        what: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]

@@ -230,9 +230,12 @@ impl VarianceFadeStrategy {
             let move_threshold_cents = m
                 .move_threshold_cents_override
                 .unwrap_or(self.config.move_threshold_cents);
-            next.insert(m.ticker, CachedMarket {
-                move_threshold_cents,
-            });
+            next.insert(
+                m.ticker,
+                CachedMarket {
+                    move_threshold_cents,
+                },
+            );
         }
         info!(n_markets = next.len(), "variance-fade: config loaded");
         self.markets = next;
@@ -251,7 +254,7 @@ impl VarianceFadeStrategy {
                 // 100 - no_bid = yes_ask. Mid is the midpoint of
                 // yes_bid and yes_ask.
                 let yes_ask = 100u8.checked_sub(nb)?;
-                Some((u16::from(yb) + u16::from(yes_ask)) / 2)
+                Some(u16::from(yb).midpoint(u16::from(yes_ask)))
             }
             (Some(yb), None) => Some(u16::from(yb)),
             (None, Some(nb)) => 100u8.checked_sub(nb).map(u16::from),
@@ -317,8 +320,7 @@ impl VarianceFadeStrategy {
             Side::No => book.best_yes_bid()?.0.cents(),
         };
         let ask_cents = 100u8.checked_sub(opposite_bid)?;
-        if ask_cents < self.config.min_take_ask_cents
-            || ask_cents > self.config.max_take_ask_cents
+        if ask_cents < self.config.min_take_ask_cents || ask_cents > self.config.max_take_ask_cents
         {
             debug!(
                 ticker = %key,
@@ -548,7 +550,10 @@ mod tests {
             let _ = s.record_mid("KX-T", &book, now + Duration::from_secs(i));
         }
         let spike_book = book_with_mid(60, 38);
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &spike_book, now).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-T"), &spike_book, now)
+                .is_none()
+        );
     }
 
     #[test]
@@ -589,8 +594,22 @@ mod tests {
             let _ = s.record_mid("KX-T", &book, now + Duration::from_secs(i));
         }
         let spike_book = book_with_mid(60, 38);
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &spike_book, now + Duration::from_secs(20)).is_some());
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &spike_book, now + Duration::from_secs(21)).is_none());
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &spike_book,
+                now + Duration::from_secs(20)
+            )
+            .is_some()
+        );
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &spike_book,
+                now + Duration::from_secs(21)
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -601,7 +620,10 @@ mod tests {
         let mut s = VarianceFadeStrategy::new(cfg(path));
         s.reload_markets();
         let book = book_with_mid(60, 38);
-        assert!(s.evaluate(&MarketTicker::new("KX-OTHER"), &book, Instant::now()).is_none());
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-OTHER"), &book, Instant::now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -626,7 +648,21 @@ mod tests {
         }
         // Move to mid 55 — 6¢ above median.
         let book = book_with_mid(54, 44);
-        assert!(s.evaluate(&MarketTicker::new("KX-LOOSE"), &book, now + Duration::from_secs(20)).is_some());
-        assert!(s.evaluate(&MarketTicker::new("KX-TIGHT"), &book, now + Duration::from_secs(20)).is_none());
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-LOOSE"),
+                &book,
+                now + Duration::from_secs(20)
+            )
+            .is_some()
+        );
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-TIGHT"),
+                &book,
+                now + Duration::from_secs(20)
+            )
+            .is_none()
+        );
     }
 }

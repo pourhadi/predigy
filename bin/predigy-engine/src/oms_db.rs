@@ -364,14 +364,12 @@ impl Oms for DbBackedOms {
         }
 
         // 2. Idempotency / collision probe.
-        let client_ids: Vec<String> =
-            group.intents.iter().map(|i| i.client_id.clone()).collect();
-        let existing: Vec<(String, Option<uuid::Uuid>)> = sqlx::query_as(
-            "SELECT client_id, leg_group_id FROM intents WHERE client_id = ANY($1)",
-        )
-        .bind(&client_ids)
-        .fetch_all(&self.pool)
-        .await?;
+        let client_ids: Vec<String> = group.intents.iter().map(|i| i.client_id.clone()).collect();
+        let existing: Vec<(String, Option<uuid::Uuid>)> =
+            sqlx::query_as("SELECT client_id, leg_group_id FROM intents WHERE client_id = ANY($1)")
+                .bind(&client_ids)
+                .fetch_all(&self.pool)
+                .await?;
         if !existing.is_empty() {
             // Are ALL members of `group` accounted for, AND under
             // the same group_id?

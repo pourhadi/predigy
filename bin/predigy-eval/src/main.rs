@@ -79,9 +79,7 @@ enum Cmd {
         interval: String,
     },
     /// (v2) Backtest-replay parameter optimizer.
-    Optimize {
-        strategy: String,
-    },
+    Optimize { strategy: String },
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -113,9 +111,17 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Summary(w) => cmd_summary(&db, w).await,
-        Cmd::Ledger { strategy, window, limit } => cmd_ledger(&db, &strategy, window, limit).await,
+        Cmd::Ledger {
+            strategy,
+            window,
+            limit,
+        } => cmd_ledger(&db, &strategy, window, limit).await,
         Cmd::Diagnose { strategy, window } => cmd_diagnose(&db, &strategy, window).await,
-        Cmd::Report { window, out, format } => cmd_report(&db, window, out, format).await,
+        Cmd::Report {
+            window,
+            out,
+            format,
+        } => cmd_report(&db, window, out, format).await,
         Cmd::Compare { a, b, window } => cmd_compare(&db, &a, &b, window).await,
         Cmd::Watch { window, interval } => cmd_watch(&db, window, &interval).await,
         Cmd::Optimize { strategy } => cmd_optimize(&strategy),
@@ -171,7 +177,11 @@ async fn cmd_summary(db: &Db, w: WindowOpts) -> Result<()> {
                     predigy_eval_lib::Severity::Warn => "warn    ",
                     predigy_eval_lib::Severity::Info => "info    ",
                 };
-                println!("                  {sev} {:?}: {}", d.code, short_message(&d.message));
+                println!(
+                    "                  {sev} {:?}: {}",
+                    d.code,
+                    short_message(&d.message)
+                );
             }
         }
     }
@@ -218,7 +228,15 @@ async fn cmd_ledger(db: &Db, strategy: &str, w: WindowOpts, limit: usize) -> Res
             .unwrap_or_else(|| "—".into());
         println!(
             "{:<31} | {:<4} | {:>3} | {:>4}c | {:>5} | {:>7} | {:>3}c | {:>4} | {}",
-            t.ticker, t.side, t.qty_open, t.avg_entry_cents, exit_str, net, t.fees_paid_cents, hold, reason
+            t.ticker,
+            t.side,
+            t.qty_open,
+            t.avg_entry_cents,
+            exit_str,
+            net,
+            t.fees_paid_cents,
+            hold,
+            reason
         );
     }
     Ok(())
@@ -238,7 +256,10 @@ async fn cmd_diagnose(db: &Db, strategy: &str, w: WindowOpts) -> Result<()> {
     };
     let diags = diagnose(m, &trades);
     if diags.is_empty() {
-        println!("`{strategy}`: no diagnoses fired ({} closed trades, net {:+}c)", m.n_trades_closed, m.net_pnl_cents);
+        println!(
+            "`{strategy}`: no diagnoses fired ({} closed trades, net {:+}c)",
+            m.n_trades_closed, m.net_pnl_cents
+        );
         return Ok(());
     }
     let mut critical = 0usize;
@@ -254,7 +275,11 @@ async fn cmd_diagnose(db: &Db, strategy: &str, w: WindowOpts) -> Result<()> {
         println!("[{}] {:?}", sev, d.code);
         println!("    {}", d.message);
         for r in &d.recommendations {
-            println!("    -> {} ({})", format_action_short(&r.action), r.confidence.label());
+            println!(
+                "    -> {} ({})",
+                format_action_short(&r.action),
+                r.confidence.label()
+            );
             println!("       {}", r.rationale);
         }
         println!();
@@ -268,14 +293,36 @@ async fn cmd_diagnose(db: &Db, strategy: &str, w: WindowOpts) -> Result<()> {
 fn format_action_short(a: &predigy_eval_lib::ActionKind) -> String {
     use predigy_eval_lib::ActionKind::*;
     match a {
-        RaiseMinEdge { current, proposed } => format!("Raise min_edge_cents {current} -> {proposed}"),
-        LowerMinEdge { current, proposed } => format!("Lower min_edge_cents {current} -> {proposed}"),
-        TightenStopLoss { current, proposed } => format!("Tighten stop_loss_cents {current} -> {proposed}"),
-        WidenStopLoss { current, proposed } => format!("Widen stop_loss_cents {current} -> {proposed}"),
-        AddTrailingStop { trigger, distance } => format!("Add trailing stop trigger={trigger} dist={distance}"),
-        LowerThreshold { which, current, proposed } => format!("Lower {which} {current:.2} -> {proposed:.2}"),
-        RaiseThreshold { which, current, proposed } => format!("Raise {which} {current:.2} -> {proposed:.2}"),
-        RaiseRiskCap { which, current, proposed } => format!("Raise {which} {current} -> {proposed}"),
+        RaiseMinEdge { current, proposed } => {
+            format!("Raise min_edge_cents {current} -> {proposed}")
+        }
+        LowerMinEdge { current, proposed } => {
+            format!("Lower min_edge_cents {current} -> {proposed}")
+        }
+        TightenStopLoss { current, proposed } => {
+            format!("Tighten stop_loss_cents {current} -> {proposed}")
+        }
+        WidenStopLoss { current, proposed } => {
+            format!("Widen stop_loss_cents {current} -> {proposed}")
+        }
+        AddTrailingStop { trigger, distance } => {
+            format!("Add trailing stop trigger={trigger} dist={distance}")
+        }
+        LowerThreshold {
+            which,
+            current,
+            proposed,
+        } => format!("Lower {which} {current:.2} -> {proposed:.2}"),
+        RaiseThreshold {
+            which,
+            current,
+            proposed,
+        } => format!("Raise {which} {current:.2} -> {proposed:.2}"),
+        RaiseRiskCap {
+            which,
+            current,
+            proposed,
+        } => format!("Raise {which} {current} -> {proposed}"),
         DisableStrategy { reason } => format!("Disable strategy: {reason}"),
         EnableStrategy { reason } => format!("Enable strategy: {reason}"),
         Investigate { what } => format!("Investigate: {what}"),
@@ -310,7 +357,7 @@ async fn cmd_report(
         }))?,
     };
     if let Some(path) = out {
-        std::fs::write(&path, &body).with_context(|| format!("write {path:?}"))?;
+        std::fs::write(&path, &body).with_context(|| format!("write {}", path.display()))?;
         eprintln!("wrote report to {}", path.display());
     } else {
         print!("{body}");
@@ -333,38 +380,52 @@ async fn cmd_compare(db: &Db, a: &str, b: &str, w: WindowOpts) -> Result<()> {
     let lines: Vec<(&str, String, String)> = vec![
         (
             "Closed trades",
-            ma.map(|m| m.n_trades_closed.to_string()).unwrap_or_else(|| "—".into()),
-            mb.map(|m| m.n_trades_closed.to_string()).unwrap_or_else(|| "—".into()),
+            ma.map(|m| m.n_trades_closed.to_string())
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| m.n_trades_closed.to_string())
+                .unwrap_or_else(|| "—".into()),
         ),
         (
             "Net PnL (c)",
-            ma.map(|m| format!("{:+}", m.net_pnl_cents)).unwrap_or_else(|| "—".into()),
-            mb.map(|m| format!("{:+}", m.net_pnl_cents)).unwrap_or_else(|| "—".into()),
+            ma.map(|m| format!("{:+}", m.net_pnl_cents))
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| format!("{:+}", m.net_pnl_cents))
+                .unwrap_or_else(|| "—".into()),
         ),
         (
             "Win rate",
-            ma.map(|m| format!("{:.1}%", m.win_rate * 100.0)).unwrap_or_else(|| "—".into()),
-            mb.map(|m| format!("{:.1}%", m.win_rate * 100.0)).unwrap_or_else(|| "—".into()),
+            ma.map(|m| format!("{:.1}%", m.win_rate * 100.0))
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| format!("{:.1}%", m.win_rate * 100.0))
+                .unwrap_or_else(|| "—".into()),
         ),
         (
             "Expectancy (c)",
-            ma.map(|m| format!("{:+.1}", m.expectancy_cents)).unwrap_or_else(|| "—".into()),
-            mb.map(|m| format!("{:+.1}", m.expectancy_cents)).unwrap_or_else(|| "—".into()),
+            ma.map(|m| format!("{:+.1}", m.expectancy_cents))
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| format!("{:+.1}", m.expectancy_cents))
+                .unwrap_or_else(|| "—".into()),
         ),
         (
             "Sharpe",
-            ma.map(|m| format!("{:.2}", m.sharpe_ratio)).unwrap_or_else(|| "—".into()),
-            mb.map(|m| format!("{:.2}", m.sharpe_ratio)).unwrap_or_else(|| "—".into()),
+            ma.map(|m| format!("{:.2}", m.sharpe_ratio))
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| format!("{:.2}", m.sharpe_ratio))
+                .unwrap_or_else(|| "—".into()),
         ),
         (
             "Median hold",
-            ma.map(|m| format!("{}s", m.median_hold_secs)).unwrap_or_else(|| "—".into()),
-            mb.map(|m| format!("{}s", m.median_hold_secs)).unwrap_or_else(|| "—".into()),
+            ma.map(|m| format!("{}s", m.median_hold_secs))
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| format!("{}s", m.median_hold_secs))
+                .unwrap_or_else(|| "—".into()),
         ),
         (
             "Intents submitted",
-            ma.map(|m| m.n_intents_submitted.to_string()).unwrap_or_else(|| "—".into()),
-            mb.map(|m| m.n_intents_submitted.to_string()).unwrap_or_else(|| "—".into()),
+            ma.map(|m| m.n_intents_submitted.to_string())
+                .unwrap_or_else(|| "—".into()),
+            mb.map(|m| m.n_intents_submitted.to_string())
+                .unwrap_or_else(|| "—".into()),
         ),
     ];
     for (k, va, vb) in lines {
@@ -385,7 +446,9 @@ async fn cmd_watch(db: &Db, w: WindowOpts, interval: &str) -> Result<()> {
 
 fn parse_interval(s: &str) -> Result<std::time::Duration> {
     let (digits, unit) = s.split_at(s.len() - 1);
-    let n: u64 = digits.parse().with_context(|| format!("parse interval {s}"))?;
+    let n: u64 = digits
+        .parse()
+        .with_context(|| format!("parse interval {s}"))?;
     let dur = match unit {
         "s" => std::time::Duration::from_secs(n),
         "m" => std::time::Duration::from_secs(n * 60),

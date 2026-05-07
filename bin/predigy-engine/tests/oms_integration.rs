@@ -1119,12 +1119,7 @@ async fn rejection_cascades_cancel_request_to_sibling_legs() {
     ensure_market(&pool, "KX-LG-C1").await;
     ensure_market(&pool, "KX-LG-C2").await;
     let ks = Arc::new(KillSwitchView::new());
-    let oms = DbBackedOms::new_with_mode(
-        pool.clone(),
-        permissive_caps(),
-        ks,
-        EngineMode::Live,
-    );
+    let oms = DbBackedOms::new_with_mode(pool.clone(), permissive_caps(), ks, EngineMode::Live);
 
     let group = LegGroup::new(vec![
         buy_yes("test:C1:0001", "KX-LG-C1", 1, 30),
