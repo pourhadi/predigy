@@ -150,6 +150,10 @@ struct Snapshot {
     /// (`*-exit:*` or `*-flat:*`) — Phase 6 take-profit,
     /// stop-loss, and force-flat fires. Newest first.
     recent_exits: Vec<ExitRow>,
+    /// **Audit I5** — fill-latency telemetry.
+    /// Aggregated submit-to-fill duration per strategy across
+    /// the last hour. `None` if no fills landed in the window.
+    fill_latency: Vec<FillLatencyRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,6 +227,21 @@ struct EnginePositionRow {
     /// (mark - avg_entry) × |qty|, signed. `None` if mark is
     /// missing.
     unrealized_pnl_cents: Option<i64>,
+}
+
+/// **Audit I5** — submit-to-fill latency per strategy, last
+/// hour. Surfaces the round-trip time the engine sees from
+/// the moment it persists `intents.submitted_at` to the
+/// moment the WS push delivers a fill (`fills.ts`). Useful for
+/// detecting venue / network / queue degradation.
+#[derive(Debug, Clone, Serialize)]
+struct FillLatencyRow {
+    strategy: String,
+    n_fills: i64,
+    mean_ms: i64,
+    p50_ms: i64,
+    p95_ms: i64,
+    max_ms: i64,
 }
 
 /// Phase 6 — one recent exit fire (TP/SL/force-flat). Pulled
@@ -649,6 +668,13 @@ async fn build_snapshot(
                 snap.last_refresh_error = Some(format!("recent_exits: {e}"));
             }
         }
+        match db_fill_latency(pool).await {
+            Ok(rows) => snap.fill_latency = rows,
+            Err(e) => {
+                warn!(error = %e, "refresh: fill_latency failed");
+                snap.last_refresh_error = Some(format!("fill_latency: {e}"));
+            }
+        }
     }
 
     snap
@@ -968,6 +994,55 @@ async fn db_recent_exits(pool: &sqlx::PgPool) -> Result<Vec<ExitRow>, sqlx::Erro
             price_cents: r.price_cents,
             status: r.status,
             reason: r.reason,
+        })
+        .collect())
+}
+
+/// **Audit I5** — fill-latency telemetry. Pulls submit-to-fill
+/// latency for every fill in the last hour, aggregates per
+/// strategy. PERCENTILE_DISC is the bog-standard distribution
+/// quantile in Postgres.
+async fn db_fill_latency(pool: &sqlx::PgPool) -> Result<Vec<FillLatencyRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        strategy: String,
+        n_fills: i64,
+        // f64s because the sqlx driver maps DOUBLE PRECISION to
+        // f64; conversion to ms (i64) happens in the mapper below.
+        mean_secs: Option<f64>,
+        p50_secs: Option<f64>,
+        p95_secs: Option<f64>,
+        max_secs: Option<f64>,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT
+             i.strategy,
+             COUNT(*)::BIGINT AS n_fills,
+             AVG(EXTRACT(EPOCH FROM (f.ts - i.submitted_at))) AS mean_secs,
+             PERCENTILE_DISC(0.5) WITHIN GROUP (
+                 ORDER BY EXTRACT(EPOCH FROM (f.ts - i.submitted_at))
+             ) AS p50_secs,
+             PERCENTILE_DISC(0.95) WITHIN GROUP (
+                 ORDER BY EXTRACT(EPOCH FROM (f.ts - i.submitted_at))
+             ) AS p95_secs,
+             MAX(EXTRACT(EPOCH FROM (f.ts - i.submitted_at))) AS max_secs
+           FROM fills f
+           JOIN intents i ON i.client_id = f.client_id
+          WHERE f.ts >= now() - interval '1 hour'
+          GROUP BY i.strategy
+          ORDER BY i.strategy",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| FillLatencyRow {
+            strategy: r.strategy,
+            n_fills: r.n_fills,
+            mean_ms: (r.mean_secs.unwrap_or(0.0) * 1000.0).round() as i64,
+            p50_ms: (r.p50_secs.unwrap_or(0.0) * 1000.0).round() as i64,
+            p95_ms: (r.p95_secs.unwrap_or(0.0) * 1000.0).round() as i64,
+            max_ms: (r.max_secs.unwrap_or(0.0) * 1000.0).round() as i64,
         })
         .collect())
 }

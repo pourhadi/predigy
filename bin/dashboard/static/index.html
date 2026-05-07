@@ -155,6 +155,9 @@
   <h2>recent exits <small style="color: var(--muted)">(tp / sl / force-flat)</small></h2>
   <div id="exits-wrap"></div>
 
+  <h2>fill latency <small style="color: var(--muted)">(submit → fill, last hour)</small></h2>
+  <div id="latency-wrap"></div>
+
   <h2>recent events</h2>
   <div id="events-wrap"></div>
 
@@ -377,7 +380,42 @@ function render(s) {
 
     renderEnginePositions(s.engine_positions || []);
     renderExits(s.recent_exits || []);
+    renderFillLatency(s.fill_latency || []);
     renderEvents(s.recent_events);
+}
+
+function renderFillLatency(rows) {
+    if (rows.length === 0) {
+        setHTML("latency-wrap",
+          `<div class="card"><div class="empty">no fills in the last hour</div></div>`);
+        return;
+    }
+    const tbody = rows.map(r => {
+        // p95 over 1s is the "investigate" threshold: REST submit
+        // is ~200ms, WS-push fills ~10ms, so p95 normally lands
+        // <500ms. >1s means venue or network degradation.
+        const slow = r.p95_ms > 1000;
+        const slowCls = slow ? 'num-neg' : '';
+        return `
+          <tr>
+            <td>${escapeHtml(r.strategy)}</td>
+            <td>${r.n_fills}</td>
+            <td>${r.mean_ms}ms</td>
+            <td>${r.p50_ms}ms</td>
+            <td class="${slowCls}">${r.p95_ms}ms</td>
+            <td>${r.max_ms}ms</td>
+          </tr>`;
+    }).join("");
+    setHTML("latency-wrap", `
+      <div class="card" style="padding: 0;">
+        <table>
+          <thead><tr>
+            <th>strategy</th><th>n</th><th>mean</th>
+            <th>p50</th><th>p95</th><th>max</th>
+          </tr></thead>
+          <tbody>${tbody}</tbody>
+        </table>
+      </div>`);
 }
 
 function fmtAge(secs) {
