@@ -26,6 +26,7 @@ members = [
     "bin/stat-curator",
     "bin/wx-stat-curator",
     "bin/wx-stat-fit-calibration",
+    "bin/predigy-import",
 ]
 
 [workspace.package]
@@ -85,6 +86,12 @@ base64 = "0.22"
 rand = "0.8"
 tempfile = "3"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "matched-path", "query", "tracing"] }
+
+# Database stack — Postgres-only, peer auth via UNIX socket on
+# the trading box. See docs/ARCHITECTURE.md "Database" section
+# for rationale + connection convention.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 [profile.release]
 opt-level = 3

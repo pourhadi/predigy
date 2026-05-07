@@ -329,6 +329,38 @@ text frame is emitted on the configured cadence) and
 `pong_response_is_silently_dropped` (verifies `"PONG"` doesn't
 surface as a Malformed event).
 
+## Engine refactor begun 2026-05-07
+
+The architectural pivot — fragmented multi-binary system → one
+consolidated `predigy-engine` with shared state and a Postgres
+database — kicked off this session. **Phases 0 and 1 done.**
+
+Source-of-truth docs:
+- `docs/ARCHITECTURE.md` — target architecture, full migration
+  plan (Phases 0-7), decision log
+- `docs/DATABASE.md` — Postgres setup recipe, query examples,
+  ops runbook, live phase tracker
+
+What's done:
+- **Phase 0**: Postgres 16.13 installed via Homebrew (peer auth
+  on UNIX socket, no password), `predigy` DB created, PATH
+  persisted in `~/.zprofile`.
+- **Phase 1**: 13-table schema in `migrations/0001_initial.sql`,
+  applied. `bin/predigy-import` reads existing JSON state files
+  + rule files into the DB, idempotent. First run reported
+  183 markets / 58 intents / 175 rules imported.
+
+The existing daemons keep running and writing JSON state through
+Phases 2-3. Schedule `predigy-import` hourly (TODO) so the DB
+stays in sync with whatever the daemons do until the engine
+takes over the write path.
+
+Next up:
+- Phase 2: `bin/predigy-engine` skeleton (one Kalshi WS client,
+  sqlx pool, strategy-trait scaffolding)
+- Phase 3: stat-trader as first strategy module + dual-write
+  parity verification
+
 ## Open work / next session priorities
 
 In rough order of leverage:
