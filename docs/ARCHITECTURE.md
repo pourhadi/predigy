@@ -617,20 +617,30 @@ For each remaining strategy:
       `Db::open_positions(Some(STRATEGY_ID.0))`); on each
       `Event::BookUpdate` the strategy re-evaluates open
       positions for that ticker against current mark.
-- [x] **Adverse-drift + profit-take exits** (Phase 6.1 in
-      stat-trader). `StatConfig::take_profit_cents` /
-      `stop_loss_cents` (defaults 8¢ / 5¢; 0 disables).
-      Closing IOCs use the same idempotent-cid pattern as
-      entries — minute-bucketed `stat-exit:{ticker}:{side}:{tag}:{minute:08x}`.
-- [ ] Port the same exit pattern to settlement / latency /
-      cross-arb. Each has different exit semantics (settlement
-      = time-to-close; latency = post-event drift; cross-arb =
-      convergence event).
-- [ ] Global Kelly accounting (sizing knows about other
-      strategies' open positions in correlated markets).
+- [x] **Adverse-drift + profit-take exits**:
+      - stat-trader (Phase 6.1, 8¢ / 5¢ defaults).
+      - cross-arb-trader (Phase 6.2, 5¢ / 4¢ defaults — tighter
+        because cross-arb scalps smaller convergences).
+      - Both use the same pattern: in-memory CachedPosition map
+        refreshed on the configured cadence (default 60s);
+        evaluate_exit() runs alongside entry on each
+        Event::BookUpdate; closing IOC at the current mark with
+        idempotent-cid `<strategy>-exit:{ticker}:{side}:{tag}:...`.
+- [x] **Global notional cap across strategies** (Phase 6.2).
+      `RiskCaps::max_global_notional_cents` enforces an
+      engine-wide ceiling in `oms_db::check_caps`; rejects with
+      `RejectionReason::NotionalExceeded { scope: "global" }`.
+      0 disables the global gate (per-strategy caps still apply).
+      Default shake-down: $15 global vs 4×$5 per-strategy so it
+      actually binds.
+- [ ] Port the exit pattern to settlement / latency. Settlement
+      probably skips (venue auto-settles); latency needs market
+      subscription plumbing for held positions OR time-based
+      exits via Tick.
 - [ ] Cross-strategy data sharing (wx-stat's model_p drift
       triggers stat-trader re-evaluation; cross-arb's Polymarket
-      view feeds stat-trader's belief).
+      view feeds stat-trader's belief). Requires a
+      cross-strategy event bus.
 
 ### Phase 7 — Retire scaffolding
 

@@ -76,6 +76,18 @@ pub struct CrossArbConfig {
     pub max_size: u32,
     /// Cooldown between submits on the same Kalshi market.
     pub cooldown: Duration,
+    /// **Phase 6.2 active exits**:
+    /// take-profit threshold in cents per contract.
+    /// Convergence-aware: when the Kalshi mark moves favorably
+    /// toward Polymarket's reference, we lock in profit.
+    /// `0` disables.
+    pub take_profit_cents: i32,
+    /// Stop-loss threshold in cents per contract. Triggered when
+    /// Kalshi moves adversely (poly didn't follow through, or
+    /// reverted). `0` disables.
+    pub stop_loss_cents: i32,
+    /// How often to refresh the open-position cache from Postgres.
+    pub position_refresh_interval: Duration,
 }
 
 impl Default for CrossArbConfig {
@@ -84,6 +96,13 @@ impl Default for CrossArbConfig {
             min_edge_cents: 1,
             max_size: 25,
             cooldown: Duration::from_millis(500),
+            // Phase 6.2 defaults: take 5¢ profit, cap 4¢ loss.
+            // Cross-arb's edges per fire are smaller than stat's
+            // (it scalps small convergences), so the exit
+            // thresholds are correspondingly tighter.
+            take_profit_cents: 5,
+            stop_loss_cents: 4,
+            position_refresh_interval: Duration::from_secs(60),
         }
     }
 }
@@ -105,6 +124,18 @@ impl PolyRef {
     }
 }
 
+/// Phase 6.2 — in-memory position snapshot. Refreshed on Tick
+/// from Postgres; stale up to `position_refresh_interval` (60s
+/// default). For exit logic this is acceptable; new positions
+/// become exit-eligible within one cadence of the fill.
+#[derive(Debug, Clone)]
+struct CachedPosition {
+    side: Side,
+    /// Signed: positive = long.
+    signed_qty: i32,
+    avg_entry_cents: i32,
+}
+
 #[derive(Debug)]
 pub struct CrossArbStrategy {
     config: CrossArbConfig,
@@ -115,6 +146,12 @@ pub struct CrossArbStrategy {
     poly_ref: HashMap<String, PolyRef>,
     /// Per-Kalshi-market submit cooldown.
     last_submit_at: HashMap<MarketTicker, Instant>,
+    /// Phase 6.2 — open positions per (ticker, side). Key is
+    /// `"{ticker}:{side_tag}"`.
+    positions: HashMap<String, CachedPosition>,
+    /// Phase 6.2 — per-position exit cooldown.
+    last_exit_at: HashMap<String, Instant>,
+    last_position_refresh: Option<Instant>,
 }
 
 impl CrossArbStrategy {
@@ -124,6 +161,9 @@ impl CrossArbStrategy {
             market_map: HashMap::new(),
             poly_ref: HashMap::new(),
             last_submit_at: HashMap::new(),
+            positions: HashMap::new(),
+            last_exit_at: HashMap::new(),
+            last_position_refresh: None,
         }
     }
 
@@ -228,6 +268,146 @@ impl CrossArbStrategy {
         }
         intents
     }
+
+    /// Phase 6.2 — refresh the in-memory open-position cache from
+    /// Postgres.
+    async fn refresh_positions(
+        &mut self,
+        state: &mut StrategyState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let rows = state.db.open_positions(Some(STRATEGY_ID.0)).await?;
+        let n = rows.len();
+        let mut next: HashMap<String, CachedPosition> = HashMap::with_capacity(n);
+        for r in rows {
+            let side = match r.side.as_str() {
+                "yes" => Side::Yes,
+                "no" => Side::No,
+                _ => continue,
+            };
+            let key = position_key(&r.ticker, side);
+            next.insert(
+                key,
+                CachedPosition {
+                    side,
+                    signed_qty: r.current_qty,
+                    avg_entry_cents: r.avg_entry_cents,
+                },
+            );
+        }
+        self.positions = next;
+        self.last_position_refresh = Some(Instant::now());
+        debug!(n_positions = n, "cross-arb: position cache refreshed");
+        Ok(())
+    }
+
+    /// Phase 6.2 — evaluate open positions on this market for
+    /// take-profit / stop-loss exits. Returns 0/1 closing intent.
+    fn evaluate_exit(
+        &mut self,
+        market: &MarketTicker,
+        book: &OrderBook,
+        now: Instant,
+    ) -> Option<Intent> {
+        for side in [Side::Yes, Side::No] {
+            let key = position_key(market.as_str(), side);
+            let pos = match self.positions.get(&key) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            if pos.signed_qty == 0 {
+                continue;
+            }
+            if let Some(&last) = self.last_exit_at.get(&key)
+                && now.duration_since(last) < self.config.cooldown
+            {
+                continue;
+            }
+
+            // Mark = price we'd realize unwinding. Cross-arb only
+            // ever buys (it's a stat-arb against poly reference);
+            // signed_qty should be positive for normal flows. We
+            // handle short fallback for safety.
+            let mark_cents = match (pos.side, pos.signed_qty.is_positive()) {
+                (Side::Yes, true) => book.best_yes_bid()?.0.cents() as i32,
+                (Side::No, true) => book.best_no_bid()?.0.cents() as i32,
+                (Side::Yes, false) => 100i32 - book.best_no_bid()?.0.cents() as i32,
+                (Side::No, false) => 100i32 - book.best_yes_bid()?.0.cents() as i32,
+            };
+
+            let pnl_per = if pos.signed_qty > 0 {
+                mark_cents - pos.avg_entry_cents
+            } else {
+                pos.avg_entry_cents - mark_cents
+            };
+
+            let take =
+                self.config.take_profit_cents > 0 && pnl_per >= self.config.take_profit_cents;
+            let stop = self.config.stop_loss_cents > 0 && pnl_per <= -self.config.stop_loss_cents;
+            if !(take || stop) {
+                continue;
+            }
+
+            let action = if pos.signed_qty > 0 {
+                IntentAction::Sell
+            } else {
+                IntentAction::Buy
+            };
+            let abs_qty = pos.signed_qty.unsigned_abs() as i32;
+            let limit_cents = mark_cents.clamp(1, 99);
+            let side_tag = match pos.side {
+                Side::Yes => "Y",
+                Side::No => "N",
+            };
+            let reason_tag = if take { "tp" } else { "sl" };
+            // No minute-bucket on the exit cid (cross-arb fires
+            // sub-second); use the Kalshi limit + qty as the
+            // discriminator instead so repeated triggers at the
+            // same price collapse via OMS idempotency.
+            let client_id = format!(
+                "cross-arb-exit:{ticker}:{side_tag}:{tag}:{lim:02}:{qty:04}",
+                ticker = market.as_str(),
+                tag = reason_tag,
+                lim = limit_cents,
+                qty = abs_qty,
+            );
+            let intent = Intent {
+                client_id,
+                strategy: STRATEGY_ID.0,
+                market: market.clone(),
+                side: pos.side,
+                action,
+                price_cents: Some(limit_cents),
+                qty: abs_qty,
+                order_type: OrderType::Limit,
+                tif: Tif::Ioc,
+                reason: Some(format!(
+                    "cross-arb-exit: {reason_tag} entry={}¢ mark={}¢ pnl={}¢/contract",
+                    pos.avg_entry_cents, mark_cents, pnl_per
+                )),
+            };
+            info!(
+                market = %market.as_str(),
+                side = ?pos.side,
+                signed_qty = pos.signed_qty,
+                avg_entry = pos.avg_entry_cents,
+                mark = mark_cents,
+                pnl_per,
+                trigger = reason_tag,
+                "cross-arb: emitting exit"
+            );
+            self.last_exit_at.insert(key, now);
+            return Some(intent);
+        }
+        None
+    }
+}
+
+fn position_key(ticker: &str, side: Side) -> String {
+    let tag = match side {
+        Side::Yes => 'y',
+        Side::No => 'n',
+    };
+    format!("{ticker}:{tag}")
 }
 
 #[async_trait]
@@ -255,10 +435,28 @@ impl Strategy for CrossArbStrategy {
     async fn on_event(
         &mut self,
         ev: &Event,
-        _state: &mut StrategyState,
+        state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
+        // Phase 6.2 — refresh the open-position cache on the
+        // configured cadence + on first call. Stale up to one
+        // position_refresh_interval; new fills become exit-
+        // eligible within that window.
+        let needs_refresh = self
+            .last_position_refresh
+            .is_none_or(|t| t.elapsed() >= self.config.position_refresh_interval);
+        if needs_refresh {
+            self.refresh_positions(state).await?;
+        }
+
         match ev {
-            Event::BookUpdate { market, book } => Ok(self.evaluate(market, book, Instant::now())),
+            Event::BookUpdate { market, book } => {
+                let now = Instant::now();
+                let mut intents = self.evaluate(market, book, now);
+                if let Some(exit) = self.evaluate_exit(market, book, now) {
+                    intents.push(exit);
+                }
+                Ok(intents)
+            }
             Event::External(ExternalEvent::PolymarketBook {
                 asset_id,
                 best_bid,
@@ -273,6 +471,13 @@ impl Strategy for CrossArbStrategy {
             }
             Event::External(_) | Event::Tick | Event::DiscoveryDelta { .. } => Ok(Vec::new()),
         }
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        // Periodic ticks drive the position-cache refresh in the
+        // absence of book updates (e.g. quiet markets). Shares
+        // the same cadence as the cache freshness window.
+        Some(self.config.position_refresh_interval)
     }
 }
 
@@ -373,6 +578,19 @@ mod tests {
             min_edge_cents: 1,
             max_size: 10,
             cooldown: Duration::from_millis(1),
+            // Tight thresholds let unit tests drive exits
+            // deterministically.
+            take_profit_cents: 5,
+            stop_loss_cents: 4,
+            position_refresh_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn cached_position(side: Side, signed_qty: i32, avg_entry_cents: i32) -> CachedPosition {
+        CachedPosition {
+            side,
+            signed_qty,
+            avg_entry_cents,
         }
     }
 
@@ -452,6 +670,9 @@ mod tests {
             min_edge_cents: 50,
             max_size: 10,
             cooldown: Duration::from_millis(1),
+            take_profit_cents: 5,
+            stop_loss_cents: 4,
+            position_refresh_interval: Duration::from_secs(60),
         });
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
@@ -469,6 +690,9 @@ mod tests {
             min_edge_cents: 1,
             max_size: 10,
             cooldown: Duration::from_secs(60),
+            take_profit_cents: 5,
+            stop_loss_cents: 4,
+            position_refresh_interval: Duration::from_secs(60),
         });
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
@@ -517,5 +741,120 @@ mod tests {
     fn declares_polymarket_external_subscription() {
         let s = CrossArbStrategy::new(cfg());
         assert_eq!(s.external_subscriptions(), vec!["polymarket"]);
+    }
+
+    // ─── Phase 6.2 active-exit tests ─────────────────────────
+
+    #[test]
+    fn exit_take_profit_long_yes() {
+        // Long YES at 50¢. Mark = 56¢. PnL = +6¢ ≥ tp(5¢).
+        let mut s = CrossArbStrategy::new(cfg());
+        let market = MarketTicker::new("KX-EXIT-A");
+        s.positions.insert(
+            position_key("KX-EXIT-A", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(56, 100)], &[(40, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("take-profit fires");
+        assert_eq!(intent.side, Side::Yes);
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.qty, 4);
+        assert_eq!(intent.price_cents, Some(56));
+        assert_eq!(intent.tif, Tif::Ioc);
+        assert!(
+            intent
+                .client_id
+                .starts_with("cross-arb-exit:KX-EXIT-A:Y:tp:")
+        );
+    }
+
+    #[test]
+    fn exit_stop_loss_long_yes() {
+        // Long YES at 50¢. Mark = 45¢. PnL = -5¢ ≤ -sl(4¢).
+        let mut s = CrossArbStrategy::new(cfg());
+        let market = MarketTicker::new("KX-EXIT-B");
+        s.positions.insert(
+            position_key("KX-EXIT-B", Side::Yes),
+            cached_position(Side::Yes, 6, 50),
+        );
+        let book = book(&[(45, 100)], &[(50, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("stop-loss fires");
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.qty, 6);
+        assert_eq!(intent.price_cents, Some(45));
+        assert!(intent.client_id.contains(":sl:"));
+    }
+
+    #[test]
+    fn no_exit_inside_band() {
+        // Long YES at 50¢. Mark = 53¢. PnL = +3¢, inside [-4, +5).
+        let mut s = CrossArbStrategy::new(cfg());
+        let market = MarketTicker::new("KX-EXIT-C");
+        s.positions.insert(
+            position_key("KX-EXIT-C", Side::Yes),
+            cached_position(Side::Yes, 3, 50),
+        );
+        let book = book(&[(53, 100)], &[(40, 100)]);
+        assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn exit_take_profit_long_no() {
+        // Long NO at 30¢. Mark (best NO bid) = 36¢. PnL = +6¢ ≥
+        // tp(5¢). Sell-NO IOC at the touch.
+        let mut s = CrossArbStrategy::new(cfg());
+        let market = MarketTicker::new("KX-EXIT-D");
+        s.positions.insert(
+            position_key("KX-EXIT-D", Side::No),
+            cached_position(Side::No, 5, 30),
+        );
+        let book = book(&[(60, 100)], &[(36, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("NO-side take-profit fires");
+        assert_eq!(intent.side, Side::No);
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.price_cents, Some(36));
+    }
+
+    #[test]
+    fn exit_cooldown_blocks_repeat() {
+        let mut s = CrossArbStrategy::new(cfg());
+        let market = MarketTicker::new("KX-EXIT-E");
+        s.positions.insert(
+            position_key("KX-EXIT-E", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(56, 100)], &[(40, 100)]);
+        let now = Instant::now();
+        assert!(s.evaluate_exit(&market, &book, now).is_some());
+        assert!(s.evaluate_exit(&market, &book, now).is_none());
+    }
+
+    #[test]
+    fn exit_disabled_when_thresholds_zero() {
+        let mut cfg_off = cfg();
+        cfg_off.take_profit_cents = 0;
+        cfg_off.stop_loss_cents = 0;
+        let mut s = CrossArbStrategy::new(cfg_off);
+        let market = MarketTicker::new("KX-EXIT-F");
+        s.positions.insert(
+            position_key("KX-EXIT-F", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(95, 100)], &[(2, 100)]);
+        assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn exit_only_for_known_position() {
+        let mut s = CrossArbStrategy::new(cfg());
+        let market = MarketTicker::new("KX-EXIT-G");
+        let book = book(&[(56, 100)], &[(40, 100)]);
+        assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
     }
 }
