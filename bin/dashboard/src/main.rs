@@ -135,6 +135,21 @@ struct Snapshot {
     /// Shared kill-flag file currently armed.
     kill_flag_armed: bool,
     last_refresh_error: Option<String>,
+
+    // Phase 6 — engine-side surfaces. Populated only when the
+    // Postgres pool is available; empty otherwise (legacy
+    // daemons don't write to the engine's `positions` /
+    // `intents` tables in their JSON state files).
+    /// Per-strategy open positions from the engine's
+    /// `positions` table. Distinct from `open_positions` above
+    /// (which is Kalshi's account-wide REST view); engine
+    /// positions are scoped per strategy and include the
+    /// idempotent client_id chain that produced them.
+    engine_positions: Vec<EnginePositionRow>,
+    /// Recent intents whose client_id matches an exit pattern
+    /// (`*-exit:*` or `*-flat:*`) — Phase 6 take-profit,
+    /// stop-loss, and force-flat fires. Newest first.
+    recent_exits: Vec<ExitRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,6 +197,46 @@ struct EventRow {
     kind: String,
     /// Free-form summary the UI displays as the body of the card.
     summary: String,
+}
+
+/// Phase 6 — one open position from the engine's `positions`
+/// table, with derived age. The engine writes these on every
+/// fill cascade; the dashboard surfaces them so the operator
+/// can see what each strategy currently holds.
+#[derive(Debug, Clone, Serialize)]
+struct EnginePositionRow {
+    strategy: String,
+    ticker: String,
+    side: String,
+    /// Signed: positive = long; negative = short.
+    current_qty: i32,
+    avg_entry_cents: i32,
+    /// Seconds since the position opened.
+    age_secs: i64,
+    realized_pnl_cents: i64,
+    fees_paid_cents: i64,
+}
+
+/// Phase 6 — one recent exit fire (TP/SL/force-flat). Pulled
+/// from `intents` filtered by client_id pattern.
+#[derive(Debug, Clone, Serialize)]
+struct ExitRow {
+    /// Unix seconds.
+    ts: i64,
+    strategy: String,
+    ticker: String,
+    side: String,
+    /// `tp` (take profit) | `sl` (stop loss) | `flat` (latency
+    /// time-based force-flat) | `unknown` (didn't match a known
+    /// pattern).
+    kind: String,
+    qty: i32,
+    price_cents: Option<i32>,
+    /// Current intent status — `shadow` / `submitted` / `acked`
+    /// / `filled` / `rejected` / etc.
+    status: String,
+    /// The strategy's per-fire reason (entry/mark/pnl summary).
+    reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -518,6 +573,28 @@ async fn build_snapshot(
     all_events.truncate(RECENT_EVENTS_KEEP);
     snap.recent_events = all_events;
 
+    // Phase 6 — engine-side surfaces. DB-only; legacy daemons
+    // don't write to engine positions/intents tables. If the
+    // pool is unavailable or queries fail, the dashboard
+    // continues to render with empty Phase 6 sections rather
+    // than failing the whole snapshot.
+    if let Some(pool) = db {
+        match db_engine_positions(pool).await {
+            Ok(rows) => snap.engine_positions = rows,
+            Err(e) => {
+                warn!(error = %e, "refresh: engine_positions failed");
+                snap.last_refresh_error = Some(format!("engine_positions: {e}"));
+            }
+        }
+        match db_recent_exits(pool).await {
+            Ok(rows) => snap.recent_exits = rows,
+            Err(e) => {
+                warn!(error = %e, "refresh: recent_exits failed");
+                snap.last_refresh_error = Some(format!("recent_exits: {e}"));
+            }
+        }
+    }
+
     snap
 }
 
@@ -720,6 +797,116 @@ struct DbStrategyState {
     in_flight_orders: usize,
 }
 
+/// Phase 6 — pull every currently-open engine position from
+/// Postgres, regardless of strategy. Returned newest-first by
+/// `opened_at`. Bounded at 200 rows so a runaway engine doesn't
+/// produce a 10MB JSON payload.
+async fn db_engine_positions(pool: &sqlx::PgPool) -> Result<Vec<EnginePositionRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        strategy: String,
+        ticker: String,
+        side: String,
+        current_qty: i32,
+        avg_entry_cents: i32,
+        opened_at: chrono::DateTime<chrono::Utc>,
+        realized_pnl_cents: i64,
+        fees_paid_cents: i64,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT strategy, ticker, side, current_qty, avg_entry_cents,
+                opened_at, realized_pnl_cents, fees_paid_cents
+           FROM positions
+          WHERE closed_at IS NULL
+          ORDER BY opened_at DESC
+          LIMIT 200",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = chrono::Utc::now();
+    Ok(rows
+        .into_iter()
+        .map(|r| EnginePositionRow {
+            strategy: r.strategy,
+            ticker: r.ticker,
+            side: r.side,
+            current_qty: r.current_qty,
+            avg_entry_cents: r.avg_entry_cents,
+            age_secs: (now - r.opened_at).num_seconds().max(0),
+            realized_pnl_cents: r.realized_pnl_cents,
+            fees_paid_cents: r.fees_paid_cents,
+        })
+        .collect())
+}
+
+/// Phase 6 — recent exit fires (TP / SL / force-flat). Matches
+/// the deterministic client_id patterns each strategy uses for
+/// its closing intents:
+///
+/// - `stat-exit:{ticker}:{side}:{tp|sl}:...`
+/// - `cross-arb-exit:{ticker}:{side}:{tp|sl}:...`
+/// - `latency-flat:{ticker}:{side}:...`
+///
+/// Bounded at 50 rows; client-side filterable in the dashboard
+/// UI by `kind` if needed.
+async fn db_recent_exits(pool: &sqlx::PgPool) -> Result<Vec<ExitRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        strategy: String,
+        ticker: String,
+        side: String,
+        client_id: String,
+        qty: i32,
+        price_cents: Option<i32>,
+        status: String,
+        reason: Option<String>,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT submitted_at, strategy, ticker, side, client_id,
+                qty, price_cents, status, reason
+           FROM intents
+          WHERE client_id LIKE '%-exit:%'
+             OR client_id LIKE '%-flat:%'
+          ORDER BY submitted_at DESC
+          LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ExitRow {
+            ts: r.submitted_at.timestamp(),
+            strategy: r.strategy,
+            ticker: r.ticker,
+            side: r.side,
+            kind: classify_exit_kind(&r.client_id),
+            qty: r.qty,
+            price_cents: r.price_cents,
+            status: r.status,
+            reason: r.reason,
+        })
+        .collect())
+}
+
+/// Map an exit-cid to its kind for UI grouping. Pattern is
+/// `<strategy>-{exit|flat}:{ticker}:{side}:{tag}:...`.
+fn classify_exit_kind(cid: &str) -> String {
+    if cid.contains("-flat:") {
+        return "flat".to_string();
+    }
+    if cid.contains("-exit:") {
+        // Look for ":tp:" or ":sl:" component.
+        if cid.contains(":tp:") {
+            return "tp".to_string();
+        }
+        if cid.contains(":sl:") {
+            return "sl".to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
 async fn db_strategy_state(
     pool: &sqlx::PgPool,
     strategy: &str,
@@ -822,5 +1009,28 @@ mod tests {
     fn strip_ansi_drops_sgr_sequences() {
         let s = "\x1b[2m2026-05-05\x1b[0m INFO";
         assert_eq!(strip_ansi(s), "2026-05-05 INFO");
+    }
+
+    #[test]
+    fn classify_exit_kind_recognises_take_profit() {
+        assert_eq!(classify_exit_kind("stat-exit:KX-A:Y:tp:00abcdef"), "tp");
+        assert_eq!(classify_exit_kind("cross-arb-exit:KX-B:N:tp:50:0010"), "tp");
+    }
+
+    #[test]
+    fn classify_exit_kind_recognises_stop_loss() {
+        assert_eq!(classify_exit_kind("stat-exit:KX-A:Y:sl:00abcdef"), "sl");
+    }
+
+    #[test]
+    fn classify_exit_kind_recognises_force_flat() {
+        assert_eq!(classify_exit_kind("latency-flat:WX-A:Y:001a2b3c"), "flat");
+    }
+
+    #[test]
+    fn classify_exit_kind_falls_back_to_unknown() {
+        // Entry cids should not be classified as exits.
+        assert_eq!(classify_exit_kind("stat:KX-A:50:0001:00abcdef"), "unknown");
+        assert_eq!(classify_exit_kind("anything-else"), "unknown");
     }
 }

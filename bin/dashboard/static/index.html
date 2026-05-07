@@ -149,6 +149,12 @@
   <h2>positions</h2>
   <div id="pos-wrap"></div>
 
+  <h2>engine positions <small style="color: var(--muted)">(per-strategy from postgres)</small></h2>
+  <div id="engine-pos-wrap"></div>
+
+  <h2>recent exits <small style="color: var(--muted)">(tp / sl / force-flat)</small></h2>
+  <div id="exits-wrap"></div>
+
   <h2>recent events</h2>
   <div id="events-wrap"></div>
 
@@ -369,7 +375,88 @@ function render(s) {
           </div>`);
     }
 
+    renderEnginePositions(s.engine_positions || []);
+    renderExits(s.recent_exits || []);
     renderEvents(s.recent_events);
+}
+
+function fmtAge(secs) {
+    if (secs == null) return "—";
+    const s = Math.max(0, Math.round(secs));
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.round(s / 60)}m`;
+    if (s < 86400) return `${Math.round(s / 3600)}h`;
+    return `${Math.round(s / 86400)}d`;
+}
+
+function renderEnginePositions(rows) {
+    if (rows.length === 0) {
+        setHTML("engine-pos-wrap",
+          `<div class="card"><div class="empty">no engine-tracked open positions</div></div>`);
+        return;
+    }
+    const tbody = rows.map(p => {
+        const pnl = p.realized_pnl_cents;
+        const pnlCls = pnl > 0 ? 'num-pos' : (pnl < 0 ? 'num-neg' : '');
+        const pnlStr = `${pnl > 0 ? '+' : ''}${(pnl / 100).toFixed(2)}`;
+        return `
+          <tr>
+            <td>${escapeHtml(p.strategy)}</td>
+            <td class="market">${escapeHtml(p.ticker)}</td>
+            <td>${escapeHtml(p.side)}</td>
+            <td>${p.current_qty}</td>
+            <td>${p.avg_entry_cents}¢</td>
+            <td>${fmtAge(p.age_secs)}</td>
+            <td class="${pnlCls}">${pnlStr}</td>
+            <td>$${(p.fees_paid_cents / 100).toFixed(2)}</td>
+          </tr>`;
+    }).join("");
+    setHTML("engine-pos-wrap", `
+      <div class="card" style="padding: 0;">
+        <table>
+          <thead><tr>
+            <th>strategy</th><th>market</th><th>side</th><th>qty</th>
+            <th>entry</th><th>age</th><th>realized</th><th>fees</th>
+          </tr></thead>
+          <tbody>${tbody}</tbody>
+        </table>
+      </div>`);
+}
+
+function renderExits(rows) {
+    if (rows.length === 0) {
+        setHTML("exits-wrap",
+          `<div class="card"><div class="empty">no exit fires recorded</div></div>`);
+        return;
+    }
+    const tbody = rows.map(e => {
+        const px = e.price_cents != null ? `${e.price_cents}¢` : '—';
+        const kindClass =
+              e.kind === 'tp'   ? 'num-pos'
+            : e.kind === 'sl'   ? 'num-neg'
+            : '';
+        return `
+          <tr>
+            <td>${fmtUnixAge(e.ts)}</td>
+            <td>${escapeHtml(e.strategy)}</td>
+            <td class="market">${escapeHtml(e.ticker)}</td>
+            <td>${escapeHtml(e.side)}</td>
+            <td class="${kindClass}">${escapeHtml(e.kind)}</td>
+            <td>${e.qty}</td>
+            <td>${px}</td>
+            <td>${escapeHtml(e.status)}</td>
+          </tr>`;
+    }).join("");
+    setHTML("exits-wrap", `
+      <div class="card" style="padding: 0;">
+        <table>
+          <thead><tr>
+            <th>when</th><th>strategy</th><th>market</th><th>side</th>
+            <th>kind</th><th>qty</th><th>price</th><th>status</th>
+          </tr></thead>
+          <tbody>${tbody}</tbody>
+        </table>
+      </div>`);
 }
 
 async function tick() {
