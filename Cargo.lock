@@ -1877,6 +1877,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-strategy-cross-arb"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "predigy-book",
+ "predigy-core",
+ "predigy-engine-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "predigy-strategy-latency"
 version = "0.1.0"
 dependencies = [

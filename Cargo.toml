@@ -17,6 +17,7 @@ members = [
     "crates/strategies/stat",
     "crates/strategies/settlement",
     "crates/strategies/latency",
+    "crates/strategies/cross-arb",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -129,6 +130,7 @@ predigy-engine-core = { path = "crates/engine-core" }
 predigy-strategy-stat = { path = "crates/strategies/stat" }
 predigy-strategy-settlement = { path = "crates/strategies/settlement" }
 predigy-strategy-latency = { path = "crates/strategies/latency" }
+predigy-strategy-cross-arb = { path = "crates/strategies/cross-arb" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
 stat-trader = { path = "bin/stat-trader" }

@@ -36,6 +36,27 @@ pub enum Event {
         added: Vec<DiscoveredMarket>,
         removed: Vec<MarketTicker>,
     },
+    /// The pair-file dispatcher (cross-arb's plumbing) saw the
+    /// configured pair file change and emitted the diff. The
+    /// engine has already registered the `added` Kalshi tickers
+    /// with the market-data router AND subscribed the
+    /// corresponding Polymarket assets via the external-feed
+    /// dispatcher. Strategies should update their internal
+    /// kalshi→poly mapping from `added` and drop bookkeeping for
+    /// `removed`.
+    PairUpdate {
+        added: Vec<KalshiPolyPair>,
+        removed: Vec<MarketTicker>,
+    },
+}
+
+/// One Kalshi ↔ Polymarket pair as published by cross-arb-curator.
+/// The kalshi side is the venue we trade on; the poly side is
+/// reference-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KalshiPolyPair {
+    pub kalshi_ticker: MarketTicker,
+    pub poly_asset_id: String,
 }
 
 /// Non-Kalshi inputs. Strategies that care subscribe via
