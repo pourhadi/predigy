@@ -4,6 +4,7 @@
 //! Production defaults are intentionally tight for the $50-cap
 //! shake-down phase; raise via env when capital grows.
 
+use crate::oms_db::EngineMode;
 use predigy_engine_core::oms::RiskCaps;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,6 +18,19 @@ pub struct EngineConfig {
     /// Run pending sqlx migrations on startup. Default true.
     /// Disable only for read-only tools.
     pub auto_migrate: bool,
+
+    /// Engine execution mode. Defaults to Shadow — production
+    /// services should explicitly set `PREDIGY_ENGINE_MODE=live`
+    /// once parity is verified. Live mode is what activates the
+    /// REST submitter; Shadow leaves intents at status='shadow'
+    /// where the venue submitter never sees them.
+    pub engine_mode: EngineMode,
+
+    /// REST venue-submitter poll interval. The submitter checks
+    /// for `submitted` and `cancel_requested` rows on this cadence.
+    /// 250ms keeps median submit-to-ack at ~250ms + REST RTT
+    /// (~200ms) ≈ ~450ms. Tighten for latency-sensitive lanes.
+    pub venue_rest_poll_interval: Duration,
 
     /// Kalshi credentials. Used by REST + WS + (Phase 4) FIX.
     pub kalshi_key_id: String,
@@ -63,6 +77,11 @@ impl EngineConfig {
             database_url: std::env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "postgresql:///predigy".into()),
             auto_migrate: env_bool("PREDIGY_ENGINE_AUTO_MIGRATE", true),
+            engine_mode: env_engine_mode("PREDIGY_ENGINE_MODE", EngineMode::Shadow),
+            venue_rest_poll_interval: env_duration_ms(
+                "PREDIGY_VENUE_REST_POLL_MS",
+                Duration::from_millis(250),
+            ),
             kalshi_key_id: std::env::var("KALSHI_KEY_ID")
                 .context("KALSHI_KEY_ID env var is required")?,
             kalshi_pem_path: std::env::var("KALSHI_PEM")
@@ -116,6 +135,27 @@ fn env_duration(name: &str, default: Duration) -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(default, Duration::from_secs)
+}
+
+fn env_duration_ms(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(default, Duration::from_millis)
+}
+
+fn env_engine_mode(name: &str, default: EngineMode) -> EngineMode {
+    match std::env::var(name).ok().as_deref() {
+        Some("live" | "Live" | "LIVE") => EngineMode::Live,
+        Some("shadow" | "Shadow" | "SHADOW") => EngineMode::Shadow,
+        Some(other) => {
+            eprintln!(
+                "{name}={other:?} not recognized; using default {default:?}"
+            );
+            default
+        }
+        None => default,
+    }
 }
 
 fn dirs_log_default() -> PathBuf {

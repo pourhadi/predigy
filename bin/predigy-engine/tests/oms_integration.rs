@@ -565,3 +565,61 @@ async fn fill_then_close_settles_realised_pnl() {
     assert_eq!(pos.2, 0);
     assert_eq!(pos.1, 100);
 }
+
+#[tokio::test]
+async fn duplicate_venue_fill_id_is_idempotent() {
+    // The WS-push exec-data path (Phase 4a) can replay fills
+    // across reconnects; the OMS must dedupe on venue_fill_id so
+    // a replayed fill doesn't double-credit the position. Same
+    // venue_fill_id arriving twice should leave exactly one row
+    // in `fills` and one position update.
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-DUP").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    oms.submit(buy_yes("test:DUP:0001", "KX-INT-DUP", 3, 30))
+        .await
+        .unwrap();
+
+    let fill = ExecutionUpdate {
+        client_id: "test:DUP:0001".into(),
+        venue_order_id: Some("venue-dup-1".into()),
+        venue_fill_id: Some("trade-dup-A".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 3,
+        avg_fill_price_cents: Some(30),
+        last_fill_qty: Some(3),
+        last_fill_price_cents: Some(30),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({"source": "ws_push"}),
+    };
+
+    oms.apply_execution(fill.clone()).await.unwrap();
+    // Replay the same fill (e.g. from a WS reconnect or a REST
+    // belt-and-suspenders poller landing on the same trade_id).
+    oms.apply_execution(fill).await.unwrap();
+
+    // Exactly one row in `fills`.
+    let fill_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM fills WHERE venue_fill_id = 'trade-dup-A'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fill_count.0, 1, "duplicate fill must collapse to a single row");
+
+    // Position reflects a single 3-contract fill (not 6).
+    let pos: (i32, i32) = sqlx::query_as(
+        "SELECT current_qty, avg_entry_cents
+           FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-DUP'
+            AND closed_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pos.0, 3, "duplicate fill must not double the position");
+    assert_eq!(pos.1, 30);
+}

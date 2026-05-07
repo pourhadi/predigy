@@ -354,9 +354,38 @@ impl Oms for DbBackedOms {
         .await?;
 
         // 3. Fill row + position update on Filled / PartialFill.
+        //
+        // Idempotency: every WS-push fill carries a venue-assigned
+        // `venue_fill_id` (Kalshi's `trade_id`). The same fill can
+        // legitimately arrive twice — WS replays after a reconnect,
+        // or REST `list_fills` polling running alongside WS push as
+        // belt-and-suspenders. We dedupe on `venue_fill_id` BEFORE
+        // running the position cascade, so a replayed fill is a
+        // no-op rather than a double-credit. The
+        // `fills.venue_fill_id` UNIQUE index would catch it at
+        // insert time, but doing the check first means we don't
+        // run the (more expensive) position upsert for nothing.
         if matches!(ev.status, ExecutionStatus::Filled | ExecutionStatus::PartialFill) {
             if let (Some(qty), Some(price)) = (ev.last_fill_qty, ev.last_fill_price_cents) {
                 let fee = ev.last_fill_fee_cents.unwrap_or(0);
+
+                if let Some(fid) = ev.venue_fill_id.as_deref() {
+                    let already: Option<(i64,)> = sqlx::query_as(
+                        "SELECT id FROM fills WHERE venue_fill_id = $1",
+                    )
+                    .bind(fid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if already.is_some() {
+                        debug!(
+                            client_id = %ev.client_id,
+                            venue_fill_id = fid,
+                            "apply_execution: duplicate fill (skipping cascade)"
+                        );
+                        tx.commit().await?;
+                        return Ok(());
+                    }
+                }
 
                 // Look up intent metadata for fill row.
                 let row: Option<(String, String, String, String)> = sqlx::query_as(

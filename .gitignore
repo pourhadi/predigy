@@ -5,6 +5,7 @@ Cargo.lock.bak
 # Editor / OS
 .idea/
 .vscode/
+.claude/
 *.swp
 .DS_Store
 

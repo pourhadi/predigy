@@ -15,10 +15,12 @@
 //! market-data router, reconciliation loop).
 
 pub mod config;
+pub mod exec_data;
 pub mod market_data;
 pub mod oms_db;
 pub mod registry;
 pub mod supervisor;
+pub mod venue_rest;
 
 pub use config::EngineConfig;
 pub use oms_db::DbBackedOms;

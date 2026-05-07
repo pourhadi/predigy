@@ -27,10 +27,12 @@
 use anyhow::{Context as _, Result};
 use predigy_engine::{
     config::EngineConfig,
+    exec_data::{ExecDataConfig, ExecDataConsumer},
     market_data::{MarketDataRouter, RouterConfig},
     oms_db::DbBackedOms,
     registry::StrategyRegistry,
     supervisor::{RestartPolicy, Supervisor},
+    venue_rest::{VenueRest, VenueRestConfig},
 };
 use predigy_engine_core::oms::KillSwitchView;
 use predigy_engine_core::state::StrategyState;
@@ -78,13 +80,15 @@ async fn main() -> Result<()> {
     // Initial sync from the DB / file fallback.
     sync_kill_switch(&pool, &config.kill_switch_file, &kill_switch).await;
 
-    // 4. Build the OMS.
-    let oms: Arc<dyn predigy_engine_core::oms::Oms> = Arc::new(DbBackedOms::new(
+    // 4. Build the OMS at the configured mode (Shadow by default;
+    //    Live activates the venue submitter).
+    let oms: Arc<dyn predigy_engine_core::oms::Oms> = Arc::new(DbBackedOms::new_with_mode(
         pool.clone(),
         config.default_risk_caps.clone(),
         kill_switch.clone(),
+        config.engine_mode,
     ));
-    info!("predigy-engine: oms ready");
+    info!(mode = ?config.engine_mode, "predigy-engine: oms ready");
 
     // 5. Spawn the kill-switch watcher. Polls the DB +
     //    file-based fallback every 5s.
@@ -117,12 +121,50 @@ async fn main() -> Result<()> {
         .with_context(|| format!("read PEM at {}", config.kalshi_pem_path.display()))?;
     let router_cfg = RouterConfig {
         kalshi_key_id: config.kalshi_key_id.clone(),
-        kalshi_pem: pem,
+        kalshi_pem: pem.clone(),
         rest_endpoint: config.kalshi_rest_endpoint.clone(),
         ws_endpoint: config.kalshi_ws_endpoint.clone(),
     };
     let router = MarketDataRouter::connect(router_cfg).await?;
     info!("predigy-engine: market-data router connected");
+
+    // 7a. Exec-data consumer — dedicated WS connection to the
+    //     authed `fill` + `market_positions` channels. Pushes
+    //     fills into the OMS at <50ms median (vs ~500ms for the
+    //     legacy REST poller). Same venue connection style as the
+    //     market-data router; separate task for clean state.
+    let exec_data = ExecDataConsumer::connect(
+        ExecDataConfig {
+            kalshi_key_id: config.kalshi_key_id.clone(),
+            kalshi_pem: pem.clone(),
+            ws_endpoint: config.kalshi_ws_endpoint.clone(),
+        },
+        pool.clone(),
+        oms.clone(),
+    )
+    .await?;
+    info!("predigy-engine: exec-data consumer connected");
+
+    // 7b. REST venue submitter — polls `intents WHERE
+    //     status='submitted'` and pushes them to Kalshi. Pairs
+    //     with the WS exec-data consumer to close the order
+    //     lifecycle (submit via REST, fills via WS push). Runs
+    //     in both Shadow and Live mode; in Shadow the queue is
+    //     always empty (intents land at status='shadow').
+    let venue_rest = VenueRest::start(
+        VenueRestConfig {
+            kalshi_key_id: config.kalshi_key_id.clone(),
+            kalshi_pem: pem.clone(),
+            rest_endpoint: config.kalshi_rest_endpoint.clone(),
+            poll_interval: config.venue_rest_poll_interval,
+        },
+        pool.clone(),
+    )
+    .await?;
+    info!(
+        poll_ms = config.venue_rest_poll_interval.as_millis() as u64,
+        "predigy-engine: venue-rest submitter started"
+    );
 
     // 8. Spawn one supervisor per strategy. Each supervisor owns
     //    its strategy instance + its event channel + its
@@ -172,6 +214,8 @@ async fn main() -> Result<()> {
     for sup in supervisors {
         sup.shutdown(config.shutdown_grace).await;
     }
+    venue_rest.shutdown(config.shutdown_grace).await;
+    exec_data.shutdown(config.shutdown_grace).await;
     router.shutdown(config.shutdown_grace).await;
     pool.close().await;
     info!("predigy-engine: shutdown complete");

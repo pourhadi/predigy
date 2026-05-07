@@ -283,7 +283,7 @@ pub enum SelfTradePreventionV2 {
     Maker,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateOrderResponse {
     pub order_id: String,
     #[serde(default)]
@@ -299,7 +299,7 @@ pub struct CreateOrderResponse {
     pub average_fee_paid: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CancelOrderResponse {
     pub order_id: String,
     #[serde(default)]
