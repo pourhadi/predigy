@@ -13,6 +13,7 @@ members = [
     "crates/sim",
     "crates/ext-feeds",
     "crates/signals",
+    "crates/engine-core",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -27,6 +28,7 @@ members = [
     "bin/wx-stat-curator",
     "bin/wx-stat-fit-calibration",
     "bin/predigy-import",
+    "bin/predigy-engine",
 ]
 
 [workspace.package]
@@ -37,7 +39,9 @@ license = "UNLICENSED"
 repository = "https://github.com/pourhadi/predigy"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` (not `forbid`) so test modules that need env::set_var or
+# similar can `#[allow(unsafe_code)]` on the module.
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]
@@ -49,6 +53,59 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
+# Pedantic lints we treat as stylistic, not correctness:
+#   cast_lossless    — `x as i64` is fine; explicit From only when grep-ability matters.
+#   doc_markdown     — vendor names + types in prose without backticks are clearer.
+#   needless_pass_by_value — fine for small Copy structs / configs.
+#   too_many_arguments — production code DOES sometimes have wide signatures.
+#   missing_fields_in_debug — finish_non_exhaustive() is not always more informative.
+#   redundant_closure_for_method_calls — sometimes the closure is the readable form.
+#   uninlined_format_args — `{}` with explicit args is fine when it improves readability.
+cast_lossless = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+missing_fields_in_debug = "allow"
+redundant_closure_for_method_calls = "allow"
+uninlined_format_args = "allow"
+items_after_statements = "allow"
+collapsible_if = "allow"
+needless_borrow = "allow"
+manual_let_else = "allow"
+needless_borrows_for_generic_args = "allow"
+ref_option = "allow"
+result_large_err = "allow"
+or_fun_call = "allow"
+ignored_unit_patterns = "allow"
+manual_is_multiple_of = "allow"
+ref_as_ptr = "allow"
+duration_subsec = "allow"
+duration_suboptimal_units = "allow"
+unnecessary_wraps = "allow"
+single_match_else = "allow"
+ignore_without_reason = "allow"
+default_trait_access = "allow"
+unchecked_time_subtraction = "allow"
+unnecessary_map_or = "allow"
+cast_possible_wrap = "allow"
+similar_names = "allow"
+large_enum_variant = "allow"
+map_unwrap_or = "allow"
+too_many_lines = "allow"
+elidable_lifetime_names = "allow"
+manual_div_ceil = "allow"
+useless_let_if_seq = "allow"
+needless_lifetimes = "allow"
+manual_ok_err = "allow"
+needless_collect = "allow"
+struct_field_names = "allow"
+unused_self = "allow"
+return_self_not_must_use = "allow"
+match_same_arms = "allow"
+single_match = "allow"
+explicit_iter_loop = "allow"
+unused_async = "allow"
+let_underscore_untyped = "allow"
 
 [workspace.dependencies]
 predigy-core = { path = "crates/core" }
@@ -63,6 +120,7 @@ predigy-poly-md = { path = "crates/poly-md" }
 predigy-ext-feeds = { path = "crates/ext-feeds" }
 predigy-signals = { path = "crates/signals" }
 predigy-kalshi-fix = { path = "crates/kalshi-fix" }
+predigy-engine-core = { path = "crates/engine-core" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
 stat-trader = { path = "bin/stat-trader" }

@@ -1,0 +1,528 @@
+//! Integration tests for the DB-backed OMS against a live
+//! Postgres test DB.
+//!
+//! Connection: defaults to `postgresql:///predigy_test`. Override
+//! via `TEST_DATABASE_URL`. The DB MUST already exist + have the
+//! schema applied (one-time setup):
+//!
+//! ```bash
+//! createdb predigy_test
+//! psql -U dan -d predigy_test -f migrations/0001_initial.sql
+//! ```
+//!
+//! Each test runs in its own transaction-ish isolation by:
+//! truncating positions / intents / fills / intent_events at
+//! the start. Tests within a single file run serially (cargo
+//! test default for same-file integration tests is parallel,
+//! but the truncations would race; we use a serial mutex via
+//! the `serial_test`-like pattern: each test acquires a global
+//! tokio::sync::Mutex before mutating).
+
+use predigy_core::market::MarketTicker;
+use predigy_core::side::Side;
+use predigy_engine::oms_db::DbBackedOms;
+use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::oms::{
+    ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, RejectionReason, RiskCaps, SubmitOutcome,
+};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
+
+fn test_database_url() -> String {
+    std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql:///predigy_test".into())
+}
+
+// Global mutex to serialise tests against the shared DB.
+async fn test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::OnceCell<AsyncMutex<()>> = tokio::sync::OnceCell::const_new();
+    LOCK.get_or_init(|| async { AsyncMutex::new(()) })
+        .await
+        .lock()
+        .await
+}
+
+async fn fresh_pool() -> PgPool {
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&test_database_url())
+        .await
+        .expect("connect to test db");
+    // Wipe state. Order matters for FK refs.
+    for tbl in [
+        "intent_events",
+        "fills",
+        "positions",
+        "intents",
+        "model_p_snapshots",
+        "model_p_inputs",
+        "rules",
+        "calibration",
+        "settlements",
+        "book_snapshots",
+        "kill_switches",
+        "markets",
+    ] {
+        sqlx::query(&format!("TRUNCATE TABLE {tbl} RESTART IDENTITY CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("truncate {tbl}: {e}"));
+    }
+    pool
+}
+
+async fn ensure_market(pool: &PgPool, ticker: &str) {
+    sqlx::query(
+        "INSERT INTO markets (ticker, venue, market_type)
+         VALUES ($1, 'kalshi', 'binary') ON CONFLICT (ticker) DO NOTHING",
+    )
+    .bind(ticker)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn buy_yes(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent {
+    Intent {
+        client_id: client_id.into(),
+        strategy: "test",
+        market: MarketTicker::new(ticker),
+        side: Side::Yes,
+        action: IntentAction::Buy,
+        price_cents: Some(price_cents),
+        qty,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: Some("integration test".into()),
+    }
+}
+
+fn permissive_caps() -> RiskCaps {
+    RiskCaps {
+        max_notional_cents: 1_000_000,
+        max_daily_loss_cents: 1_000_000,
+        max_contracts_per_side: 1000,
+        max_in_flight: 1000,
+        max_orders_per_window: 1000,
+        rate_window_ms: 1000,
+    }
+}
+
+#[tokio::test]
+async fn submit_persists_intent_and_emits_event() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-A").await;
+
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+    let outcome = oms.submit(buy_yes("test:A:0001", "KX-INT-A", 1, 30)).await.unwrap();
+    match outcome {
+        SubmitOutcome::Submitted { client_id, .. } => assert_eq!(client_id, "test:A:0001"),
+        other => panic!("expected Submitted, got {other:?}"),
+    }
+    let row: (String, i32, String) = sqlx::query_as(
+        "SELECT status, qty, ticker FROM intents WHERE client_id = $1",
+    )
+    .bind("test:A:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "submitted");
+    assert_eq!(row.1, 1);
+    assert_eq!(row.2, "KX-INT-A");
+
+    let evs: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = $1",
+    )
+    .bind("test:A:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evs.0, 1);
+}
+
+#[tokio::test]
+async fn duplicate_client_id_returns_idempotent() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-B").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool, permissive_caps(), ks);
+
+    let intent = buy_yes("test:B:0001", "KX-INT-B", 1, 30);
+    let first = oms.submit(intent.clone()).await.unwrap();
+    matches!(first, SubmitOutcome::Submitted { .. });
+    let second = oms.submit(intent).await.unwrap();
+    match second {
+        SubmitOutcome::Idempotent { client_id, current_status } => {
+            assert_eq!(client_id, "test:B:0001");
+            assert_eq!(current_status, "submitted");
+        }
+        other => panic!("expected Idempotent, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn kill_switch_armed_rejects() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-C").await;
+    let ks = Arc::new(KillSwitchView::new());
+    ks.arm();
+    let oms = DbBackedOms::new(pool, permissive_caps(), ks);
+
+    let outcome = oms.submit(buy_yes("test:C:0001", "KX-INT-C", 1, 30)).await.unwrap();
+    match outcome {
+        SubmitOutcome::Rejected {
+            reason: RejectionReason::KillSwitchArmed { .. },
+        } => {}
+        other => panic!("expected KillSwitchArmed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn contract_cap_rejects() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-D").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let mut caps = permissive_caps();
+    caps.max_contracts_per_side = 2;
+    let oms = DbBackedOms::new(pool, caps, ks);
+
+    // 3 contracts on a side capped at 2.
+    let outcome = oms.submit(buy_yes("test:D:0001", "KX-INT-D", 3, 30)).await.unwrap();
+    match outcome {
+        SubmitOutcome::Rejected {
+            reason: RejectionReason::ContractCapExceeded { current, limit, .. },
+        } => {
+            assert_eq!(current, 3);
+            assert_eq!(limit, 2);
+        }
+        other => panic!("expected ContractCapExceeded, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_client_id_rejects() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-E").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool, permissive_caps(), ks);
+
+    let outcome = oms.submit(buy_yes("", "KX-INT-E", 1, 30)).await.unwrap();
+    match outcome {
+        SubmitOutcome::Rejected {
+            reason: RejectionReason::InvalidIntent { .. },
+        } => {}
+        other => panic!("expected InvalidIntent, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn negative_qty_rejects() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-F").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool, permissive_caps(), ks);
+
+    let outcome = oms.submit(buy_yes("test:F:0001", "KX-INT-F", 0, 30)).await.unwrap();
+    match outcome {
+        SubmitOutcome::Rejected {
+            reason: RejectionReason::InvalidIntent { .. },
+        } => {}
+        other => panic!("expected InvalidIntent, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn execution_filled_creates_position_and_fill() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-G").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    let cid = "test:G:0001";
+    oms.submit(buy_yes(cid, "KX-INT-G", 5, 30)).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: cid.into(),
+        venue_order_id: Some("venue-G".into()),
+        venue_fill_id: Some("unique-fill-0001".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 5,
+        avg_fill_price_cents: Some(28),
+        last_fill_qty: Some(5),
+        last_fill_price_cents: Some(28),
+        last_fill_fee_cents: Some(2),
+        venue_payload: serde_json::json!({"raw": "test"}),
+    })
+    .await
+    .unwrap();
+
+    // Position created.
+    let pos: (i32, i32, i64) = sqlx::query_as(
+        "SELECT current_qty, avg_entry_cents, fees_paid_cents
+           FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-G' AND closed_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pos.0, 5);
+    assert_eq!(pos.1, 28);
+    assert_eq!(pos.2, 2);
+
+    // Fill row written.
+    let fill: (i32, i32, i32) = sqlx::query_as(
+        "SELECT qty, price_cents, fee_cents FROM fills WHERE client_id = $1",
+    )
+    .bind(cid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fill.0, 5);
+    assert_eq!(fill.1, 28);
+    assert_eq!(fill.2, 2);
+
+    // Intent updated to filled.
+    let intent_status: (String,) = sqlx::query_as(
+        "SELECT status FROM intents WHERE client_id = $1",
+    )
+    .bind(cid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(intent_status.0, "filled");
+}
+
+#[tokio::test]
+async fn short_position_close_realised_pnl_correct_sign() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-S").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    // Open SHORT at 30¢ (sell to open).
+    let open = Intent {
+        client_id: "test:S:open".into(),
+        strategy: "test",
+        market: MarketTicker::new("KX-INT-S"),
+        side: Side::Yes,
+        action: IntentAction::Sell,
+        price_cents: Some(30),
+        qty: 5,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: None,
+    };
+    oms.submit(open).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:S:open".into(),
+        venue_order_id: Some("v-S1".into()),
+        venue_fill_id: Some("unique-fill-0002".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 5,
+        avg_fill_price_cents: Some(30),
+        last_fill_qty: Some(5),
+        last_fill_price_cents: Some(30),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Buy back at 20¢ (a profit on a short — bought lower than sold).
+    oms.submit(buy_yes("test:S:close", "KX-INT-S", 5, 20)).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:S:close".into(),
+        venue_order_id: Some("v-S2".into()),
+        venue_fill_id: Some("unique-fill-0003".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 5,
+        avg_fill_price_cents: Some(20),
+        last_fill_qty: Some(5),
+        last_fill_price_cents: Some(20),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Short opened at 30, closed at 20 → profit per share 10¢ × 5 = 50¢.
+    let pnl: (i64,) = sqlx::query_as(
+        "SELECT realized_pnl_cents FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-S'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pnl.0, 50, "short close at lower price should be a profit");
+}
+
+#[tokio::test]
+async fn partial_fill_then_full_fill_accumulates_position() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-P").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    oms.submit(buy_yes("test:P:0001", "KX-INT-P", 10, 30)).await.unwrap();
+    // Partial fill: 4 contracts at 28¢.
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:P:0001".into(),
+        venue_order_id: Some("v-P".into()),
+        venue_fill_id: Some("v-P-fill1".into()),
+        status: ExecutionStatus::PartialFill,
+        cumulative_qty: 4,
+        avg_fill_price_cents: Some(28),
+        last_fill_qty: Some(4),
+        last_fill_price_cents: Some(28),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Then 6 more at 32¢ (different price).
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:P:0001".into(),
+        venue_order_id: Some("v-P".into()),
+        venue_fill_id: Some("v-P-fill2".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 10,
+        avg_fill_price_cents: Some(30),
+        last_fill_qty: Some(6),
+        last_fill_price_cents: Some(32),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    let pos: (i32, i32) = sqlx::query_as(
+        "SELECT current_qty, avg_entry_cents
+           FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-P' AND closed_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pos.0, 10);
+    // Weighted avg of 4@28 and 6@32 = (4*28 + 6*32)/10 = (112+192)/10 = 30.4 → 30 (integer).
+    assert_eq!(pos.1, 30);
+
+    // Two fill rows.
+    let n_fills: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM fills WHERE client_id = $1",
+    )
+    .bind("test:P:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n_fills.0, 2);
+}
+
+#[tokio::test]
+async fn cancel_marks_intent_and_appends_event() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-X").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    oms.submit(buy_yes("test:X:0001", "KX-INT-X", 1, 30)).await.unwrap();
+    oms.cancel("test:X:0001").await.unwrap();
+    let row: (String,) = sqlx::query_as(
+        "SELECT status FROM intents WHERE client_id = $1",
+    )
+    .bind("test:X:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "cancel_requested");
+    let n: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = $1",
+    )
+    .bind("test:X:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // submitted + cancel_requested = 2 events.
+    assert_eq!(n.0, 2);
+}
+
+#[tokio::test]
+async fn fill_then_close_settles_realised_pnl() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-H").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    // Open at 30¢.
+    oms.submit(buy_yes("test:H:open", "KX-INT-H", 5, 30)).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:H:open".into(),
+        venue_order_id: Some("venue-H1".into()),
+        venue_fill_id: Some("unique-fill-0004".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 5,
+        avg_fill_price_cents: Some(30),
+        last_fill_qty: Some(5),
+        last_fill_price_cents: Some(30),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Close at 50¢ via a sell.
+    let close = Intent {
+        client_id: "test:H:close".into(),
+        strategy: "test",
+        market: MarketTicker::new("KX-INT-H"),
+        side: Side::Yes,
+        action: IntentAction::Sell,
+        price_cents: Some(50),
+        qty: 5,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: None,
+    };
+    oms.submit(close).await.unwrap();
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:H:close".into(),
+        venue_order_id: Some("venue-H2".into()),
+        venue_fill_id: Some("unique-fill-0005".into()),
+        status: ExecutionStatus::Filled,
+        cumulative_qty: 5,
+        avg_fill_price_cents: Some(50),
+        last_fill_qty: Some(5),
+        last_fill_price_cents: Some(50),
+        last_fill_fee_cents: Some(0),
+        venue_payload: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Position closed; realised pnl = (50 - 30) * 5 = 100¢.
+    let pos: (Option<chrono::DateTime<chrono::Utc>>, i64, i32) = sqlx::query_as(
+        "SELECT closed_at, realized_pnl_cents, current_qty
+           FROM positions
+          WHERE strategy = 'test' AND ticker = 'KX-INT-H'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(pos.0.is_some(), "position should be closed");
+    assert_eq!(pos.2, 0);
+    assert_eq!(pos.1, 100);
+}
