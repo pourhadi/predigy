@@ -287,6 +287,7 @@ pub struct ReconciliationDiff {
     pub orders_only_in_db: Vec<String>,
     pub orders_only_at_venue: Vec<String>,
     pub status_mismatches: Vec<(String, String, String)>, // (client_id, db_status, venue_status)
+    pub position_mismatches: Vec<(String, i32, i32)>,     // (ticker, db_qty, venue_qty)
 }
 
 impl ReconciliationDiff {
@@ -294,6 +295,7 @@ impl ReconciliationDiff {
         self.orders_only_in_db.is_empty()
             && self.orders_only_at_venue.is_empty()
             && self.status_mismatches.is_empty()
+            && self.position_mismatches.is_empty()
     }
 }
 

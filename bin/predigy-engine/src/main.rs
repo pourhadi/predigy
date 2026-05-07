@@ -103,21 +103,59 @@ async fn main() -> Result<()> {
         info!("predigy-engine: migrations applied");
     }
 
+    let pem = std::fs::read_to_string(&config.kalshi_pem_path)
+        .with_context(|| format!("read PEM at {}", config.kalshi_pem_path.display()))?;
+    let rest_signer = Signer::from_pem(&config.kalshi_key_id, &pem)
+        .map_err(|e| anyhow::anyhow!("engine rest signer: {e}"))?;
+    let rest_client = if let Some(base) = config.kalshi_rest_endpoint.as_deref() {
+        RestClient::with_base(base, Some(rest_signer))
+    } else {
+        RestClient::authed(rest_signer)
+    }
+    .map_err(|e| anyhow::anyhow!("engine rest client: {e}"))?;
+    let rest_client = Arc::new(rest_client);
+
     // 3. Kill-switch view shared across the OMS + watcher.
     let kill_switch = Arc::new(KillSwitchView::new());
 
     // Initial sync from the DB / file fallback.
-    sync_kill_switch(&pool, &config.kill_switch_file, &kill_switch).await;
+    sync_kill_switch(&pool, &config.kill_switch_file, &kill_switch, &[]).await;
 
     // 4. Build the OMS at the configured mode (Shadow by default;
     //    Live activates the venue submitter).
-    let oms: Arc<dyn predigy_engine_core::oms::Oms> = Arc::new(DbBackedOms::new_with_mode(
+    let db_oms = DbBackedOms::new_with_mode(
         pool.clone(),
         config.default_risk_caps.clone(),
         kill_switch.clone(),
         config.engine_mode,
-    ));
+    )
+    .with_reconciliation_rest(rest_client.clone());
+    let oms: Arc<dyn predigy_engine_core::oms::Oms> = Arc::new(db_oms);
     info!(mode = ?config.engine_mode, "predigy-engine: oms ready");
+
+    // 5. Spawn the kill-switch watcher. Polls the DB +
+    //    file-based fallback every 5s.
+    // 6. Strategy registry — Phase 3.2 ships StatStrategy as the
+    //    first registered module. More strategies land in Phase 5.
+    let registry = StrategyRegistry::new();
+    register_strategies(&registry).await;
+    let known_strategy_ids: Vec<&'static str> = registry
+        .iter_ids()
+        .await
+        .into_iter()
+        .map(|id| id.0)
+        .collect();
+    sync_kill_switch(
+        &pool,
+        &config.kill_switch_file,
+        &kill_switch,
+        &known_strategy_ids,
+    )
+    .await;
+    info!(
+        n_strategies = known_strategy_ids.len(),
+        "predigy-engine: strategy registry built"
+    );
 
     // 5. Spawn the kill-switch watcher. Polls the DB +
     //    file-based fallback every 5s.
@@ -125,34 +163,25 @@ async fn main() -> Result<()> {
         let pool = pool.clone();
         let file = config.kill_switch_file.clone();
         let ks = kill_switch.clone();
+        let known = known_strategy_ids.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                sync_kill_switch(&pool, &file, &ks).await;
+                sync_kill_switch(&pool, &file, &ks, &known).await;
             }
         })
     };
 
-    // 6. Strategy registry — Phase 3.2 ships StatStrategy as the
-    //    first registered module. More strategies land in Phase 5.
-    let registry = StrategyRegistry::new();
-    register_strategies(&registry).await;
-    info!(
-        n_strategies = registry.iter_ids().await.len(),
-        "predigy-engine: strategy registry built"
-    );
-
     // 7. Market-data router. Connects to Kalshi WS, fans out
     //    book updates to subscribed strategy supervisors.
-    let pem = std::fs::read_to_string(&config.kalshi_pem_path)
-        .with_context(|| format!("read PEM at {}", config.kalshi_pem_path.display()))?;
     let router_cfg = RouterConfig {
         kalshi_key_id: config.kalshi_key_id.clone(),
         kalshi_pem: pem.clone(),
         rest_endpoint: config.kalshi_rest_endpoint.clone(),
         ws_endpoint: config.kalshi_ws_endpoint.clone(),
+        db_pool: Some(pool.clone()),
     };
     let router = MarketDataRouter::connect(router_cfg).await?;
     info!("predigy-engine: market-data router connected");
@@ -386,13 +415,14 @@ async fn main() -> Result<()> {
     } else {
         let signer = Signer::from_pem(&config.kalshi_key_id, &pem)
             .map_err(|e| anyhow::anyhow!("discovery signer: {e}"))?;
-        let rest_client = if let Some(base) = config.kalshi_rest_endpoint.as_deref() {
-            RestClient::with_base(base, Some(signer))
-        } else {
-            RestClient::authed(signer)
-        }
-        .map_err(|e| anyhow::anyhow!("discovery rest client: {e}"))?;
-        let rest_arc = Arc::new(rest_client);
+        let rest_arc = Arc::new(
+            if let Some(base) = config.kalshi_rest_endpoint.as_deref() {
+                RestClient::with_base(base, Some(signer))
+            } else {
+                RestClient::authed(signer)
+            }
+            .map_err(|e| anyhow::anyhow!("discovery rest client: {e}"))?,
+        );
         let supervisor_refs: Vec<&Supervisor> = supervisors.iter().collect();
         let svc = DiscoveryService::start(
             rest_arc,
@@ -401,6 +431,21 @@ async fn main() -> Result<()> {
             &discovery_subs,
         );
         Some(svc)
+    };
+
+    let reconcile_handle = {
+        let oms = oms.clone();
+        let interval = config.reconcile_interval;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(e) = oms.reconcile().await {
+                    warn!(error = %e, "oms: reconciliation pass failed");
+                }
+            }
+        })
     };
 
     // 9. Wait on shutdown signal.
@@ -413,6 +458,7 @@ async fn main() -> Result<()> {
     // 10. Drain.
     info!("predigy-engine: shutdown initiated; draining");
     watcher_handle.abort();
+    reconcile_handle.abort();
     if let Some(svc) = discovery_service {
         svc.shutdown(config.shutdown_grace).await;
     }
@@ -704,6 +750,7 @@ async fn sync_kill_switch(
     pool: &sqlx::PgPool,
     fallback_file: &std::path::Path,
     view: &Arc<KillSwitchView>,
+    known_strategy_ids: &[&'static str],
 ) {
     // File-based fallback. Predigy's convention (set by the
     // dashboard): the flag file always exists once anyone has
@@ -747,16 +794,11 @@ async fn sync_kill_switch(
     }
 
     // Audit I2 — per-strategy switches. Pull all non-global
-    // rows; populate the view for each strategy id we know
-    // about. Only the four trader strategies are relevant; the
-    // OMS only consults `is_armed_for(strategy)` for those.
+    // rows; populate the view for every registered strategy id.
+    if known_strategy_ids.is_empty() {
+        return;
+    }
     type StatePair = (&'static str, bool);
-    let known: &[&'static str] = &[
-        predigy_strategy_stat::STRATEGY_ID.0,
-        predigy_strategy_settlement::STRATEGY_ID.0,
-        predigy_strategy_latency::STRATEGY_ID.0,
-        predigy_strategy_cross_arb::STRATEGY_ID.0,
-    ];
     match sqlx::query_as::<_, (String, bool)>(
         "SELECT scope, armed FROM kill_switches WHERE scope <> 'global'",
     )
@@ -766,12 +808,17 @@ async fn sync_kill_switch(
         Ok(rows) => {
             // Map scope -> armed for the strategies we know.
             let mut updates: Vec<StatePair> = Vec::new();
-            for known_id in known {
+            for known_id in known_strategy_ids {
                 let armed = rows
                     .iter()
                     .find(|(scope, _)| scope == *known_id)
                     .map_or(false, |(_, a)| *a);
                 updates.push((*known_id, armed));
+            }
+            for (scope, armed) in rows {
+                if !known_strategy_ids.iter().any(|known| *known == scope) {
+                    warn!(scope, armed, "kill-switch: unknown strategy scope in DB");
+                }
             }
             view.set_strategy_states(&updates);
         }

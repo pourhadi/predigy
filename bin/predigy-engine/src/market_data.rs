@@ -24,6 +24,7 @@ use predigy_kalshi_md::{
     Channel, Client as MdClient, Connection as MdConnection, Event as MdEvent,
 };
 use predigy_kalshi_rest::Signer;
+use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +69,7 @@ pub struct RouterConfig {
     pub kalshi_pem: String,
     pub rest_endpoint: Option<String>,
     pub ws_endpoint: Option<url::Url>,
+    pub db_pool: Option<PgPool>,
 }
 
 impl std::fmt::Debug for RouterConfig {
@@ -82,6 +84,7 @@ impl std::fmt::Debug for RouterConfig {
 /// Router state — held inside the spawned task.
 struct RouterState {
     subs: Arc<RwLock<Subscriptions>>,
+    db_pool: Option<PgPool>,
     /// Per-market book state. Built lazily on first snapshot.
     books: HashMap<String, OrderBook>,
     /// Client request id → tickers requested. `subscribed` only carries the
@@ -147,6 +150,7 @@ impl MarketDataRouter {
 
         let router_state = RouterState {
             subs: subs.clone(),
+            db_pool: config.db_pool.clone(),
             books: HashMap::new(),
             req_to_tickers: HashMap::new(),
             sid_to_tickers: HashMap::new(),
@@ -364,16 +368,24 @@ async fn handle_event(
                 .entry(sid)
                 .or_default()
                 .insert(market.clone());
-            if let Some((expected, got)) = observe_sid_seq(state, sid, snapshot.seq) {
-                warn!(
-                    sid,
-                    market,
-                    expected,
-                    got,
-                    "router: sid sequence gap on snapshot; requesting WS snapshots"
-                );
-                let markets = known_sid_markets(state, sid);
-                request_sid_snapshot(state, connection, sid, markets).await?;
+            let is_pending_recovery = pending_snapshot(state, sid, &market);
+            match observe_snapshot_seq(state, sid, snapshot.seq, is_pending_recovery) {
+                SeqObservation::Fresh => {}
+                SeqObservation::Stale { last, got } => {
+                    debug!(sid, market, last, got, "router: dropping stale snapshot");
+                    return Ok(());
+                }
+                SeqObservation::Gap { expected, got } => {
+                    warn!(
+                        sid,
+                        market,
+                        expected,
+                        got,
+                        "router: sid sequence gap on snapshot; requesting WS snapshots"
+                    );
+                    let markets = known_sid_markets(state, sid);
+                    request_sid_snapshot(state, connection, sid, markets).await?;
+                }
             }
             // Borrow scopes split: apply mutation in one block,
             // clone the book, then fan out using the clone +
@@ -387,6 +399,7 @@ async fn handle_event(
                 book.clone()
             };
             mark_snapshot_ready(state, sid, &market);
+            persist_book_snapshot(state, &book_clone, None).await;
             fan_out(&state.subs, &market, &book_clone).await;
         }
         MdEvent::Delta { sid, delta } => {
@@ -403,14 +416,21 @@ async fn handle_event(
                 .entry(sid)
                 .or_default()
                 .insert(market.clone());
-            if let Some((expected, got)) = observe_sid_seq(state, sid, delta.seq) {
-                warn!(
-                    sid,
-                    market, expected, got, "router: sid sequence gap; requesting WS snapshots"
-                );
-                let markets = known_sid_markets(state, sid);
-                request_sid_snapshot(state, connection, sid, markets).await?;
-                return Ok(());
+            match observe_delta_seq(state, sid, delta.seq) {
+                SeqObservation::Fresh => {}
+                SeqObservation::Stale { last, got } => {
+                    debug!(sid, market, last, got, "router: dropping stale delta");
+                    return Ok(());
+                }
+                SeqObservation::Gap { expected, got } => {
+                    warn!(
+                        sid,
+                        market, expected, got, "router: sid sequence gap; requesting WS snapshots"
+                    );
+                    let markets = known_sid_markets(state, sid);
+                    request_sid_snapshot(state, connection, sid, markets).await?;
+                    return Ok(());
+                }
             }
             if pending_snapshot(state, sid, &market) {
                 debug!(
@@ -438,6 +458,7 @@ async fn handle_event(
             };
             match outcome_clone.0 {
                 ApplyOutcome::Ok => {
+                    persist_book_snapshot(state, &outcome_clone.1, None).await;
                     fan_out(&state.subs, &market, &outcome_clone.1).await;
                 }
                 ApplyOutcome::Gap { expected, got } => {
@@ -451,7 +472,19 @@ async fn handle_event(
                 }
             }
         }
-        MdEvent::Ticker { .. } | MdEvent::Trade { .. } => {
+        MdEvent::Ticker { body, .. } => {
+            let market = body.market_ticker;
+            if let Some(book) = state.books.get(&market).cloned() {
+                let last_trade = body.price_dollars.as_deref().and_then(dollars_str_to_cents);
+                persist_book_snapshot(state, &book, last_trade).await;
+            }
+        }
+        MdEvent::Trade { body, .. } => {
+            let market = body.market_ticker;
+            if let Some(book) = state.books.get(&market).cloned() {
+                let last_trade = dollars_str_to_cents(&body.yes_price_dollars);
+                persist_book_snapshot(state, &book, last_trade).await;
+            }
             // Strategies don't yet consume ticker / trade events;
             // we keep them subscribed for low-latency last-trade
             // signals once strategies opt in.
@@ -517,20 +550,161 @@ async fn fan_out(subs: &Arc<RwLock<Subscriptions>>, market: &str, book: &OrderBo
     }
 }
 
-fn observe_sid_seq(state: &mut RouterState, sid: u64, seq: u64) -> Option<(u64, u64)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeqObservation {
+    Fresh,
+    Stale { last: u64, got: u64 },
+    Gap { expected: u64, got: u64 },
+}
+
+fn observe_delta_seq(state: &mut RouterState, sid: u64, seq: u64) -> SeqObservation {
     let Some(last) = state.sid_last_seq.get(&sid).copied() else {
         state.sid_last_seq.insert(sid, seq);
-        return None;
+        return SeqObservation::Fresh;
     };
     if seq <= last {
-        return None;
+        return SeqObservation::Stale { last, got: seq };
     }
     state.sid_last_seq.insert(sid, seq);
     let expected = last.saturating_add(1);
     if seq > expected {
-        Some((expected, seq))
+        SeqObservation::Gap { expected, got: seq }
     } else {
-        None
+        SeqObservation::Fresh
+    }
+}
+
+fn observe_snapshot_seq(
+    state: &mut RouterState,
+    sid: u64,
+    seq: u64,
+    is_pending_recovery: bool,
+) -> SeqObservation {
+    let Some(last) = state.sid_last_seq.get(&sid).copied() else {
+        state.sid_last_seq.insert(sid, seq);
+        return SeqObservation::Fresh;
+    };
+    if seq < last || (seq == last && !is_pending_recovery) {
+        return SeqObservation::Stale { last, got: seq };
+    }
+    state.sid_last_seq.insert(sid, seq);
+    let expected = last.saturating_add(1);
+    if seq > expected && !is_pending_recovery {
+        SeqObservation::Gap { expected, got: seq }
+    } else {
+        SeqObservation::Fresh
+    }
+}
+
+async fn persist_book_snapshot(
+    state: &RouterState,
+    book: &OrderBook,
+    last_trade_cents: Option<i32>,
+) {
+    let Some(pool) = &state.db_pool else {
+        return;
+    };
+    let bid = book.best_yes_bid();
+    let ask = book.best_yes_ask();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO markets (ticker, venue, market_type)
+         VALUES ($1, 'kalshi', 'binary')
+         ON CONFLICT (ticker) DO NOTHING",
+    )
+    .bind(book.market())
+    .execute(pool)
+    .await
+    {
+        warn!(market = book.market(), error = %e, "router: persist market row failed");
+        return;
+    }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO book_snapshots
+            (ticker, best_yes_bid_cents, best_yes_ask_cents,
+             best_yes_bid_qty, best_yes_ask_qty, last_trade_cents, last_update)
+         VALUES ($1, $2, $3, $4, $5, $6, now())
+         ON CONFLICT (ticker) DO UPDATE SET
+             best_yes_bid_cents = EXCLUDED.best_yes_bid_cents,
+             best_yes_ask_cents = EXCLUDED.best_yes_ask_cents,
+             best_yes_bid_qty = EXCLUDED.best_yes_bid_qty,
+             best_yes_ask_qty = EXCLUDED.best_yes_ask_qty,
+             last_trade_cents = COALESCE(EXCLUDED.last_trade_cents, book_snapshots.last_trade_cents),
+             last_update = EXCLUDED.last_update",
+    )
+    .bind(book.market())
+    .bind(bid.map(|(p, _)| i32::from(p.cents())))
+    .bind(ask.map(|(p, _)| i32::from(p.cents())))
+    .bind(bid.map(|(_, q)| i32::try_from(q).unwrap_or(i32::MAX)))
+    .bind(ask.map(|(_, q)| i32::try_from(q).unwrap_or(i32::MAX)))
+    .bind(last_trade_cents)
+    .execute(pool)
+    .await
+    {
+        warn!(market = book.market(), error = %e, "router: persist book snapshot failed");
+    }
+}
+
+fn dollars_str_to_cents(s: &str) -> Option<i32> {
+    let v: f64 = s.parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    Some((v * 100.0).round() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn state() -> RouterState {
+        RouterState {
+            subs: Arc::new(RwLock::new(Subscriptions::default())),
+            db_pool: None,
+            books: HashMap::new(),
+            req_to_tickers: HashMap::new(),
+            sid_to_tickers: HashMap::new(),
+            sid_last_seq: HashMap::new(),
+            sid_snapshot_pending: HashMap::new(),
+            subscribed_tickers: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn stale_delta_is_reported_without_advancing_sequence() {
+        let mut s = state();
+        assert_eq!(observe_delta_seq(&mut s, 7, 10), SeqObservation::Fresh);
+        assert_eq!(
+            observe_delta_seq(&mut s, 7, 10),
+            SeqObservation::Stale { last: 10, got: 10 }
+        );
+        assert_eq!(s.sid_last_seq.get(&7).copied(), Some(10));
+    }
+
+    #[test]
+    fn stale_snapshot_is_reported_without_replacing_sequence() {
+        let mut s = state();
+        assert_eq!(
+            observe_snapshot_seq(&mut s, 7, 12, false),
+            SeqObservation::Fresh
+        );
+        assert_eq!(
+            observe_snapshot_seq(&mut s, 7, 11, false),
+            SeqObservation::Stale { last: 12, got: 11 }
+        );
+        assert_eq!(s.sid_last_seq.get(&7).copied(), Some(12));
+    }
+
+    #[test]
+    fn pending_recovery_snapshot_at_last_sequence_is_accepted() {
+        let mut s = state();
+        assert_eq!(observe_delta_seq(&mut s, 7, 15), SeqObservation::Fresh);
+        assert_eq!(
+            observe_snapshot_seq(&mut s, 7, 15, true),
+            SeqObservation::Fresh
+        );
     }
 }
 

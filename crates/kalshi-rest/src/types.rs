@@ -309,6 +309,41 @@ pub struct CancelOrderResponse {
     pub reduced_by: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OrdersResponse {
+    #[serde(default)]
+    pub orders: Vec<OrderRecord>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OrderResponse {
+    pub order: OrderRecord,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OrderRecord {
+    pub order_id: String,
+    pub client_order_id: String,
+    pub ticker: String,
+    pub status: String,
+    #[serde(default)]
+    pub fill_count_fp: Option<String>,
+    #[serde(default)]
+    pub remaining_count_fp: Option<String>,
+    #[serde(default)]
+    pub initial_count_fp: Option<String>,
+    #[serde(default)]
+    pub yes_price_dollars: Option<String>,
+    #[serde(default)]
+    pub no_price_dollars: Option<String>,
+    #[serde(default)]
+    pub taker_fees_dollars: Option<String>,
+    #[serde(default)]
+    pub maker_fees_dollars: Option<String>,
+}
+
 /// Body posted to `DELETE /portfolio/events/orders/batched`. Each
 /// element in `orders` names one venue order id to cancel. Kalshi
 /// processes the batch atomically per-order — partial success is
@@ -347,7 +382,7 @@ pub struct BatchCancelOrderResult {
 
 // -------------------------------------------------------------- Fills
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FillsResponse {
     #[serde(default)]
     pub fills: Vec<FillRecord>,
@@ -355,7 +390,7 @@ pub struct FillsResponse {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FillRecord {
     pub fill_id: String,
     #[serde(default)]

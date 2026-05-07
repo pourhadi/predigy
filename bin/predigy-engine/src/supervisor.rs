@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tracing::{error, info, warn};
 
 /// Restart configuration for a supervised strategy.
@@ -135,6 +136,7 @@ async fn supervisor_loop(
         // itself panics, fail loud and exit — that's a config
         // bug, not a runtime hiccup.
         let mut strategy = factory();
+        let tick_interval = strategy.tick_interval();
 
         // I6: grace window starts at lifecycle boot. After a
         // restart, the supervisor re-arms grace from now —
@@ -149,6 +151,7 @@ async fn supervisor_loop(
             &mut event_rx,
             boot_at,
             policy.boot_grace,
+            tick_interval,
             id,
         )
         .await;
@@ -194,10 +197,30 @@ async fn run_one_lifecycle(
     event_rx: &mut mpsc::Receiver<Event>,
     boot_at: std::time::Instant,
     boot_grace: Duration,
+    tick_interval: Option<Duration>,
     id: StrategyId,
 ) -> LoopOutcome {
     let mut grace_logged_done = boot_grace.is_zero();
-    while let Some(ev) = event_rx.recv().await {
+    let mut tick = tick_interval
+        .map(|cadence| tokio::time::interval_at(TokioInstant::now() + cadence, cadence));
+    if let Some(tick) = tick.as_mut() {
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
+
+    loop {
+        let ev = tokio::select! {
+            ev = event_rx.recv() => {
+                let Some(ev) = ev else { return LoopOutcome::Shutdown; };
+                ev
+            }
+            _ = async {
+                if let Some(tick) = tick.as_mut() {
+                    tick.tick().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => Event::Tick,
+        };
         // I6: drop BookUpdate events during the grace window so
         // the strategy doesn't fire on the initial-snapshot
         // burst. Other event kinds pass through — Tick (cache
@@ -241,7 +264,6 @@ async fn run_one_lifecycle(
             }
         }
     }
-    LoopOutcome::Shutdown
 }
 
 async fn submit_one(oms: &Arc<dyn Oms>, intent: predigy_engine_core::Intent) -> EngineResult<()> {

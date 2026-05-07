@@ -130,16 +130,16 @@ grep -E "emitting exit|force-flat|oms: rejected" ~/Library/Logs/predigy/engine.s
 psql -d predigy -c "SELECT strategy, client_id, action, status, reason, submitted_at FROM intents WHERE client_id LIKE '%-exit:%' OR client_id LIKE '%-flat:%' ORDER BY submitted_at DESC LIMIT 30;"
 ```
 
-Known blocker: current OMS cap projection treats exits as additive
-exposure. If logs show `notional cap` or `contract cap` rejections for
-exit intents, keep caps small and prioritize the fix in
-`docs/PROFITABILITY_AUDIT_PLAN.md`.
+Current behavior: exits/reductions project signed exposure and should not be
+blocked by entry caps. If logs show `notional cap` or `contract cap`
+rejections for exit intents, treat it as a regression.
 
 ### "Positions diverged from venue"
 
-As of the profitability audit, full broker reconciliation is not yet
-production-complete. Do not assume the engine will automatically repair
-missed WS fills or manual venue changes.
+The engine now runs periodic REST reconciliation. It applies missed fills and
+terminal order states, detects unmanaged venue orders, and logs position
+mismatches as `oms: reconciliation found drift`. It does not auto-flatten or
+invent DB positions for manual venue state.
 
 Immediate checks:
 
@@ -149,8 +149,8 @@ psql -d predigy -c "SELECT strategy, status, COUNT(*) FROM intents GROUP BY stra
 tail -n 120 ~/Library/Logs/predigy/engine.stderr.log
 ```
 
-If venue state disagrees with Postgres, keep the kill switch armed and
-handle the position manually until reconciliation is implemented.
+If venue state disagrees with Postgres, keep the kill switch armed until you
+understand whether the drift is legacy/manual exposure or a current OMS bug.
 
 ### "Dashboard or engine is producing many Kalshi 429s"
 

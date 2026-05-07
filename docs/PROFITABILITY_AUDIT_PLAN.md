@@ -44,7 +44,8 @@ complete and live-observed cleanly.
 
 ## Priority 0: Immediate Safety Fixes
 
-These are scale blockers. Fix before raising caps.
+These were scale blockers. Items 1-5 were implemented and redeployed live
+on 2026-05-07 in the consolidated engine.
 
 ### 1. Fix Reduce / Exit Risk Handling
 
@@ -177,7 +178,9 @@ Required tests:
 
 ## Priority 1: Risk-Control Hardening
 
-Fix these before any meaningful scale-up.
+Fix these before any meaningful scale-up. Items 1-5 were implemented and
+redeployed live on 2026-05-07. Keep caps small while the new checks are
+live-observed.
 
 ### 1. Mark-to-Market Daily Loss
 

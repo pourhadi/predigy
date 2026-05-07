@@ -99,6 +99,21 @@ fn buy_yes(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent 
     }
 }
 
+fn sell_yes(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent {
+    Intent {
+        client_id: client_id.into(),
+        strategy: "test",
+        market: MarketTicker::new(ticker),
+        side: Side::Yes,
+        action: IntentAction::Sell,
+        price_cents: Some(price_cents),
+        qty,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: Some("integration test".into()),
+    }
+}
+
 fn permissive_caps() -> RiskCaps {
     RiskCaps {
         max_notional_cents: 1_000_000,
@@ -640,6 +655,112 @@ async fn duplicate_venue_fill_id_is_idempotent() {
     .unwrap();
     assert_eq!(pos.0, 3, "duplicate fill must not double the position");
     assert_eq!(pos.1, 30);
+
+    let events: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM intent_events WHERE client_id = 'test:DUP:0001'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events.0, 2,
+        "duplicate fill must not append a lifecycle event"
+    );
+}
+
+#[tokio::test]
+async fn long_at_contract_cap_can_sell_to_close() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-CLOSE-LONG").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let mut caps = permissive_caps();
+    caps.max_contracts_per_side = 3;
+    caps.max_notional_cents = 90;
+    let oms = DbBackedOms::new(pool.clone(), caps, ks);
+
+    sqlx::query(
+        "INSERT INTO positions
+            (strategy, ticker, side, current_qty, avg_entry_cents,
+             fees_paid_cents, opened_at, last_fill_at)
+         VALUES ('test', 'KX-INT-CLOSE-LONG', 'yes', 3, 30, 0, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = oms
+        .submit(sell_yes("test:CLOSE-LONG:0001", "KX-INT-CLOSE-LONG", 3, 50))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, SubmitOutcome::Submitted { .. }),
+        "sell-to-close at cap should pass; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn short_at_contract_cap_can_buy_to_close() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-CLOSE-SHORT").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let mut caps = permissive_caps();
+    caps.max_contracts_per_side = 3;
+    caps.max_notional_cents = 90;
+    let oms = DbBackedOms::new(pool.clone(), caps, ks);
+
+    sqlx::query(
+        "INSERT INTO positions
+            (strategy, ticker, side, current_qty, avg_entry_cents,
+             fees_paid_cents, opened_at, last_fill_at)
+         VALUES ('test', 'KX-INT-CLOSE-SHORT', 'yes', -3, 30, 0, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = oms
+        .submit(buy_yes(
+            "test:CLOSE-SHORT:0001",
+            "KX-INT-CLOSE-SHORT",
+            3,
+            20,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, SubmitOutcome::Submitted { .. }),
+        "buy-to-close at cap should pass; got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn naked_sell_is_modeled_as_short_and_respects_caps() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-NAKED").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let mut caps = permissive_caps();
+    caps.max_contracts_per_side = 2;
+    let oms = DbBackedOms::new(pool.clone(), caps, ks);
+
+    let rejected = oms
+        .submit(sell_yes("test:NAKED:0001", "KX-INT-NAKED", 3, 40))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        SubmitOutcome::Rejected {
+            reason: RejectionReason::ContractCapExceeded { .. }
+        }
+    ));
+
+    let accepted = oms
+        .submit(sell_yes("test:NAKED:0002", "KX-INT-NAKED", 2, 40))
+        .await
+        .unwrap();
+    assert!(matches!(accepted, SubmitOutcome::Submitted { .. }));
 }
 
 #[tokio::test]

@@ -16,7 +16,7 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-07, post-cutover)
+## What is running RIGHT NOW (2026-05-07, post-safety hardening)
 
 ```
 launchctl list | grep predigy
@@ -120,27 +120,24 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 
 ## Open work / next session priorities
 
-1. **Do not scale yet.** A full profitability/safety audit is now
-   captured in `docs/PROFITABILITY_AUDIT_PLAN.md`. Keep caps small
-   until Priority 0 and Priority 1 items are fixed and live-observed.
-2. **Fix exit/reduce cap handling first.** Current OMS risk checks
-   treat exits as additive exposure, so TP/SL/force-flat orders can be
-   rejected by notional or contract caps. Live logs have shown this.
-3. **Fix tick scheduling and reconciliation.** Strategy `tick_interval()`
-   exists but supervisors currently depend on inbound events; venue
-   reconciliation is documented but not production-complete.
-4. **Harden market data and duplicate fills.** Sid-level sequence handling
-   is better than per-market REST resnapshot loops, but stale/duplicate
-   frames still need explicit drop semantics. Fill dedupe must happen
-   before mutating intent lifecycle state.
-5. **Gate strategy exposure while proving edge.** Favor `wx-stat`,
+1. **Do not scale yet.** Priority 0 and Priority 1 safety hardening from
+   `docs/PROFITABILITY_AUDIT_PLAN.md` is now live, but it needs clean
+   observation before caps increase.
+2. **Watch reconciliation drift.** The new REST reconciliation loop applies
+   missed fills/order terminal states and logs position mismatches. Current
+   live drift includes legacy/manual venue positions that are not fully
+   represented in the consolidated OMS DB.
+3. **Watch mark availability.** `book_snapshots` are now persisted from WS
+   books. The OMS fails closed for risk-increasing entries when a strategy
+   has open positions without recent marks; exits/reductions still pass.
+4. **Gate strategy exposure while proving edge.** Favor `wx-stat`,
    `implication-arb`, `internal-arb`, and measured `settlement`.
    Shadow or tightly gate `book-imbalance`, `variance-fade`, `latency`,
    and `news-trader` until empirical edge exists.
-6. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
+5. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
    Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
    do not prioritize FIX above the safety blockers.
-7. **Phase 7 — retire legacy daemons** completely (delete
+6. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.

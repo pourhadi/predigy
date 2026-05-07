@@ -22,7 +22,10 @@ use predigy_engine_core::oms::{
     ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, ReconciliationDiff, RejectionReason,
     RiskCaps, SubmitGroupOutcome, SubmitOutcome, VenueChoice,
 };
+use predigy_kalshi_rest::types::{FillRecord, MarketPosition, OrderRecord};
+use predigy_kalshi_rest::{Client as RestClient, Error as RestError};
 use sqlx::PgPool;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -57,6 +60,7 @@ pub struct DbBackedOms {
     risk_caps: RiskCaps,
     kill_switch: Arc<KillSwitchView>,
     mode: EngineMode,
+    rest: Option<Arc<RestClient>>,
 }
 
 impl DbBackedOms {
@@ -77,7 +81,13 @@ impl DbBackedOms {
             risk_caps,
             kill_switch,
             mode,
+            rest: None,
         }
+    }
+
+    pub fn with_reconciliation_rest(mut self, rest: Arc<RestClient>) -> Self {
+        self.rest = Some(rest);
+        self
     }
 
     pub fn mode(&self) -> EngineMode {
@@ -117,22 +127,26 @@ impl DbBackedOms {
     /// per-side and notional caps. Returns the relevant numbers
     /// without locking — the actual write transaction will
     /// re-verify.
-    async fn current_exposure(&self, intent: &Intent) -> EngineResult<ExposureSnapshot> {
+    async fn current_exposure(
+        &self,
+        intent: &Intent,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> EngineResult<ExposureSnapshot> {
         let strategy = intent.strategy;
         let ticker = intent.market.as_str();
         let side = side_to_str(&intent);
 
         // Open contracts on this (strategy, ticker, side).
-        let row: Option<(i32,)> = sqlx::query_as(
-            "SELECT current_qty FROM positions
+        let row: Option<(i32, i32)> = sqlx::query_as(
+            "SELECT current_qty, avg_entry_cents FROM positions
               WHERE strategy = $1 AND ticker = $2 AND side = $3 AND closed_at IS NULL",
         )
         .bind(strategy)
         .bind(ticker)
         .bind(side)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
-        let current_contracts = row.map_or(0, |(q,)| q.abs());
+        let (current_qty, current_avg_entry_cents) = row.unwrap_or((0, 0));
 
         // Total open notional across this strategy. Sum = qty *
         // avg_entry_cents per row, treating short positions as
@@ -143,7 +157,7 @@ impl DbBackedOms {
               WHERE strategy = $1 AND closed_at IS NULL",
         )
         .bind(strategy)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
         let strategy_notional_cents = total.and_then(|t| t.0).unwrap_or(0);
 
@@ -155,7 +169,7 @@ impl DbBackedOms {
                FROM positions
               WHERE closed_at IS NULL",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
         let global_notional_cents = global_total.and_then(|t| t.0).unwrap_or(0);
 
@@ -169,26 +183,31 @@ impl DbBackedOms {
                 AND status NOT IN ('filled','cancelled','rejected','expired','shadow')",
         )
         .bind(strategy)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await?;
 
-        // Daily realised PnL.
-        let pnl: (Option<i64>,) = sqlx::query_as(
-            "SELECT SUM(realized_pnl_cents)::BIGINT
-               FROM positions
+        let rate_window_ms = i64::try_from(self.risk_caps.rate_window_ms).unwrap_or(i64::MAX);
+        let rate_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT FROM intents
               WHERE strategy = $1
-                AND closed_at >= date_trunc('day', now())",
+                AND submitted_at >= now() - ($2::BIGINT * interval '1 millisecond')",
         )
         .bind(strategy)
-        .fetch_one(&self.pool)
+        .bind(rate_window_ms)
+        .fetch_one(&mut **tx)
         .await?;
 
+        let daily = daily_pnl_with_marks(tx, strategy).await?;
+
         Ok(ExposureSnapshot {
-            current_contracts,
+            current_qty,
+            current_avg_entry_cents,
             strategy_notional_cents,
             global_notional_cents,
             in_flight: i32::try_from(in_flight.0).unwrap_or(i32::MAX),
-            daily_realized_pnl_cents: pnl.0.unwrap_or(0),
+            orders_in_rate_window: u32::try_from(rate_count.0).unwrap_or(u32::MAX),
+            daily_pnl_cents: daily.pnl_cents,
+            missing_recent_mark: daily.missing_recent_mark,
         })
     }
 
@@ -199,9 +218,21 @@ impl DbBackedOms {
     ) -> Result<(), RejectionReason> {
         let caps = &self.risk_caps;
 
-        if exposure.daily_realized_pnl_cents < -caps.max_daily_loss_cents {
+        let projection = project_position(intent, exposure);
+        let risk_reducing = projection.added_notional_cents <= 0
+            && projection.projected_abs_contracts <= exposure.current_qty.abs();
+
+        if exposure.daily_pnl_cents < -caps.max_daily_loss_cents && !risk_reducing {
             return Err(RejectionReason::DailyLossExceeded {
                 strategy: intent.strategy,
+            });
+        }
+        if exposure.missing_recent_mark && !risk_reducing {
+            return Err(RejectionReason::InvalidIntent {
+                reason: format!(
+                    "missing recent mark for open {} positions; refusing risk-increasing entry",
+                    intent.strategy
+                ),
             });
         }
         if exposure.in_flight >= caps.max_in_flight {
@@ -211,23 +242,25 @@ impl DbBackedOms {
                 limit: caps.max_in_flight,
             });
         }
+        if exposure.orders_in_rate_window >= caps.max_orders_per_window {
+            return Err(RejectionReason::RateLimited {
+                window_ms: caps.rate_window_ms,
+            });
+        }
 
         // Project the post-fill state to check side-cap.
-        let projected_contracts = exposure.current_contracts + intent.qty;
-        if projected_contracts > caps.max_contracts_per_side {
+        if projection.projected_abs_contracts > caps.max_contracts_per_side {
             return Err(RejectionReason::ContractCapExceeded {
                 ticker: intent.market.as_str().to_string(),
                 side: side_to_str(intent).to_string(),
-                current: projected_contracts,
+                current: projection.projected_abs_contracts,
                 limit: caps.max_contracts_per_side,
             });
         }
 
-        // Notional projection — assume worst-case fill at the
-        // intent's limit price (or 50¢ if market order — pessimistic).
-        let projected_fill_cents = intent.price_cents.unwrap_or(50) as i64;
-        let added_notional = projected_fill_cents * i64::from(intent.qty);
-        if exposure.strategy_notional_cents + added_notional > caps.max_notional_cents {
+        if exposure.strategy_notional_cents + projection.added_notional_cents
+            > caps.max_notional_cents
+        {
             return Err(RejectionReason::NotionalExceeded {
                 scope: format!("strategy:{}", intent.strategy),
                 current_cents: exposure.strategy_notional_cents,
@@ -239,7 +272,8 @@ impl DbBackedOms {
         // 0 disables (per-strategy caps still apply); >0 enforces
         // a hard ceiling on engine-wide exposure.
         if caps.max_global_notional_cents > 0
-            && exposure.global_notional_cents + added_notional > caps.max_global_notional_cents
+            && exposure.global_notional_cents + projection.added_notional_cents
+                > caps.max_global_notional_cents
         {
             return Err(RejectionReason::NotionalExceeded {
                 scope: "global".into(),
@@ -259,11 +293,14 @@ impl Oms for DbBackedOms {
             return Ok(SubmitOutcome::Rejected { reason });
         }
 
+        let mut tx = self.pool.begin().await?;
+        lock_submit_section(&mut tx).await?;
+
         // Idempotency check — does this client_id already exist?
         let existing: Option<(String,)> =
             sqlx::query_as("SELECT status FROM intents WHERE client_id = $1")
                 .bind(&intent.client_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         if let Some((status,)) = existing {
             debug!(client_id = %intent.client_id, %status, "oms: idempotent re-submit");
@@ -274,7 +311,7 @@ impl Oms for DbBackedOms {
         }
 
         // Risk caps.
-        let exposure = self.current_exposure(&intent).await?;
+        let exposure = self.current_exposure(&intent, &mut tx).await?;
         if let Err(reason) = self.check_caps(&intent, &exposure) {
             return Ok(SubmitOutcome::Rejected { reason });
         }
@@ -286,7 +323,6 @@ impl Oms for DbBackedOms {
         // compare engine decisions against the legacy daemon's
         // fills without dual-trading.
         let initial_status = self.mode.initial_status();
-        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO intents
                 (client_id, strategy, ticker, side, action, price_cents,
@@ -363,12 +399,15 @@ impl Oms for DbBackedOms {
             }
         }
 
+        let mut tx = self.pool.begin().await?;
+        lock_submit_section(&mut tx).await?;
+
         // 2. Idempotency / collision probe.
         let client_ids: Vec<String> = group.intents.iter().map(|i| i.client_id.clone()).collect();
         let existing: Vec<(String, Option<uuid::Uuid>)> =
             sqlx::query_as("SELECT client_id, leg_group_id FROM intents WHERE client_id = ANY($1)")
                 .bind(&client_ids)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *tx)
                 .await?;
         if !existing.is_empty() {
             // Are ALL members of `group` accounted for, AND under
@@ -419,17 +458,28 @@ impl Oms for DbBackedOms {
         // ticker for the contract-side check; for combined
         // notional we re-use the snapshot from the first leg.
         let first = &group.intents[0];
-        let baseline = self.current_exposure(first).await?;
-        let combined_added: i64 = group
-            .intents
-            .iter()
-            .map(|i| i64::from(i.price_cents.unwrap_or(50)) * i64::from(i.qty))
-            .sum();
+        let baseline = self.current_exposure(first, &mut tx).await?;
+        let mut combined_added = 0_i64;
+        for intent in &group.intents {
+            let exposure = self.current_exposure(intent, &mut tx).await?;
+            combined_added += project_position(intent, &exposure).added_notional_cents;
+        }
 
-        if baseline.daily_realized_pnl_cents < -caps.max_daily_loss_cents {
+        if baseline.daily_pnl_cents < -caps.max_daily_loss_cents {
             return Ok(SubmitGroupOutcome::Rejected {
                 reason: RejectionReason::DailyLossExceeded {
                     strategy: first.strategy,
+                },
+                failing_client_id: first.client_id.clone(),
+            });
+        }
+        if baseline.missing_recent_mark {
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::InvalidIntent {
+                    reason: format!(
+                        "missing recent mark for open {} positions; refusing leg group",
+                        first.strategy
+                    ),
                 },
                 failing_client_id: first.client_id.clone(),
             });
@@ -442,6 +492,16 @@ impl Oms for DbBackedOms {
                     strategy: first.strategy,
                     in_flight: baseline.in_flight,
                     limit: caps.max_in_flight,
+                },
+                failing_client_id: first.client_id.clone(),
+            });
+        }
+        if baseline.orders_in_rate_window + u32::try_from(group.intents.len()).unwrap_or(u32::MAX)
+            > caps.max_orders_per_window
+        {
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::RateLimited {
+                    window_ms: caps.rate_window_ms,
                 },
                 failing_client_id: first.client_id.clone(),
             });
@@ -473,8 +533,8 @@ impl Oms for DbBackedOms {
         // independent of others (different ticker → different
         // `(strategy, ticker, side)` row in `positions`).
         for intent in &group.intents {
-            let exposure = self.current_exposure(intent).await?;
-            let projected = exposure.current_contracts + intent.qty;
+            let exposure = self.current_exposure(intent, &mut tx).await?;
+            let projected = project_position(intent, &exposure).projected_abs_contracts;
             if projected > caps.max_contracts_per_side {
                 return Ok(SubmitGroupOutcome::Rejected {
                     reason: RejectionReason::ContractCapExceeded {
@@ -492,7 +552,6 @@ impl Oms for DbBackedOms {
         //    whole transaction rolls back and we return the DB
         //    error.
         let initial_status = self.mode.initial_status();
-        let mut tx = self.pool.begin().await?;
         for intent in &group.intents {
             sqlx::query(
                 "INSERT INTO intents
@@ -564,6 +623,27 @@ impl Oms for DbBackedOms {
 
     async fn apply_execution(&self, ev: ExecutionUpdate) -> EngineResult<()> {
         let mut tx = self.pool.begin().await?;
+
+        if matches!(
+            ev.status,
+            ExecutionStatus::Filled | ExecutionStatus::PartialFill
+        ) && let Some(fid) = ev.venue_fill_id.as_deref()
+        {
+            let already: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM fills WHERE venue_fill_id = $1")
+                    .bind(fid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if already.is_some() {
+                debug!(
+                    client_id = %ev.client_id,
+                    venue_fill_id = fid,
+                    "apply_execution: duplicate fill (full no-op)"
+                );
+                tx.commit().await?;
+                return Ok(());
+            }
+        }
 
         // 1. Intents row update (status, cumulative qty, avg fill,
         //    venue order id).
@@ -672,23 +752,6 @@ impl Oms for DbBackedOms {
             if let (Some(qty), Some(price)) = (ev.last_fill_qty, ev.last_fill_price_cents) {
                 let fee = ev.last_fill_fee_cents.unwrap_or(0);
 
-                if let Some(fid) = ev.venue_fill_id.as_deref() {
-                    let already: Option<(i64,)> =
-                        sqlx::query_as("SELECT id FROM fills WHERE venue_fill_id = $1")
-                            .bind(fid)
-                            .fetch_optional(&mut *tx)
-                            .await?;
-                    if already.is_some() {
-                        debug!(
-                            client_id = %ev.client_id,
-                            venue_fill_id = fid,
-                            "apply_execution: duplicate fill (skipping cascade)"
-                        );
-                        tx.commit().await?;
-                        return Ok(());
-                    }
-                }
-
                 // Look up intent metadata for fill row.
                 let row: Option<(String, String, String, String)> = sqlx::query_as(
                     "SELECT strategy, ticker, side, action
@@ -742,23 +805,485 @@ impl Oms for DbBackedOms {
     }
 
     async fn reconcile(&self) -> EngineResult<ReconciliationDiff> {
-        // Stub. Full implementation lands when FIX is wired
-        // (Phase 4) — we'll diff `SELECT venue_order_id FROM
-        // intents WHERE status NOT terminal` against the venue's
-        // `OrderStatusRequest` snapshot.
-        Ok(ReconciliationDiff::default())
+        let Some(rest) = &self.rest else {
+            return Err(EngineError::Oms(
+                "reconcile requires an authenticated REST client".into(),
+            ));
+        };
+
+        let active: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT client_id, venue_order_id, status
+               FROM intents
+              WHERE status NOT IN ('filled','cancelled','rejected','expired','shadow')
+              ORDER BY last_updated_at DESC
+              LIMIT 500",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut diff = ReconciliationDiff::default();
+        let mut venue_seen = HashSet::new();
+        for (client_id, venue_order_id, db_status) in &active {
+            let Some(order_id) = venue_order_id.as_deref() else {
+                diff.orders_only_in_db.push(client_id.clone());
+                continue;
+            };
+            venue_seen.insert(order_id.to_string());
+            match rest.get_order(order_id).await {
+                Ok(resp) => {
+                    reconcile_order_status(self, &resp.order, client_id, db_status, &mut diff)
+                        .await?;
+                    catch_up_order_fills(self, rest, client_id, &resp.order).await?;
+                }
+                Err(RestError::Api { status: 404, body }) => {
+                    diff.orders_only_in_db.push(client_id.clone());
+                    mark_intent_terminal(
+                        &self.pool,
+                        client_id,
+                        "expired",
+                        serde_json::json!({
+                            "kind": "reconciliation_order_absent",
+                            "venue_order_id": order_id,
+                            "body": body,
+                        }),
+                    )
+                    .await?;
+                }
+                Err(e) => return Err(EngineError::Oms(format!("get_order {order_id}: {e}"))),
+            }
+        }
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let resp = rest
+                .list_orders(None, Some("resting"), None, Some(100), cursor.as_deref())
+                .await
+                .map_err(|e| EngineError::Oms(format!("list resting orders: {e}")))?;
+            for order in resp.orders {
+                if !venue_seen.contains(&order.order_id) {
+                    let known: Option<(String,)> =
+                        sqlx::query_as("SELECT client_id FROM intents WHERE venue_order_id = $1")
+                            .bind(&order.order_id)
+                            .fetch_optional(&self.pool)
+                            .await?;
+                    if known.is_none() {
+                        diff.orders_only_at_venue.push(order.order_id);
+                    }
+                }
+            }
+            cursor = resp.cursor.filter(|c| !c.is_empty());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        reconcile_positions(self, rest, &mut diff).await?;
+        if diff.is_clean() {
+            debug!("oms: reconciliation clean");
+        } else {
+            warn!(?diff, "oms: reconciliation found drift");
+        }
+        Ok(diff)
     }
 }
 
 #[derive(Debug)]
 struct ExposureSnapshot {
-    current_contracts: i32,
+    current_qty: i32,
+    current_avg_entry_cents: i32,
     strategy_notional_cents: i64,
     /// Phase 6.2 — total open notional across every strategy in
     /// `positions`. Used for the global-cap check.
     global_notional_cents: i64,
     in_flight: i32,
-    daily_realized_pnl_cents: i64,
+    orders_in_rate_window: u32,
+    daily_pnl_cents: i64,
+    missing_recent_mark: bool,
+}
+
+#[derive(Debug)]
+struct PositionProjection {
+    projected_abs_contracts: i32,
+    added_notional_cents: i64,
+}
+
+#[derive(Debug)]
+struct DailyPnlSnapshot {
+    pnl_cents: i64,
+    missing_recent_mark: bool,
+}
+
+async fn lock_submit_section(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> EngineResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('predigy_oms_submit')::BIGINT)")
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn signed_intent_qty(intent: &Intent) -> i32 {
+    match intent.action {
+        IntentAction::Buy => intent.qty,
+        IntentAction::Sell => -intent.qty,
+    }
+}
+
+fn project_position(intent: &Intent, exposure: &ExposureSnapshot) -> PositionProjection {
+    let signed_qty = signed_intent_qty(intent);
+    let projected_qty = exposure.current_qty + signed_qty;
+    let fill_cents = i64::from(intent.price_cents.unwrap_or(50));
+
+    let current_abs = i64::from(exposure.current_qty.abs());
+    let projected_abs = i64::from(projected_qty.abs());
+    let current_notional = current_abs * i64::from(exposure.current_avg_entry_cents);
+
+    let projected_notional =
+        if exposure.current_qty == 0 || signed_qty.signum() == exposure.current_qty.signum() {
+            current_notional + fill_cents * i64::from(intent.qty)
+        } else if projected_qty.signum() == exposure.current_qty.signum() || projected_qty == 0 {
+            projected_abs * i64::from(exposure.current_avg_entry_cents)
+        } else {
+            // Reversal: the reducing portion closes at the old basis; only the
+            // excess beyond flat opens new exposure at the submitted price.
+            let reversed_abs = i64::from(intent.qty) - current_abs;
+            reversed_abs.max(0) * fill_cents
+        };
+
+    PositionProjection {
+        projected_abs_contracts: projected_qty.abs(),
+        added_notional_cents: projected_notional - current_notional,
+    }
+}
+
+async fn daily_pnl_with_marks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    strategy: &str,
+) -> EngineResult<DailyPnlSnapshot> {
+    let rows: Vec<(
+        i32,
+        i32,
+        i64,
+        i64,
+        Option<i32>,
+        Option<i32>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT p.current_qty,
+                p.avg_entry_cents,
+                p.realized_pnl_cents,
+                p.fees_paid_cents,
+                b.best_yes_bid_cents,
+                b.best_yes_ask_cents,
+                b.last_update
+           FROM positions p
+      LEFT JOIN book_snapshots b ON b.ticker = p.ticker
+          WHERE p.strategy = $1
+            AND (p.closed_at >= date_trunc('day', now()) OR p.closed_at IS NULL)",
+    )
+    .bind(strategy)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut pnl = 0_i64;
+    let mut missing_recent_mark = false;
+    let now = chrono::Utc::now();
+    for (qty, avg_entry, realized, fees, bid, ask, mark_ts) in rows {
+        pnl += realized - fees;
+        if qty == 0 {
+            continue;
+        }
+        let recent = mark_ts.is_some_and(|ts| now.signed_duration_since(ts).num_seconds() <= 120);
+        if !recent {
+            missing_recent_mark = true;
+            continue;
+        }
+        let mark = if qty > 0 { bid } else { ask };
+        if let Some(mark_cents) = mark {
+            pnl +=
+                i64::from(mark_cents - avg_entry) * i64::from(qty.signum()) * i64::from(qty.abs());
+        } else {
+            missing_recent_mark = true;
+        }
+    }
+    Ok(DailyPnlSnapshot {
+        pnl_cents: pnl,
+        missing_recent_mark,
+    })
+}
+
+async fn reconcile_order_status(
+    oms: &DbBackedOms,
+    order: &OrderRecord,
+    client_id: &str,
+    db_status: &str,
+    diff: &mut ReconciliationDiff,
+) -> EngineResult<()> {
+    let target = match order.status.as_str() {
+        "resting" => "acked",
+        "canceled" => "cancelled",
+        "executed" => "filled",
+        other => other,
+    };
+    if db_status == target || (target == "acked" && db_status == "partial_fill") {
+        return Ok(());
+    }
+    diff.status_mismatches.push((
+        client_id.to_string(),
+        db_status.to_string(),
+        order.status.clone(),
+    ));
+
+    match target {
+        "acked" if db_status == "submitted" => {
+            mark_intent_status(
+                &oms.pool,
+                client_id,
+                "acked",
+                Some(&order.order_id),
+                serde_json::json!({"kind": "reconciliation_order_resting", "order": order}),
+            )
+            .await?;
+        }
+        "cancelled" => {
+            mark_intent_terminal(
+                &oms.pool,
+                client_id,
+                "cancelled",
+                serde_json::json!({"kind": "reconciliation_order_cancelled", "order": order}),
+            )
+            .await?;
+        }
+        "filled" => {
+            let cumulative = order
+                .fill_count_fp
+                .as_deref()
+                .and_then(parse_contracts_fp)
+                .unwrap_or(0);
+            <DbBackedOms as Oms>::apply_execution(
+                oms,
+                ExecutionUpdate {
+                    client_id: client_id.to_string(),
+                    venue_order_id: Some(order.order_id.clone()),
+                    venue_fill_id: None,
+                    status: ExecutionStatus::Filled,
+                    cumulative_qty: cumulative,
+                    avg_fill_price_cents: None,
+                    last_fill_qty: None,
+                    last_fill_price_cents: None,
+                    last_fill_fee_cents: None,
+                    venue_payload: serde_json::json!({
+                        "kind": "reconciliation_order_executed",
+                        "order": order,
+                    }),
+                },
+            )
+            .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn catch_up_order_fills(
+    oms: &DbBackedOms,
+    rest: &Arc<RestClient>,
+    client_id: &str,
+    order: &OrderRecord,
+) -> EngineResult<()> {
+    let intent_side: Option<(String,)> =
+        sqlx::query_as("SELECT side FROM intents WHERE client_id = $1")
+            .bind(client_id)
+            .fetch_optional(&oms.pool)
+            .await?;
+    let Some((side,)) = intent_side else {
+        return Err(EngineError::Oms(format!(
+            "reconciliation fill catch-up for unknown intent {client_id}"
+        )));
+    };
+
+    let mut cursor: Option<String> = None;
+    loop {
+        let resp = rest
+            .list_fills(Some(&order.order_id), None, Some(100), cursor.as_deref())
+            .await
+            .map_err(|e| EngineError::Oms(format!("list_fills {}: {e}", order.order_id)))?;
+        for fill in resp.fills {
+            apply_rest_fill(oms, client_id, order, &side, &fill).await?;
+        }
+        cursor = resp.cursor.filter(|c| !c.is_empty());
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_rest_fill(
+    oms: &DbBackedOms,
+    client_id: &str,
+    order: &OrderRecord,
+    intent_side: &str,
+    fill: &FillRecord,
+) -> EngineResult<()> {
+    let qty = parse_contracts_fp(&fill.count_fp).ok_or_else(|| {
+        EngineError::Oms(format!(
+            "invalid fill count_fp '{}' for {}",
+            fill.count_fp, fill.fill_id
+        ))
+    })?;
+    let price = if intent_side == "no" {
+        dollars_str_to_cents(&fill.no_price_dollars)
+    } else {
+        dollars_str_to_cents(&fill.yes_price_dollars)
+    }
+    .ok_or_else(|| EngineError::Oms(format!("invalid fill price for {}", fill.fill_id)))?;
+    let fee = fill
+        .fee_cost
+        .as_deref()
+        .and_then(dollars_str_to_cents)
+        .unwrap_or(0);
+    let cumulative = order
+        .fill_count_fp
+        .as_deref()
+        .and_then(parse_contracts_fp)
+        .unwrap_or(qty);
+    let remaining = order
+        .remaining_count_fp
+        .as_deref()
+        .and_then(parse_contracts_fp)
+        .unwrap_or(0);
+    let status = if order.status == "executed" || remaining == 0 {
+        ExecutionStatus::Filled
+    } else {
+        ExecutionStatus::PartialFill
+    };
+    let fill_id = fill
+        .trade_id
+        .as_deref()
+        .unwrap_or(&fill.fill_id)
+        .to_string();
+    <DbBackedOms as Oms>::apply_execution(
+        oms,
+        ExecutionUpdate {
+            client_id: client_id.to_string(),
+            venue_order_id: Some(order.order_id.clone()),
+            venue_fill_id: Some(fill_id),
+            status,
+            cumulative_qty: cumulative,
+            avg_fill_price_cents: Some(price),
+            last_fill_qty: Some(qty),
+            last_fill_price_cents: Some(price),
+            last_fill_fee_cents: Some(fee),
+            venue_payload: serde_json::json!({
+                "kind": "reconciliation_fill_catchup",
+                "fill": fill,
+                "order": order,
+            }),
+        },
+    )
+    .await
+}
+
+async fn reconcile_positions(
+    oms: &DbBackedOms,
+    rest: &Arc<RestClient>,
+    diff: &mut ReconciliationDiff,
+) -> EngineResult<()> {
+    let venue = rest
+        .positions()
+        .await
+        .map_err(|e| EngineError::Oms(format!("positions: {e}")))?;
+    let mut venue_by_ticker = HashMap::new();
+    for p in venue.market_positions {
+        if let Some(qty) = venue_position_qty(&p) {
+            if qty != 0 {
+                venue_by_ticker.insert(p.ticker.clone(), qty);
+            }
+        }
+    }
+
+    let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT ticker,
+                SUM(CASE WHEN side = 'yes' THEN current_qty ELSE -current_qty END)::BIGINT
+           FROM positions
+          WHERE closed_at IS NULL
+          GROUP BY ticker",
+    )
+    .fetch_all(&oms.pool)
+    .await?;
+    let mut db_tickers = HashSet::new();
+    for (ticker, qty) in rows {
+        let db_qty = i32::try_from(qty.unwrap_or(0)).unwrap_or(0);
+        db_tickers.insert(ticker.clone());
+        let venue_qty = venue_by_ticker.get(&ticker).copied().unwrap_or(0);
+        if db_qty != venue_qty {
+            diff.position_mismatches.push((ticker, db_qty, venue_qty));
+        }
+    }
+    for (ticker, venue_qty) in venue_by_ticker {
+        if !db_tickers.contains(&ticker) {
+            diff.position_mismatches.push((ticker, 0, venue_qty));
+        }
+    }
+    Ok(())
+}
+
+async fn mark_intent_status(
+    pool: &PgPool,
+    client_id: &str,
+    status: &str,
+    venue_order_id: Option<&str>,
+    payload: serde_json::Value,
+) -> EngineResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE intents
+            SET status = $2,
+                venue_order_id = COALESCE($3, venue_order_id),
+                last_updated_at = now()
+          WHERE client_id = $1",
+    )
+    .bind(client_id)
+    .bind(status)
+    .bind(venue_order_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO intent_events (client_id, status, venue_payload) VALUES ($1, $2, $3)")
+        .bind(client_id)
+        .bind(status)
+        .bind(payload)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn mark_intent_terminal(
+    pool: &PgPool,
+    client_id: &str,
+    status: &str,
+    payload: serde_json::Value,
+) -> EngineResult<()> {
+    mark_intent_status(pool, client_id, status, None, payload).await
+}
+
+fn parse_contracts_fp(s: &str) -> Option<i32> {
+    let v: f64 = s.parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    Some(v.round() as i32)
+}
+
+fn dollars_str_to_cents(s: &str) -> Option<i32> {
+    let v: f64 = s.parse().ok()?;
+    if !v.is_finite() {
+        return None;
+    }
+    Some((v * 100.0).round() as i32)
+}
+
+fn venue_position_qty(p: &MarketPosition) -> Option<i32> {
+    p.position_contracts.map(|q| q.round() as i32)
 }
 
 async fn upsert_position(

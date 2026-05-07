@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::types::{
     BalanceResponse, BatchCancelOrdersRequest, BatchCancelOrdersResponse, CancelOrderResponse,
     CreateOrderRequest, CreateOrderResponse, FillsResponse, MarketDetailResponse, MarketsResponse,
-    OrderbookResponse, PositionsResponse, SeriesListResponse,
+    OrderResponse, OrderbookResponse, OrdersResponse, PositionsResponse, SeriesListResponse,
 };
 use predigy_book::Snapshot;
 use predigy_core::price::Price;
@@ -337,6 +337,46 @@ impl Client {
         }
         self.delete_json(&format!("/portfolio/events/orders/{order_id}"), &[])
             .await
+    }
+
+    /// `GET /portfolio/orders/{order_id}` (auth required).
+    pub async fn get_order(&self, order_id: &str) -> Result<OrderResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("get_order requires a signer".into()));
+        }
+        self.get_json(&format!("/portfolio/orders/{order_id}"), &[])
+            .await
+    }
+
+    /// `GET /portfolio/orders` (auth required).
+    pub async fn list_orders(
+        &self,
+        ticker: Option<&str>,
+        status: Option<&str>,
+        min_ts: Option<i64>,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<OrdersResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth("list_orders requires a signer".into()));
+        }
+        let mut q = Vec::new();
+        if let Some(t) = ticker {
+            q.push(("ticker", t.to_string()));
+        }
+        if let Some(s) = status {
+            q.push(("status", s.to_string()));
+        }
+        if let Some(t) = min_ts {
+            q.push(("min_ts", t.to_string()));
+        }
+        if let Some(l) = limit {
+            q.push(("limit", l.to_string()));
+        }
+        if let Some(c) = cursor {
+            q.push(("cursor", c.to_string()));
+        }
+        self.get_json("/portfolio/orders", &q).await
     }
 
     /// `DELETE /portfolio/events/orders/batched` (auth required).

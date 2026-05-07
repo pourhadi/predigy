@@ -109,11 +109,21 @@ async fn submitter_task(pool: PgPool, rest: Arc<RestClient>, poll_interval: Dura
 /// separate rate limiter at this throughput.
 async fn drain_submits(pool: &PgPool, rest: &Arc<RestClient>) -> Result<()> {
     let rows: Vec<SubmittedIntent> = sqlx::query_as::<_, SubmittedIntent>(
-        "SELECT client_id, ticker, side, action, price_cents, qty,
-                order_type, tif
-           FROM intents
-          WHERE status = 'submitted'
-          ORDER BY submitted_at
+        "SELECT i.client_id, i.strategy, i.ticker, i.side, i.action,
+                i.price_cents, i.qty, i.order_type, i.tif,
+                EXISTS (
+                    SELECT 1
+                      FROM positions p
+                     WHERE p.strategy = i.strategy
+                       AND p.ticker = i.ticker
+                       AND p.side = i.side
+                       AND p.closed_at IS NULL
+                       AND ((i.action = 'sell' AND p.current_qty > 0 AND i.qty <= p.current_qty)
+                         OR (i.action = 'buy' AND p.current_qty < 0 AND i.qty <= ABS(p.current_qty)))
+                ) AS reduce_only
+           FROM intents i
+          WHERE i.status = 'submitted'
+          ORDER BY i.submitted_at
           LIMIT 64",
     )
     .fetch_all(pool)
@@ -139,11 +149,13 @@ async fn submit_one(pool: &PgPool, rest: &Arc<RestClient>, row: &SubmittedIntent
 
     debug!(
         client_id = %row.client_id,
+        strategy = %row.strategy,
         ticker = %row.ticker,
         side = %row.side,
         action = %row.action,
         qty = row.qty,
         price_cents = ?row.price_cents,
+        reduce_only = row.reduce_only,
         "venue_rest: submitting"
     );
 
@@ -369,7 +381,7 @@ fn build_create_request(row: &SubmittedIntent) -> Result<CreateOrderRequest> {
         time_in_force: tif,
         self_trade_prevention_type: SelfTradePreventionV2::TakerAtCross,
         post_only,
-        reduce_only: None,
+        reduce_only: row.reduce_only.then_some(true),
     })
 }
 
@@ -487,6 +499,7 @@ async fn mark_cancelled(pool: &PgPool, client_id: &str, payload: serde_json::Val
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct SubmittedIntent {
     client_id: String,
+    strategy: String,
     ticker: String,
     side: String,
     action: String,
@@ -494,6 +507,7 @@ struct SubmittedIntent {
     qty: i32,
     order_type: String,
     tif: String,
+    reduce_only: bool,
 }
 
 #[cfg(test)]
@@ -503,6 +517,7 @@ mod tests {
     fn intent(side: &str, action: &str, price_cents: Option<i32>, tif: &str) -> SubmittedIntent {
         SubmittedIntent {
             client_id: "stat:KXFOO-X:00012345".into(),
+            strategy: "stat".into(),
             ticker: "KXFOO-X".into(),
             side: side.into(),
             action: action.into(),
@@ -510,6 +525,7 @@ mod tests {
             qty: 2,
             order_type: "limit".into(),
             tif: tif.into(),
+            reduce_only: false,
         }
     }
 
@@ -532,6 +548,14 @@ mod tests {
         assert_eq!(req.side, OrderSideV2::Ask);
         assert_eq!(req.action, OrderAction::Sell);
         assert_eq!(req.price, "0.4200");
+    }
+
+    #[test]
+    fn reduce_only_is_sent_for_closing_intents() {
+        let mut row = intent("yes", "sell", Some(42), "ioc");
+        row.reduce_only = true;
+        let req = build_create_request(&row).unwrap();
+        assert_eq!(req.reduce_only, Some(true));
     }
 
     #[test]

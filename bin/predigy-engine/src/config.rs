@@ -248,9 +248,11 @@ mod tests {
 
     #[test]
     fn caps_from_env_overrides_individual_fields() {
+        let old_contract_cap = std::env::var("PREDIGY_MAX_CONTRACTS_PER_SIDE").ok();
         unsafe {
             std::env::set_var("PREDIGY_MAX_NOTIONAL_CENTS", "10000");
             std::env::set_var("PREDIGY_MAX_DAILY_LOSS_CENTS", "5000");
+            std::env::remove_var("PREDIGY_MAX_CONTRACTS_PER_SIDE");
         }
         let caps = caps_from_env();
         assert_eq!(caps.max_notional_cents, 10_000);
@@ -260,6 +262,9 @@ mod tests {
         unsafe {
             std::env::remove_var("PREDIGY_MAX_NOTIONAL_CENTS");
             std::env::remove_var("PREDIGY_MAX_DAILY_LOSS_CENTS");
+            if let Some(v) = old_contract_cap {
+                std::env::set_var("PREDIGY_MAX_CONTRACTS_PER_SIDE", v);
+            }
         }
     }
 }
