@@ -1874,6 +1874,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-strategy-settlement"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-book",
+ "predigy-core",
+ "predigy-engine-core",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "predigy-strategy-stat"
 version = "0.1.0"
 dependencies = [

@@ -15,6 +15,7 @@ members = [
     "crates/signals",
     "crates/engine-core",
     "crates/strategies/stat",
+    "crates/strategies/settlement",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -125,6 +126,7 @@ predigy-signals = { path = "crates/signals" }
 predigy-kalshi-fix = { path = "crates/kalshi-fix" }
 predigy-engine-core = { path = "crates/engine-core" }
 predigy-strategy-stat = { path = "crates/strategies/stat" }
+predigy-strategy-settlement = { path = "crates/strategies/settlement" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
 stat-trader = { path = "bin/stat-trader" }
