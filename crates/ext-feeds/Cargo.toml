@@ -16,6 +16,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# GRIB2 decoding for NBM probabilistic forecast data.  jpeg2000
+# unpacking is required because NBM compresses values with
+# Template 5.40.  The C dep (openjpeg) is provided by Homebrew on
+# macOS; CI Linux images get it via apt-get install libopenjp2-7-dev.
+grib = { version = "0.15", default-features = false, features = ["jpeg2000-unpack-with-openjpeg", "gridpoints-proj"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
