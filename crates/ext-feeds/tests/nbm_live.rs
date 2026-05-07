@@ -31,6 +31,7 @@ use predigy_ext_feeds::nbm::{
     NbmClient, NbmCycle, locate_quantile_messages, locate_threshold_message,
 };
 use predigy_ext_feeds::nbm_decode::decode_message;
+use predigy_ext_feeds::nbm_extract::{NamedPoint, extract_tmp_quantiles_at_points};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TEST_USER_AGENT: &str = "(predigy-ext-feeds tests, dan@pourhadi.com)";
@@ -201,4 +202,93 @@ async fn decode_tmp_50pct_quantile_at_denver() {
         dist_km < 5.0,
         "nearest grid point at Denver was {dist_km:.1} km away — grid lookup likely wrong"
     );
+}
+
+#[tokio::test]
+#[ignore = "hits live NOAA S3 + decodes 21 GRIB messages (~100MB)"]
+async fn extract_quantiles_for_multiple_airports_round_trip() {
+    // The full Phase 2C pipeline: pull ALL 21 TMP quantile messages
+    // for one (cycle, fcst_hour), sample at multiple airports in
+    // one pass, validate the cache file written and the CDF
+    // interpolation makes sense.
+    let client = NbmClient::new(TEST_USER_AGENT).unwrap();
+    let cycle = recent_cycle(now_unix());
+    eprintln!("test cycle: {cycle:?}");
+
+    let cache_dir = tempfile::tempdir().unwrap();
+
+    let points = vec![
+        NamedPoint {
+            name: "DEN".into(),
+            lat: 39.8617,
+            lon: -104.6731,
+        },
+        NamedPoint {
+            name: "LAX".into(),
+            lat: 33.9416,
+            lon: -118.4085,
+        },
+        NamedPoint {
+            name: "NYC".into(),
+            lat: 40.7794,
+            lon: -73.8803,
+        },
+    ];
+
+    let started = SystemTime::now();
+    let qs = extract_tmp_quantiles_at_points(&client, cache_dir.path(), cycle, 24, &points)
+        .await
+        .expect("extract");
+    let cold_secs = started.elapsed().unwrap().as_secs_f64();
+    eprintln!("cold extract: {cold_secs:.1}s for {} points", qs.len());
+    assert_eq!(qs.len(), 3);
+
+    for q in &qs {
+        eprintln!(
+            "  {}: 21 quantile temps Kelvin, 50%-level={:.2}K ({:.1}F), snap {:.2} km",
+            q.name,
+            q.temps_k[10],
+            (q.temps_k[10] - 273.15) * 9.0 / 5.0 + 32.0,
+            q.snap_distance_km,
+        );
+        assert_eq!(q.temps_k.len(), 21);
+        // Quantiles must be monotonic non-decreasing.
+        for w in q.temps_k.windows(2) {
+            assert!(
+                w[0] <= w[1] + 0.01,
+                "quantile non-monotone for {}: {} > {}",
+                q.name,
+                w[0],
+                w[1]
+            );
+        }
+        // 50%-level should look earth-like.
+        assert!((200.0..330.0).contains(&q.temps_k[10]));
+        assert!(q.snap_distance_km < 5.0);
+    }
+
+    // Cache should now be populated; second call must be fast.
+    let started = SystemTime::now();
+    let qs2 = extract_tmp_quantiles_at_points(&client, cache_dir.path(), cycle, 24, &points)
+        .await
+        .expect("extract from cache");
+    let warm_secs = started.elapsed().unwrap().as_secs_f64();
+    eprintln!("warm extract (cache hit): {warm_secs:.3}s");
+    assert_eq!(qs2.len(), 3);
+    // Cache hit should be <1s (just file reads).
+    assert!(warm_secs < 1.0, "warm extract took {warm_secs}s (cache miss?)");
+
+    // CDF interpolation sanity: the median quantile (50%) should
+    // map to ~0.5; a value below the 0% quantile to 0; above 100%
+    // to 1.
+    let first = &qs[0];
+    let median = first.temps_k[10];
+    let p_at_median = first.cdf_at(median);
+    eprintln!(
+        "{}: cdf_at(median={:.1}K) = {:.3}",
+        first.name, median, p_at_median
+    );
+    assert!((0.45..=0.55).contains(&p_at_median));
+    assert!((first.cdf_at(100.0) - 0.0).abs() < 1e-9);
+    assert!((first.cdf_at(400.0) - 1.0).abs() < 1e-9);
 }

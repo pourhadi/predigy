@@ -36,6 +36,7 @@
 pub mod error;
 pub mod nbm;
 pub mod nbm_decode;
+pub mod nbm_extract;
 pub mod nws;
 pub mod nws_forecast;
 
@@ -45,6 +46,7 @@ pub use nbm::{
     build_message_ranges, locate_quantile_messages, locate_threshold_message, parse_idx,
 };
 pub use nbm_decode::{NbmField, decode_message as decode_nbm_message};
+pub use nbm_extract::{AirportQuantiles, NamedPoint, extract_tmp_quantiles_at_points};
 pub use nws::{MIN_POLL_INTERVAL, NwsAlert, NwsAlertsConfig, parse_collection, spawn as spawn_nws};
 pub use nws_forecast::{
     GridPoint, HourlyForecast, HourlyForecastEntry, NwsForecastClient, parse_hourly_response,
