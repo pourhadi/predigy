@@ -379,24 +379,89 @@ the work.
 - [ ] **Phase 3.4 (BLOCKED on Phase 4)**: flip engine to Live
       mode + retire legacy stat-trader. Requires the FIX path.
 
-### Phase 4 — FIX wired in (BLOCKED on Kalshi-side approval)
+### Phase 4 — Engine venue path: REST-primary + WS-push fills
+
+The order-protocol decision was relitigated 2026-05-07. Earlier
+plan said "FIX as primary, REST fallback". Updated plan: **REST
+as primary, WS-push fills for sub-second execution feedback,
+FIX as a switchover upgrade once Kalshi grants access**.
+
+Why the change:
+- Kalshi WS does NOT support order submit / cancel — those are
+  REST-only by venue design. Confirmed against
+  [docs.kalshi.com/websockets/websocket-connection](https://docs.kalshi.com/websockets/websocket-connection).
+- Kalshi WS DOES push real-time fill / position / order-state
+  events on authed channels (`fill`, `market_positions`,
+  `user_orders`). This closes most of the latency gap REST-poll
+  would otherwise leave: ~500ms poll latency drops to ~10ms
+  push.
+- For our 5 strategy lanes, FIX matters meaningfully only for
+  latency-trader (NWS alerts) and cross-arb (cross-venue
+  spread). cross-arb's bottleneck is the round-trip "submit
+  leg 1 → fill notification → submit leg 2" — WS-push fills
+  cuts that ~50% without Kalshi-side approval.
+- FIX submit-side latency advantage (sub-ms vs REST 200ms) is
+  marginal at our current capital scale ($50→$5K). It becomes
+  load-bearing for latency-trader specifically when capital
+  scales past ~$5K and per-fire size justifies the protocol
+  upgrade.
+
+#### Phase 4a — REST submitter + WS-push fills (NOT BLOCKED)
+
+This is the production venue path the engine ships with. Builds
+without any Kalshi-side approval; deliverable in days.
+
+- [ ] **REST submitter worker** in `bin/predigy-engine/src/venue_rest.rs`.
+      Polls the `intents` table for `status='submitted'` rows
+      (Live mode), submits each via Kalshi REST
+      `POST /portfolio/orders`, updates status on response.
+      Rate-limited share of the global REST budget. Idempotent
+      via the `client_id` PK + Kalshi's `client_order_id`
+      header (Kalshi rejects duplicate client_order_ids on
+      submit so the second submit collapses cleanly).
+- [ ] **WS-push fill subscriber** in `bin/predigy-engine/src/exec_data.rs`.
+      Subscribes the existing kalshi-md client to the authed
+      channels `fill`, `market_positions`, `user_orders`. Maps
+      each MdEvent into the OMS's `ExecutionUpdate` and calls
+      `apply_execution`. Replaces what the legacy daemons do
+      via REST-poll today.
+- [ ] **REST cancel path**: same shape as submitter but for
+      `status='cancel_requested'` rows, calls `DELETE
+      /portfolio/orders/{order_id}`.
+- [ ] Engine integration test: mock REST + WS, submit intent,
+      observe fill push, position cascade, all transactional.
+
+#### Phase 4b — FIX switchover (BLOCKED on Kalshi access)
+
+The OMS already exposes `VenueChoice::{Rest, Fix}` so flipping
+order routing is a config / per-intent decision, not a rewrite.
 
 Status as of 2026-05-07: Kalshi FIX requires institutional-grade
-onboarding. Operator emailing `institutional@kalshi.com` with
-the request. See "Kalshi FIX onboarding" section below for the
-process + technical requirements + draft email.
+onboarding. Operator emailing `institutional@kalshi.com`. See
+"Kalshi FIX onboarding" section below + the email draft in
+`docs/KALSHI_FIX_REQUEST.md`.
 
 Once approved:
 - [ ] Existing `predigy-kalshi-fix` crate updated to FIXT.1.1 +
       FIX 5.0 SP2 (currently coded against FIX 4.4 per pre-session
       docs; Kalshi's live spec is FIX 5.0 SP2). Schema diff is
       modest — most of the session-layer code transfers.
-- [ ] Engine boots a FIX session at startup. Logon with
-      `ResetSeqNumFlag=true` (mandatory per spec for non-RT gateway).
-- [ ] Hot-path orders route FIX-first; REST fallback if session
-      down.
-- [ ] Verify on stat-trader's order flow first (low volume, easy
-      to inspect).
+- [ ] Engine boots a FIX session at startup (in addition to the
+      existing REST submitter). Logon with `ResetSeqNumFlag=true`
+      (mandatory per spec for non-RT gateway).
+- [ ] Order-routing policy: hot-path strategies (latency-trader,
+      cross-arb) → FIX first, REST fallback on session loss.
+      Other strategies → REST (FIX latency advantage is
+      irrelevant to them and FIX's per-key single-connection
+      constraint means we don't waste it on non-hot-path
+      orders).
+- [ ] Verify on stat-trader's order flow first (low volume,
+      easy to inspect) before flipping the latency-sensitive
+      lanes.
+
+The REST submitter built in 4a stays as the fallback even after
+4b lands — defence in depth for FIX session loss / network
+glitches. It's not throwaway work.
 
 ### Phase 5 — Port remaining strategies
 

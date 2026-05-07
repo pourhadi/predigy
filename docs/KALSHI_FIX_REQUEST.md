@@ -62,59 +62,73 @@ ready when we hit whatever activity threshold they require.
 
 ```
 To: institutional@kalshi.com
-Subject: FIX gateway access request — predigy automated trading platform
+Subject: FIX gateway access — future upgrade for predigy
+         automated trading platform
 
 Hi,
 
-I'm writing to inquire about FIX gateway access for my Kalshi
-trading account (key id a381c833-6172-4b19-a27e-a0b2345f86c7,
-account email dan@pourhadi.com). Currently using the REST + WS
-APIs in production; would like to graduate to FIX for the
-latency edge on news-driven and cross-venue strategies.
+I'm writing about FIX gateway access for my Kalshi trading
+account (key id a381c833-6172-4b19-a27e-a0b2345f86c7, email
+dan@pourhadi.com). To be upfront: we're building toward FIX
+as a future upgrade rather than a current blocker — the
+production venue path we're shipping is REST submit plus WS
+push for fills and order state, which closes most of the
+latency gap for our use-cases. FIX would be a meaningful
+upgrade for a couple of specific strategies once we hit the
+volume to justify it.
 
-A bit on what we've built and what we'd use FIX for:
+What we've built:
 
 - Predigy is a multi-strategy automated trading platform in
-  Rust. Five live strategy lanes (model-based statistical
-  bets, NWS-alert-driven weather, cross-Polymarket arbitrage,
-  pre-settlement mispricing capture, NBM probabilistic
-  weather). Shared OMS with idempotent client-ids, Postgres-
-  backed state, transactional fill cascades to positions.
+  Rust. Five live strategy lanes (statistical model
+  probability vs market quote, NWS-alert-driven weather,
+  cross-Polymarket arbitrage, pre-settlement mispricing
+  capture, NBM probabilistic weather forecasts). Shared OMS
+  with idempotent client-ids, Postgres-backed state,
+  transactional fill cascades to positions.
 
-- We've already implemented a Kalshi FIX session in Rust
-  (~1,700 lines covering session lifecycle, ExecutionReport
-  parsing, RSA-PSS-SHA256 signing on logon, sequence-number
-  management). Coded initially against FIX 4.4; happy to bring
-  it forward to FIXT.1.1 + FIX 5.0 SP2 to match Kalshi's
-  current spec.
+- Production architecture is REST for order submit/cancel +
+  WS subscriptions on the authed `fill`, `market_positions`,
+  `user_orders` channels for sub-second execution feedback.
+  This handles the cross-arb leg-2 timing well; we're not
+  blocked on FIX for it.
 
-- Primary use-case is the Order Entry NR gateway (port 8228,
-  KalshiNR). The latency edge over REST matters most for
-  news-data races (NWS active-alert fires) and cross-venue
-  spread capture against Polymarket.
+- Existing Kalshi FIX implementation in Rust (~1,700 lines:
+  session lifecycle, ExecutionReport parsing, RSA-PSS-SHA256
+  logon signing, sequence-number management). Coded against
+  FIX 4.4 initially; we'll update to FIXT.1.1 + FIX 5.0 SP2
+  to match your current spec.
 
-A few questions I'd appreciate guidance on:
+What FIX would unlock for us:
 
-1. What's the minimum-activity / technical-readiness bar for
-   FIX access? We're trading at deliberate small size during a
-   shake-down phase but ramping up; would like to understand
-   what threshold qualifies us.
+- The submit-side latency advantage matters specifically for
+  our news-data lane (firing on NWS active-alert publication
+  before the order book reprices). REST 200ms is the floor
+  there and FIX sub-ms is the meaningful improvement.
 
-2. Is the demo environment (fix.demo.kalshi.co) available for
-   integration testing ahead of meeting the activity bar? We'd
-   like to validate session lifecycle, logon, ExecutionReport
-   handling, etc. against your sandbox before we ask for prod
-   credentials.
+- Order Entry NR gateway (port 8228, KalshiNR) is the right
+  fit — non-retransmission semantics work for our latency
+  profile and avoid the institutional-tier complexity of RT.
 
-3. We're currently an individual account, not an entity. Is
-   FIX access categorically gated on entity status, or is
-   there a path for a sophisticated individual? If entity is
-   required, we're prepared to incorporate; just want to know
-   before starting that process.
+A few questions when you have time:
 
-4. Anything you'd like to see in advance of the application —
-   architecture summary, FIX message flow diagrams, code
-   samples — happy to share.
+1. Is the demo environment (fix.demo.kalshi.co) available for
+   integration testing ahead of any volume / approval gate?
+   We'd like to validate our existing FIX implementation
+   against your sandbox — session lifecycle, logon,
+   ExecutionReport handling — so we're production-ready when
+   we hit the threshold for live FIX.
+
+2. What's the minimum-activity / technical-readiness bar for
+   prod FIX access? We're at deliberately small size during
+   a shake-down phase but ramping up; would help to know
+   what gets us over the line.
+
+3. Currently an individual account, not an entity. Is FIX
+   categorically gated on entity status, or is there a path
+   for a sophisticated individual? Prepared to incorporate
+   if needed — just want to know before starting that
+   process.
 
 Thanks,
 Dan Pourhadi
