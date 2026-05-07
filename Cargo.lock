@@ -1340,6 +1340,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "predigy-kalshi-rest",
  "serde",
  "serde_json",

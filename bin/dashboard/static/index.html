@@ -120,8 +120,12 @@
       <div class="value" id="m-portfolio">—</div>
     </div>
     <div class="card">
-      <div class="label">today's P&amp;L (all)</div>
+      <div class="label">today's realized</div>
       <div class="value" id="m-pnl">—</div>
+    </div>
+    <div class="card">
+      <div class="label">unrealized (open)</div>
+      <div class="value" id="m-unrealized">—</div>
     </div>
     <div class="card">
       <div class="label">in-flight orders</div>
@@ -297,6 +301,15 @@ function render(s) {
     const pnlEl = document.getElementById("m-pnl");
     pnlEl.textContent = fmtCents(pnl, true);
     setNumClass(pnlEl, pnl);
+    const unr = s.total_unrealized_pnl_cents;
+    const unrEl = document.getElementById("m-unrealized");
+    if (unr == null) {
+        unrEl.textContent = "—";
+        setNumClass(unrEl, 0);
+    } else {
+        unrEl.textContent = fmtCents(unr, true);
+        setNumClass(unrEl, unr);
+    }
 
     // overall health pill is derived from all strategy log ages.
     const ages = (s.strategies || []).map(x => x.log_age_secs).filter(x => x != null);
@@ -327,18 +340,30 @@ function render(s) {
     if (positions.length === 0) {
         setHTML("pos-wrap", `<div class="card"><div class="empty">no open positions</div></div>`);
     } else {
-        const rows = positions.map(p => `
-          <tr>
-            <td class="market">${escapeHtml(p.ticker)}</td>
-            <td>${p.contracts.toFixed(0)}</td>
-            <td>$${p.exposure_dollars.toFixed(2)}</td>
-            <td class="${p.realized_pnl_dollars >= 0 ? 'num-pos' : 'num-neg'}">$${p.realized_pnl_dollars.toFixed(2)}</td>
-            <td>$${p.fees_paid_dollars.toFixed(2)}</td>
-          </tr>`).join("");
+        const rows = positions.map(p => {
+            const cost = p.avg_cost_cents != null ? `${p.avg_cost_cents.toFixed(0)}¢` : '—';
+            const mark = p.mark_cents != null ? `${p.mark_cents}¢` : '—';
+            let unr = '—', unrCls = '';
+            if (p.unrealized_pnl_cents != null) {
+                const u = p.unrealized_pnl_cents;
+                unrCls = u > 0 ? 'num-pos' : (u < 0 ? 'num-neg' : '');
+                const sign = u > 0 ? '+' : '';
+                unr = `${sign}${(u/100).toFixed(2)}`;
+            }
+            return `
+              <tr>
+                <td class="market">${escapeHtml(p.ticker)}</td>
+                <td>${p.contracts.toFixed(0)}</td>
+                <td>${cost}</td>
+                <td>${mark}</td>
+                <td class="${unrCls}">${unr}</td>
+                <td>$${p.fees_paid_dollars.toFixed(2)}</td>
+              </tr>`;
+        }).join("");
         setHTML("pos-wrap", `
           <div class="card" style="padding: 0;">
             <table>
-              <thead><tr><th>market</th><th>qty</th><th>exp</th><th>P&amp;L</th><th>fees</th></tr></thead>
+              <thead><tr><th>market</th><th>qty</th><th>cost</th><th>mark</th><th>unrealized</th><th>fees</th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           </div>`);

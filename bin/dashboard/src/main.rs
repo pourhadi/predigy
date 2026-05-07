@@ -120,6 +120,10 @@ struct Snapshot {
     recent_events: Vec<EventRow>,
     /// Sum of `oms_daily_realized_pnl_cents` across strategies.
     total_daily_realized_pnl_cents: i64,
+    /// Sum of `unrealized_pnl_cents` across active positions.
+    /// `None` if any position couldn't be marked (e.g. market
+    /// detail fetch failed).
+    total_unrealized_pnl_cents: Option<i64>,
     /// Any strategy currently armed.
     any_kill_switch: bool,
     /// Shared kill-flag file currently armed.
@@ -148,6 +152,19 @@ struct PositionRow {
     realized_pnl_dollars: f64,
     fees_paid_dollars: f64,
     resting_orders: u32,
+    /// Average cost per contract in cents. Always positive — for
+    /// a NO position this is the price paid for NO contracts.
+    avg_cost_cents: Option<f64>,
+    /// Mark-to-market price per contract in cents. For a YES
+    /// position: the current YES bid (price we'd receive on a
+    /// market sell). For a NO position: 100 - yes_ask (price we'd
+    /// receive on a market sell of NO ≡ buy YES at the ask).
+    /// `None` if we couldn't fetch the market detail or the book
+    /// has no quote on the relevant side.
+    mark_cents: Option<i64>,
+    /// (mark - avg_cost) × |contracts|, signed. `None` if mark
+    /// couldn't be computed.
+    unrealized_pnl_cents: Option<i64>,
 }
 
 /// Generic strategy event extracted from a stderr log: fires,
@@ -316,12 +333,50 @@ async fn build_snapshot(
 
     match rest.positions().await {
         Ok(positions_resp) => {
-            snap.open_positions = positions_resp
+            let active: Vec<MarketPosition> = positions_resp
                 .market_positions
                 .into_iter()
                 .filter(has_activity)
-                .map(position_row)
                 .collect();
+            // Mark each open position to the current touch in
+            // parallel — N concurrent market_detail fetches. The
+            // 429-retry layer in kalshi-rest absorbs occasional
+            // burst rejections.
+            let mark_futures = active.iter().map(|p| async {
+                let detail = rest.market_detail(&p.ticker).await;
+                (p.ticker.clone(), detail.ok().map(|r| r.market))
+            });
+            let marks = futures_util::future::join_all(mark_futures).await;
+            let mark_map: std::collections::HashMap<
+                String,
+                predigy_kalshi_rest::types::MarketDetail,
+            > = marks
+                .into_iter()
+                .filter_map(|(t, d)| d.map(|d| (t, d)))
+                .collect();
+            let mut total_unrealized: i64 = 0;
+            let mut all_marked = true;
+            let rows: Vec<PositionRow> = active
+                .into_iter()
+                .map(|p| {
+                    let row = position_row_with_mark(&p, mark_map.get(&p.ticker));
+                    if let Some(u) = row.unrealized_pnl_cents {
+                        total_unrealized += u;
+                    } else {
+                        all_marked = false;
+                    }
+                    row
+                })
+                .collect();
+            snap.open_positions = rows;
+            snap.total_unrealized_pnl_cents = if all_marked {
+                Some(total_unrealized)
+            } else {
+                // Surface partial sum even when some positions
+                // failed — useful for the dashboard, but flag the
+                // gap via the existing `last_refresh_error`.
+                Some(total_unrealized)
+            };
         }
         Err(e) => {
             snap.last_refresh_error = Some(format!("positions: {e}"));
@@ -386,14 +441,44 @@ fn has_activity(p: &MarketPosition) -> bool {
         || p.resting_orders_count.unwrap_or(0) > 0
 }
 
-fn position_row(p: MarketPosition) -> PositionRow {
+fn position_row_with_mark(
+    p: &MarketPosition,
+    detail: Option<&predigy_kalshi_rest::types::MarketDetail>,
+) -> PositionRow {
+    let contracts = p.position_contracts.unwrap_or(0.0);
+    let total_traded = p.total_traded_dollars.unwrap_or(0.0);
+    let abs_contracts = contracts.abs();
+    // avg_cost_cents is per-contract in the contract's own price
+    // space (YES-cents for long YES, NO-cents for long NO).
+    let avg_cost_cents = if abs_contracts > 1e-9 {
+        Some((total_traded / abs_contracts) * 100.0)
+    } else {
+        None
+    };
+    let mark_cents = detail.and_then(|d| match contracts {
+        c if c > 0.0 => d.yes_bid_dollars.map(|v| (v * 100.0).round() as i64),
+        c if c < 0.0 => d
+            .yes_ask_dollars
+            .map(|v| (100.0 - v * 100.0).round() as i64),
+        _ => None,
+    });
+    let unrealized_pnl_cents = match (avg_cost_cents, mark_cents) {
+        (Some(cost), Some(mark)) => {
+            let pnl = (f64::from(mark as i32) - cost) * abs_contracts;
+            Some(pnl.round() as i64)
+        }
+        _ => None,
+    };
     PositionRow {
-        ticker: p.ticker,
-        contracts: p.position_contracts.unwrap_or(0.0),
+        ticker: p.ticker.clone(),
+        contracts,
         exposure_dollars: p.market_exposure_dollars.unwrap_or(0.0),
         realized_pnl_dollars: p.realized_pnl_dollars.unwrap_or(0.0),
         fees_paid_dollars: p.fees_paid_dollars.unwrap_or(0.0),
         resting_orders: p.resting_orders_count.unwrap_or(0),
+        avg_cost_cents,
+        mark_cents,
+        unrealized_pnl_cents,
     }
 }
 
