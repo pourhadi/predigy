@@ -107,10 +107,12 @@ async fn main() -> Result<()> {
     }
     info!(n = intents_inserted, "intents upserted");
 
-    // ---- Rules: stat-rules.json, wx-stat-rules.json, wx-rules.json ----
+    // ---- Rules: stat-rules.json, wx-rules.json ----
+    // wx-stat-rules.json is consumed directly by the dedicated wx-stat
+    // strategy in the consolidated engine. Importing it as `stat` would
+    // double-fire weather exposure under two strategy IDs.
     let rule_files = [
         ("stat", "stat-rules.json", RuleFormat::StatRule),
-        ("stat", "wx-stat-rules.json", RuleFormat::StatRule),
         ("latency", "wx-rules.json", RuleFormat::LatencyRule),
     ];
     let mut rules_inserted = 0u64;
@@ -121,6 +123,15 @@ async fn main() -> Result<()> {
             info!(strategy, ?path, n, "rules upserted");
         }
         rules_inserted += n;
+    }
+    let disabled_wx_stat =
+        disable_rules_for_source(&pool, "stat", &args.config_dir.join("wx-stat-rules.json"))
+            .await?;
+    if disabled_wx_stat > 0 {
+        info!(
+            n = disabled_wx_stat,
+            "disabled legacy imported wx-stat rules"
+        );
     }
     info!(n = rules_inserted, "rules upserted total");
 
@@ -315,9 +326,12 @@ async fn import_rules(pool: &PgPool, strategy: &str, path: &Path, fmt: RuleForma
             let parsed: Vec<StatRuleJson> = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse {}", path.display()))?;
             let n = parsed.len() as u64;
-            for r in parsed {
-                upsert_stat_rule(pool, strategy, &r, path).await?;
+            let active_tickers: Vec<String> =
+                parsed.iter().map(|r| r.kalshi_market.clone()).collect();
+            for r in &parsed {
+                upsert_stat_rule(pool, strategy, r, path).await?;
             }
+            disable_missing_stat_rules(pool, strategy, path, &active_tickers).await?;
             n
         }
         RuleFormat::LatencyRule => {
@@ -339,6 +353,51 @@ async fn import_rules(pool: &PgPool, strategy: &str, path: &Path, fmt: RuleForma
         }
     };
     Ok(n)
+}
+
+async fn disable_missing_stat_rules(
+    pool: &PgPool,
+    strategy: &str,
+    source_path: &Path,
+    active_tickers: &[String],
+) -> Result<u64> {
+    let rows = sqlx::query(
+        "UPDATE rules
+            SET enabled = false,
+                fitted_at = now()
+          WHERE strategy = $1
+            AND source = $2
+            AND enabled = true
+            AND NOT (ticker = ANY($3))",
+    )
+    .bind(strategy)
+    .bind(source_label(source_path))
+    .bind(active_tickers)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows)
+}
+
+async fn disable_rules_for_source(
+    pool: &PgPool,
+    strategy: &str,
+    source_path: &Path,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        "UPDATE rules
+            SET enabled = false,
+                fitted_at = now()
+          WHERE strategy = $1
+            AND source = $2
+            AND enabled = true",
+    )
+    .bind(strategy)
+    .bind(source_label(source_path))
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows)
 }
 
 async fn upsert_stat_rule(
@@ -364,10 +423,14 @@ async fn upsert_stat_rule(
     .bind(&rule.side)
     .bind(rule.model_p)
     .bind(rule.min_edge_cents)
-    .bind(format!("import:{}", source_path.display()))
+    .bind(source_label(source_path))
     .execute(pool)
     .await?;
     Ok(())
+}
+
+fn source_label(source_path: &Path) -> String {
+    format!("import:{}", source_path.display())
 }
 
 async fn upsert_latency_placeholder(

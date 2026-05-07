@@ -27,14 +27,19 @@ use predigy_ext_feeds::nbm::NbmClient;
 use predigy_ext_feeds::nws_forecast::NwsForecastClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use stat_trader::StatRule;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use wx_stat_curator::airports::{airport_utc_offset_hours, local_date_for_unix};
 use wx_stat_curator::calibration::Calibration;
 use wx_stat_curator::nbm_curate::{NbmCurateOutcome, curate_via_nbm};
 use wx_stat_curator::nbm_path::recent_qmd_cycle;
+use wx_stat_curator::observations::AsosClient;
+use wx_stat_curator::observed_gate::{
+    ObservedGateDecision, ObservedMap, decide_from_observed, observations_required, observed_key,
+};
 use wx_stat_curator::{
     Airport, ForecastDecision, ProbabilityConfig, TempMarket, TempStrikeKind, lookup_airport,
     parse_temp_market, scan_temp_markets,
@@ -114,6 +119,11 @@ struct Args {
     /// Pass `""` to skip prediction logging entirely.
     #[arg(long, default_value = "data/wx_stat_predictions")]
     nbm_predictions_dir: PathBuf,
+
+    /// Cache root for ASOS observed daily extremes used to gate same-day
+    /// weather markets before forecast/NBM scoring.
+    #[arg(long, default_value = "data/wx_stat_observations")]
+    observations_cache: PathBuf,
 }
 
 #[tokio::main]
@@ -148,6 +158,16 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+
+    let run_unix = now_unix();
+    let run_ts_utc = format_unix_utc_iso(run_unix);
+    let observed = load_observed_extremes(
+        &markets,
+        &args.user_agent,
+        &args.observations_cache,
+        run_unix,
+    )
+    .await?;
 
     let mut rules: Vec<StatRule> = Vec::new();
     let mut inspections: Vec<RuleInspection> = Vec::new();
@@ -187,7 +207,6 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        let run_ts_utc = format_now_utc_iso();
         let outcomes = curate_via_nbm(
             &nbm_client,
             &args.nbm_cache,
@@ -195,6 +214,8 @@ async fn main() -> Result<()> {
             &markets,
             calibration.as_ref(),
             &run_ts_utc,
+            run_unix,
+            &observed,
         )
         .await;
         let mut predictions: Vec<wx_stat_curator::predictions::PredictionRecord> = Vec::new();
@@ -203,7 +224,9 @@ async fn main() -> Result<()> {
                 NbmCurateOutcome::Rule(out) => {
                     info!(audit = %out.audit, "accepted rule (nbm)");
                     rules.push(out.rule);
-                    predictions.push(out.prediction);
+                    if let Some(prediction) = out.prediction {
+                        predictions.push(prediction);
+                    }
                     inspections.push(RuleInspection {
                         ticker: out.ticker,
                         title: out.title,
@@ -260,7 +283,17 @@ async fn main() -> Result<()> {
             predigy_ext_feeds::nws_forecast::HourlyForecast,
         > = HashMap::new();
         for m in &markets {
-            match curate_one(&nws, m, &cfg, &mut grid_cache, &mut forecast_cache).await {
+            match curate_one(
+                &nws,
+                m,
+                &cfg,
+                &mut grid_cache,
+                &mut forecast_cache,
+                run_unix,
+                &observed,
+            )
+            .await
+            {
                 CurateOutcome::Rule {
                     rule,
                     audit,
@@ -374,6 +407,8 @@ async fn curate_one(
         (&'static str, String),
         predigy_ext_feeds::nws_forecast::HourlyForecast,
     >,
+    run_unix: i64,
+    observed: &ObservedMap,
 ) -> CurateOutcome {
     // 1) Parse market metadata into a structured spec.
     let spec = match parse_temp_market(
@@ -391,6 +426,10 @@ async fn curate_one(
     let Some(airport) = lookup_airport(&spec.airport_code) else {
         return CurateOutcome::Skip(format!("unmapped airport {}", spec.airport_code));
     };
+
+    if let Some(outcome) = observed_gate_outcome(m, airport, &spec, run_unix, observed) {
+        return outcome;
+    }
 
     // 3) Resolve airport → grid cell (cached).
     let grid = match grid_cache.get(airport.code) {
@@ -439,7 +478,58 @@ async fn curate_one(
             model_p,
             forecast_value_f,
             hours_considered,
+            "forecast",
         ),
+    }
+}
+
+fn observed_gate_outcome(
+    m: &TempMarket,
+    airport: &Airport,
+    spec: &wx_stat_curator::TempMarketSpec,
+    run_unix: i64,
+    observed: &ObservedMap,
+) -> Option<CurateOutcome> {
+    let utc_offset = match airport_utc_offset_hours(airport, &spec.settlement_date) {
+        Some(offset) => offset,
+        None => {
+            return Some(CurateOutcome::Error(format!(
+                "observed: missing UTC offset mapping for {}",
+                airport.code
+            )));
+        }
+    };
+    let run_local_date = match local_date_for_unix(run_unix, utc_offset) {
+        Some(date) => date,
+        None => {
+            return Some(CurateOutcome::Error(
+                "observed: invalid run timestamp".into(),
+            ));
+        }
+    };
+    if !observations_required(&spec.settlement_date, &run_local_date) {
+        return None;
+    }
+    let key = observed_key(airport, spec);
+    let extremes = match observed.get(&key) {
+        Some(Ok(extremes)) => extremes,
+        Some(Err(e)) => return Some(CurateOutcome::Error(format!("observed: {e}"))),
+        None => {
+            return Some(CurateOutcome::Error(format!(
+                "observed: missing required ASOS cache for {key:?}"
+            )));
+        }
+    };
+    match decide_from_observed(spec, extremes) {
+        Some(ObservedGateDecision::Decided {
+            model_p,
+            observed_f,
+            reason,
+            ..
+        }) => Some(emit_rule(
+            m, airport, &spec.kind, model_p, observed_f, 0, &reason,
+        )),
+        Some(ObservedGateDecision::Undecided { .. }) | None => None,
     }
 }
 
@@ -450,6 +540,7 @@ fn emit_rule(
     model_p: f64,
     forecast_value_f: f64,
     hours_considered: usize,
+    evidence: &str,
 ) -> CurateOutcome {
     if m.ticker.is_empty() {
         return CurateOutcome::Error("empty market ticker".into());
@@ -488,11 +579,12 @@ fn emit_rule(
         ),
     };
     let audit = format!(
-        "ticker={ticker} airport={code}({city}) kind={threshold} forecast={forecast:.1}F hours={hours} model_p={mp:.3} side={side:?} ask={ask}c edge={edge:+}c",
+        "ticker={ticker} airport={code}({city}) kind={threshold} evidence={evidence} value={forecast:.1}F hours={hours} model_p={mp:.3} side={side:?} ask={ask}c edge={edge:+}c",
         ticker = m.ticker,
         code = airport.code,
         city = airport.city,
         threshold = threshold_str,
+        evidence = evidence,
         forecast = forecast_value_f,
         hours = hours_considered,
         mp = model_p,
@@ -516,6 +608,89 @@ fn emit_rule(
         audit,
         inspection,
     }
+}
+
+async fn load_observed_extremes(
+    markets: &[TempMarket],
+    user_agent: &str,
+    cache_root: &std::path::Path,
+    run_unix: i64,
+) -> Result<ObservedMap> {
+    #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    struct FetchKey {
+        station: String,
+        date: String,
+        utc_offset_hours: i32,
+        use_cache: bool,
+    }
+
+    let mut needed: HashSet<FetchKey> = HashSet::new();
+    for m in markets {
+        let Ok(spec) = parse_temp_market(
+            &m.event_ticker,
+            m.strike_type.as_deref(),
+            m.floor_strike,
+            m.cap_strike,
+            m.occurrence_datetime.as_deref(),
+        ) else {
+            continue;
+        };
+        let Some(airport) = lookup_airport(&spec.airport_code) else {
+            continue;
+        };
+        let utc_offset = airport_utc_offset_hours(airport, &spec.settlement_date)
+            .ok_or_else(|| anyhow!("observed: missing UTC offset mapping for {}", airport.code))?;
+        let run_local_date = local_date_for_unix(run_unix, utc_offset)
+            .ok_or_else(|| anyhow!("observed: invalid run timestamp"))?;
+        if !observations_required(&spec.settlement_date, &run_local_date) {
+            continue;
+        }
+        let use_cache = spec.settlement_date < run_local_date;
+        needed.insert(FetchKey {
+            station: airport.asos_station_or_code().to_string(),
+            date: spec.settlement_date,
+            utc_offset_hours: utc_offset,
+            use_cache,
+        });
+    }
+
+    if needed.is_empty() {
+        return Ok(ObservedMap::new());
+    }
+
+    let client = AsosClient::new(user_agent).map_err(|e| anyhow!("asos client: {e}"))?;
+    let mut keys: Vec<FetchKey> = needed.into_iter().collect();
+    keys.sort();
+    let mut out = ObservedMap::new();
+    for key in keys {
+        let result = client
+            .fetch_local_day_extremes(
+                cache_root,
+                &key.station,
+                &key.date,
+                key.utc_offset_hours,
+                key.use_cache,
+            )
+            .await
+            .map_err(|e| e.to_string());
+        match &result {
+            Ok(extremes) => info!(
+                station = %key.station,
+                date = %key.date,
+                utc_offset_hours = key.utc_offset_hours,
+                use_cache = key.use_cache,
+                tmax_f = extremes.tmax_f,
+                tmin_f = extremes.tmin_f,
+                n_obs = extremes.n_obs,
+                "observed: loaded ASOS local-day extremes"
+            ),
+            Err(e) => {
+                warn!(station = %key.station, date = %key.date, utc_offset_hours = key.utc_offset_hours, error = %e, "observed: ASOS local-day extremes unavailable")
+            }
+        }
+        out.insert((key.station, key.date), result);
+    }
+    Ok(out)
 }
 
 async fn write_rules(rules: &[StatRule], output: &std::path::Path) -> Result<()> {
@@ -626,6 +801,8 @@ fn skip_category(reason: &str) -> &'static str {
         "nbm_window_unreachable"
     } else if reason.contains("forecast window unreachable") {
         "settlement_window_in_past"
+    } else if reason.starts_with("observed:") {
+        "observed_gate"
     // Shared reasons:
     } else if reason.starts_with("unmapped airport") {
         "unmapped_airport"
@@ -647,8 +824,8 @@ fn now_unix() -> i64 {
 /// Current UTC instant as ISO-8601 (e.g. `"2026-05-07T03:14:15Z"`).
 /// Used as the `run_ts_utc` field on Phase 2E prediction records.
 /// No chrono dep — small custom formatter.
-fn format_now_utc_iso() -> String {
-    let secs = now_unix().max(0) as u64;
+fn format_unix_utc_iso(unix: i64) -> String {
+    let secs = unix.max(0) as u64;
     let total_secs = secs;
     let hour = ((total_secs / 3600) % 24) as u8;
     let minute = ((total_secs / 60) % 60) as u8;

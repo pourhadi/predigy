@@ -200,6 +200,41 @@ should be reserved for order entry and reconciliation.
    ticker, side, current_qty, avg_entry_cents FROM positions
    WHERE strategy = 'wx-stat' AND current_qty != 0;"`
 
+### "Wx-stat/stat traded a stale same-day weather threshold"
+
+Treat this as a safety incident and keep `stat`/`wx-stat` kill switches
+armed until the rule source is clean.
+
+Checks:
+
+```sh
+grep "observed:" ~/Library/Logs/predigy/wx-stat-curate.stderr.log | tail -40
+jq '.[] | select(.kalshi_market | contains("KXHIGH") or contains("KXLOW"))' ~/.config/predigy/wx-stat-rules.json | head
+psql -d predigy -c "SELECT ticker, side, model_p, source, fitted_at FROM rules WHERE enabled = true AND strategy = 'stat' AND ticker LIKE 'KXHIGH%' ORDER BY fitted_at DESC LIMIT 20;"
+```
+
+Required behavior: same-day/past daily-temperature markets require ASOS
+observed extremes over the airport-local Kalshi settlement day. If
+observations are unavailable, the curator skips the market instead of falling
+back to forecast/NBM scoring. Current local-day observation pulls must bypass
+the ASOS cache; past local days can use cache. Once the observed daily high/low
+crosses a threshold, the emitted rule must be forced to the
+observed-deterministic side.
+
+The consolidated engine consumes `wx-stat-rules.json` directly under the
+`wx-stat` strategy. `predigy-import` must not import that file as `stat` rules.
+Verify after import refreshes:
+
+```sh
+psql -d predigy -c "SELECT COUNT(*) FROM rules WHERE strategy = 'stat' AND source = 'import:/Users/dan/.config/predigy/wx-stat-rules.json' AND enabled = true;"
+```
+
+Also verify NBM aggregation direction. Daily-high `greater` and daily-low
+`less` are any-hour events. Daily-high `less` and daily-low `greater` are
+all-hours events and must use the constraining hour. A regression here
+caused PHX below-98 for 2026-05-08 to buy YES using a cool evening hour
+even though the high forecast was ~101°F.
+
 ## Engine modes (Live ↔ Shadow)
 
 ```sh

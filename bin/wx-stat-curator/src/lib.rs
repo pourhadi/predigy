@@ -19,6 +19,7 @@ pub mod kalshi_scan;
 pub mod nbm_curate;
 pub mod nbm_path;
 pub mod observations;
+pub mod observed_gate;
 pub mod predictions;
 pub mod ticker_parse;
 

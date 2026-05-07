@@ -19,10 +19,14 @@
 //! effectively free — only file reads, no decode.
 
 use crate::airports::{Airport, lookup_airport};
+use crate::airports::{airport_utc_offset_hours, local_date_for_unix};
 use crate::calibration::{BucketKey, Calibration};
 use crate::kalshi_scan::TempMarket;
 use crate::nbm_path::{
     DAILY_HIGH_LOCAL_HOURS, DAILY_LOW_LOCAL_HOURS, approx_utc_offset_hours, forecast_hour_window,
+};
+use crate::observed_gate::{
+    ObservedGateDecision, ObservedMap, decide_from_observed, observations_required, observed_key,
 };
 use crate::predictions::{PredictionMeasurement, PredictionRecord};
 use crate::ticker_parse::{TempMarketSpec, TempMeasurement, TempStrikeKind, parse_temp_market};
@@ -57,11 +61,10 @@ pub struct NbmRuleOut {
     pub side: Side,
     pub quoted_ask_cents: u8,
     pub apparent_edge_cents: i32,
-    /// Sidecar prediction record for Phase 2E calibration. Every
-    /// rule emits one of these alongside; the operator persists
-    /// them via `predictions::append_records` so the fit driver
-    /// can later join with realised observations.
-    pub prediction: PredictionRecord,
+    /// Sidecar prediction record for Phase 2E calibration. Forecast-priced
+    /// rules emit one; observed-deterministic rules intentionally do not, to
+    /// avoid leaking realised observations back into NBM calibration samples.
+    pub prediction: Option<PredictionRecord>,
 }
 
 /// Outcome for one market — either a rule or a structured skip.
@@ -86,6 +89,8 @@ pub async fn curate_via_nbm(
     markets: &[TempMarket],
     calibration: Option<&Calibration>,
     run_ts_utc: &str,
+    run_unix: i64,
+    observed: &ObservedMap,
 ) -> Vec<NbmCurateOutcome> {
     // ---- Pass 1: plan ----
     let mut plans: Vec<Plan> = Vec::new();
@@ -153,7 +158,7 @@ pub async fn curate_via_nbm(
 
     // ---- Pass 3: emit per market ----
     for plan in plans {
-        match score_plan(&plan, &fetched, calibration, run_ts_utc) {
+        match score_plan(&plan, &fetched, calibration, run_ts_utc, run_unix, observed) {
             Ok(out) => outcomes.push(NbmCurateOutcome::Rule(out)),
             Err(reason) => outcomes.push(NbmCurateOutcome::Skip { reason }),
         }
@@ -222,6 +227,8 @@ fn score_plan(
     fetched: &HashMap<(u16, &'static str), AirportQuantiles>,
     calibration: Option<&Calibration>,
     run_ts_utc: &str,
+    run_unix: i64,
+    observed: &ObservedMap,
 ) -> Result<NbmRuleOut, String> {
     // Threshold in Kelvin (NBM is K).
     let threshold_k = match plan.spec.kind {
@@ -232,8 +239,47 @@ fn score_plan(
             return Err("unsupported strike kind: between".into());
         }
     };
-    let want_above = matches!(plan.spec.kind, TempStrikeKind::Greater { .. });
-    let mut best_p: f64 = 0.0;
+
+    let observed_utc_offset = airport_utc_offset_hours(plan.airport, &plan.spec.settlement_date)
+        .ok_or_else(|| {
+            format!(
+                "observed: missing UTC offset mapping for {}",
+                plan.airport.code
+            )
+        })?;
+    let run_local_date = local_date_for_unix(run_unix, observed_utc_offset)
+        .ok_or_else(|| "observed: invalid run timestamp".to_string())?;
+    if observations_required(&plan.spec.settlement_date, &run_local_date) {
+        let key = observed_key(plan.airport, &plan.spec);
+        let extremes = observed
+            .get(&key)
+            .ok_or_else(|| format!("observed: missing required ASOS cache for {key:?}"))?
+            .as_ref()
+            .map_err(|e| format!("observed: {e}"))?;
+        if let Some(decision) = decide_from_observed(&plan.spec, extremes) {
+            match decision {
+                ObservedGateDecision::Decided {
+                    model_p,
+                    observed_f,
+                    reason,
+                    ..
+                } => {
+                    return Ok(build_rule_out(
+                        plan,
+                        model_p,
+                        None,
+                        observed_f,
+                        Some(&reason),
+                        None,
+                    ));
+                }
+                ObservedGateDecision::Undecided { .. } => {}
+            }
+        }
+    }
+
+    let aggregation = NbmAggregation::for_spec(&plan.spec);
+    let mut best_p: f64 = aggregation.initial_probability();
     let mut best_h: Option<u16> = None;
     let mut peak_value_k: Option<f32> = None;
     for h in plan.window_start..=plan.window_end {
@@ -241,12 +287,14 @@ fn score_plan(
             continue;
         };
         let cdf = q.cdf_at(threshold_k);
-        let p = if want_above { 1.0 - cdf } else { cdf };
-        if p > best_p {
+        let p = aggregation.hour_yes_probability(cdf);
+        if aggregation.should_replace(p, best_p) {
             best_p = p;
             best_h = Some(h);
             // Use the median (50% level) as the peak-hour reference
-            // value for the inspection table.
+            // value for the inspection table. For all-hours markets
+            // this becomes the constraining hour, not necessarily the
+            // peak/coldest label implied by the field name.
             peak_value_k = q.temps_k.get(10).copied();
         }
     }
@@ -275,6 +323,86 @@ fn score_plan(
     // clamp is the floor of confidence, not a substitute for
     // calibration.
     let model_p = calibrated_p.clamp(0.02, 0.98);
+    let forecast_value_f = peak_value_k
+        .map(|k| (f64::from(k) - 273.15) * 9.0 / 5.0 + 32.0)
+        .unwrap_or(0.0);
+    let prediction = PredictionRecord {
+        run_ts_utc: run_ts_utc.to_string(),
+        ticker: plan.market.ticker.clone(),
+        airport: plan.airport.code.to_string(),
+        settlement_date: plan.spec.settlement_date.clone(),
+        threshold_k,
+        yes_when_above: matches!(plan.spec.kind, TempStrikeKind::Greater { .. }),
+        measurement: match plan.spec.measurement {
+            TempMeasurement::DailyHigh => PredictionMeasurement::DailyHigh,
+            TempMeasurement::DailyLow => PredictionMeasurement::DailyLow,
+        },
+        raw_p,
+        model_p,
+        forecast_50pct_f: forecast_value_f,
+    };
+
+    Ok(build_rule_out(
+        plan,
+        model_p,
+        best_h,
+        forecast_value_f,
+        calibration_note(&raw_p, &calibrated_p).as_deref(),
+        Some(prediction),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NbmAggregation {
+    AnyHourAbove,
+    AllHoursBelow,
+    AnyHourBelow,
+    AllHoursAbove,
+}
+
+impl NbmAggregation {
+    fn for_spec(spec: &TempMarketSpec) -> Self {
+        match (spec.measurement, &spec.kind) {
+            (TempMeasurement::DailyHigh, TempStrikeKind::Greater { .. }) => Self::AnyHourAbove,
+            (TempMeasurement::DailyHigh, TempStrikeKind::Less { .. }) => Self::AllHoursBelow,
+            (TempMeasurement::DailyLow, TempStrikeKind::Less { .. }) => Self::AnyHourBelow,
+            (TempMeasurement::DailyLow, TempStrikeKind::Greater { .. }) => Self::AllHoursAbove,
+            (_, TempStrikeKind::Between { .. }) => {
+                unreachable!("between guarded before NBM scoring")
+            }
+        }
+    }
+
+    fn initial_probability(self) -> f64 {
+        match self {
+            Self::AnyHourAbove | Self::AnyHourBelow => 0.0,
+            Self::AllHoursBelow | Self::AllHoursAbove => 1.0,
+        }
+    }
+
+    fn hour_yes_probability(self, cdf: f64) -> f64 {
+        match self {
+            Self::AnyHourAbove | Self::AllHoursAbove => 1.0 - cdf,
+            Self::AnyHourBelow | Self::AllHoursBelow => cdf,
+        }
+    }
+
+    fn should_replace(self, candidate: f64, current: f64) -> bool {
+        match self {
+            Self::AnyHourAbove | Self::AnyHourBelow => candidate > current,
+            Self::AllHoursBelow | Self::AllHoursAbove => candidate < current,
+        }
+    }
+}
+
+fn build_rule_out(
+    plan: &Plan,
+    model_p: f64,
+    best_h: Option<u16>,
+    forecast_value_f: f64,
+    note: Option<&str>,
+    prediction: Option<PredictionRecord>,
+) -> NbmRuleOut {
     let side = if model_p > 0.5 { Side::Yes } else { Side::No };
 
     // Edge in cents at curator time.
@@ -295,16 +423,9 @@ fn score_plan(
         TempStrikeKind::Less { threshold } => format!("<{threshold}"),
         TempStrikeKind::Between { lower, upper } => format!("[{lower},{upper}]"),
     };
-    let forecast_value_f = peak_value_k
-        .map(|k| (f64::from(k) - 273.15) * 9.0 / 5.0 + 32.0)
-        .unwrap_or(0.0);
-    let calibration_note = if (raw_p - calibrated_p).abs() > 1e-6 {
-        format!(" raw_p={raw_p:.3}")
-    } else {
-        String::new()
-    };
+    let note = note.map_or_else(String::new, |s| format!(" {s}"));
     let audit = format!(
-        "ticker={ticker} airport={code}({city}) kind={threshold} fcst_h={fh} fcst_50pct={fcst:.1}F model_p={mp:.3}{cnote} side={side:?} ask={ask}c edge={edge:+}c",
+        "ticker={ticker} airport={code}({city}) kind={threshold} fcst_h={fh} fcst_50pct={fcst:.1}F model_p={mp:.3}{note} side={side:?} ask={ask}c edge={edge:+}c",
         ticker = plan.market.ticker,
         code = plan.airport.code,
         city = plan.airport.city,
@@ -312,7 +433,7 @@ fn score_plan(
         fh = best_h.unwrap_or(0),
         fcst = forecast_value_f,
         mp = model_p,
-        cnote = calibration_note,
+        note = note,
         side = side,
         ask = quoted_ask_cents,
         edge = apparent_edge_cents,
@@ -325,22 +446,7 @@ fn score_plan(
         side,
         min_edge_cents: 5,
     };
-    let prediction = PredictionRecord {
-        run_ts_utc: run_ts_utc.to_string(),
-        ticker: plan.market.ticker.clone(),
-        airport: plan.airport.code.to_string(),
-        settlement_date: plan.spec.settlement_date.clone(),
-        threshold_k,
-        yes_when_above: matches!(plan.spec.kind, TempStrikeKind::Greater { .. }),
-        measurement: match plan.spec.measurement {
-            TempMeasurement::DailyHigh => PredictionMeasurement::DailyHigh,
-            TempMeasurement::DailyLow => PredictionMeasurement::DailyLow,
-        },
-        raw_p,
-        model_p,
-        forecast_50pct_f: forecast_value_f,
-    };
-    Ok(NbmRuleOut {
+    NbmRuleOut {
         rule,
         audit,
         ticker: plan.market.ticker.clone(),
@@ -353,7 +459,15 @@ fn score_plan(
         quoted_ask_cents,
         apparent_edge_cents,
         prediction,
-    })
+    }
+}
+
+fn calibration_note(raw_p: &f64, calibrated_p: &f64) -> Option<String> {
+    if (raw_p - calibrated_p).abs() > 1e-6 {
+        Some(format!("raw_p={raw_p:.3}"))
+    } else {
+        None
+    }
 }
 
 fn f_to_k(fahrenheit: f64) -> f64 {
@@ -376,6 +490,7 @@ fn parse_settlement_month(iso_date: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observations::DailyExtremes;
 
     #[test]
     fn parse_month_canonical() {
@@ -399,5 +514,174 @@ mod tests {
         assert!((f_to_k(80.0) - 299.817).abs() < 0.01);
         // 100 F = 310.928 K
         assert!((f_to_k(100.0) - 310.928).abs() < 0.01);
+    }
+
+    #[test]
+    fn observed_high_less_market_forces_no_side_before_nbm() {
+        let airport = lookup_airport("SFO").unwrap();
+        let plan = Plan {
+            market: TempMarket {
+                ticker: "KXHIGHTSFO-26MAY07-T62".into(),
+                event_ticker: "KXHIGHTSFO-26MAY07".into(),
+                series_ticker: "KXHIGHTSFO".into(),
+                title: "SFO high below 62".into(),
+                close_time: "2026-05-08T06:59:00Z".into(),
+                yes_ask_cents: 1,
+                no_ask_cents: 3,
+                strike_type: Some("less".into()),
+                floor_strike: Some(62.0),
+                cap_strike: Some(62.0),
+                occurrence_datetime: Some("2026-05-07T14:00:00Z".into()),
+            },
+            spec: TempMarketSpec {
+                airport_code: "SFO".into(),
+                measurement: TempMeasurement::DailyHigh,
+                kind: TempStrikeKind::Less { threshold: 62.0 },
+                settlement_date: "2026-05-07".into(),
+            },
+            airport,
+            window_start: 1,
+            window_end: 1,
+        };
+        let mut observed = ObservedMap::new();
+        observed.insert(
+            ("SFO".into(), "2026-05-07".into()),
+            Ok(DailyExtremes {
+                station: "SFO".into(),
+                date_utc: "2026-05-07".into(),
+                tmax_f: 64.0,
+                tmin_f: 51.0,
+                n_obs: 100,
+            }),
+        );
+
+        let out = score_plan(
+            &plan,
+            &HashMap::new(),
+            None,
+            "2026-05-07T20:00:00Z",
+            1_778_184_000,
+            &observed,
+        )
+        .unwrap();
+
+        assert_eq!(out.rule.side, Side::No);
+        assert_eq!(out.rule.model_p, 0.02);
+        assert_eq!(out.side, Side::No);
+        assert_eq!(out.quoted_ask_cents, 3);
+        assert!(out.prediction.is_none());
+        assert!(
+            out.audit
+                .contains("observed high 64.0F already >= less-than threshold 62.0F")
+        );
+    }
+
+    #[test]
+    fn daily_high_less_uses_constraining_hot_hour_not_coolest_hour() {
+        let airport = lookup_airport("PHX").unwrap();
+        let plan = Plan {
+            market: TempMarket {
+                ticker: "KXHIGHTPHX-26MAY08-T98".into(),
+                event_ticker: "KXHIGHTPHX-26MAY08".into(),
+                series_ticker: "KXHIGHTPHX".into(),
+                title: "PHX high below 98".into(),
+                close_time: "2026-05-09T06:59:00Z".into(),
+                yes_ask_cents: 4,
+                no_ask_cents: 97,
+                strike_type: Some("less".into()),
+                floor_strike: Some(98.0),
+                cap_strike: Some(98.0),
+                occurrence_datetime: Some("2026-05-08T14:00:00Z".into()),
+            },
+            spec: TempMarketSpec {
+                airport_code: "PHX".into(),
+                measurement: TempMeasurement::DailyHigh,
+                kind: TempStrikeKind::Less { threshold: 98.0 },
+                settlement_date: "2026-05-08".into(),
+            },
+            airport,
+            window_start: 66,
+            window_end: 72,
+        };
+        let mut fetched = HashMap::new();
+        fetched.insert((66, "PHX"), quantiles_at_f("PHX", 66, 101.2));
+        fetched.insert((72, "PHX"), quantiles_at_f("PHX", 72, 86.4));
+
+        let out = score_plan(
+            &plan,
+            &fetched,
+            None,
+            "2026-05-07T20:00:00Z",
+            1_778_184_000,
+            &ObservedMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(out.rule.side, Side::No);
+        assert_eq!(out.rule.model_p, 0.02);
+        assert_eq!(out.forecast_value_f.round() as i32, 101);
+        assert!(out.audit.contains("fcst_h=66"));
+    }
+
+    #[test]
+    fn daily_low_greater_uses_constraining_cold_hour_not_warmest_hour() {
+        let airport = lookup_airport("PHX").unwrap();
+        let plan = Plan {
+            market: TempMarket {
+                ticker: "KXLOWTPHX-26MAY08-T69".into(),
+                event_ticker: "KXLOWTPHX-26MAY08".into(),
+                series_ticker: "KXLOWTPHX".into(),
+                title: "PHX low above 69".into(),
+                close_time: "2026-05-09T06:59:00Z".into(),
+                yes_ask_cents: 57,
+                no_ask_cents: 44,
+                strike_type: Some("greater".into()),
+                floor_strike: Some(69.0),
+                cap_strike: None,
+                occurrence_datetime: Some("2026-05-08T14:00:00Z".into()),
+            },
+            spec: TempMarketSpec {
+                airport_code: "PHX".into(),
+                measurement: TempMeasurement::DailyLow,
+                kind: TempStrikeKind::Greater { threshold: 69.0 },
+                settlement_date: "2026-05-08".into(),
+            },
+            airport,
+            window_start: 50,
+            window_end: 57,
+        };
+        let mut fetched = HashMap::new();
+        fetched.insert((50, "PHX"), quantiles_at_f("PHX", 50, 65.0));
+        fetched.insert((57, "PHX"), quantiles_at_f("PHX", 57, 78.0));
+
+        let out = score_plan(
+            &plan,
+            &fetched,
+            None,
+            "2026-05-07T20:00:00Z",
+            1_778_184_000,
+            &ObservedMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(out.rule.side, Side::No);
+        assert_eq!(out.rule.model_p, 0.02);
+        assert_eq!(out.forecast_value_f.round() as i32, 65);
+        assert!(out.audit.contains("fcst_h=50"));
+    }
+
+    fn quantiles_at_f(name: &str, fcst_hour: u16, f: f64) -> AirportQuantiles {
+        let k = f_to_k(f) as f32;
+        AirportQuantiles {
+            cycle_prefix: "blend.20260507/06".into(),
+            fcst_hour,
+            name: name.into(),
+            query_lat: 33.4342,
+            query_lon: -112.0117,
+            snapped_lat: 33.4342,
+            snapped_lon: -112.0117,
+            snap_distance_km: 0.0,
+            temps_k: vec![k; 21],
+        }
     }
 }

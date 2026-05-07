@@ -315,7 +315,7 @@ shared OMS to FIX/REST. Strategies don't talk to Kalshi directly.
 | `crates/strategies/stat` | bin/stat-trader | model_p vs ask, Kelly-sized. Now sees model_p updates from wx-stat continuously. |
 | `crates/strategies/latency` | bin/latency-trader | Subscribes to NWS alerts via the engine's external feed; fires faster via FIX. |
 | `crates/strategies/settlement` | bin/settlement-trader | Pre-settlement mispricing capture. |
-| `crates/strategies/wx-stat` | bin/wx-stat-curator | NBM updater — emits `model_p_snapshots` rows when new cycles publish. |
+| `crates/strategies/wx-stat` | bin/wx-stat-curator | Consumes NBM-curated weather rules directly; curator gates same-day/past temperature markets through airport-local-day ASOS observed extremes before forecast scoring. `predigy-import` must not mirror `wx-stat-rules.json` into `stat`. |
 | `crates/strategies/wx-curator` | bin/wx-curator + bin/stat-curator + bin/cross-arb-curator | LLM-based rule producers. Now in-engine; output goes to `rules` table. |
 
 ### Active position management

@@ -9,12 +9,11 @@
          Kalshi-side threshold to get a real calibrated probability,
          and emits a StatRule per market.
 
-         Output file (~/.config/predigy/wx-stat-rules.json) is NOT
-         yet consumed by the running stat-trader — the operator
-         reviews + manually copies promoted rules into
-         stat-rules.json. The deliberate two-file split keeps
-         LLM-curated stat rules and forecast-derived wx-stat rules
-         from racing.
+         Output file (~/.config/predigy/wx-stat-rules.json) is
+         consumed directly by the consolidated engine's wx-stat
+         strategy when PREDIGY_WX_STAT_RULE_FILE points at it.
+         Same-day/past temperature markets are gated through ASOS
+         observed extremes before forecast/NBM scoring.
 
          Cadence: every 3h. NBM qmd publishes only at 00/06/12/18
          UTC (4 cycles/day), but with the 13h lookback the curator

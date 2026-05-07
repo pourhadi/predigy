@@ -42,6 +42,16 @@ at larger size. The follow-up audit found these scale blockers:
   mark-to-market losses.
 - OMS order-rate fields exist but are not enforced.
 - Per-strategy kill switches cover only the legacy four strategy IDs.
+- Same-day weather threshold rules must be gated by observed ASOS extremes;
+  otherwise stale forecast/NBM probabilities can trade an already-decided
+  contract on the impossible side.
+- ASOS observed-extreme gates must use the airport-local Kalshi settlement day,
+  not UTC-day aggregates, and current local-day pulls must bypass cache.
+- `wx-stat-rules.json` is owned by the dedicated `wx-stat` strategy; importing
+  it into DB `stat` rules creates duplicate weather exposure.
+- Weather threshold probability aggregation must reflect any-hour vs
+  all-hours contract semantics; below-high and above-low markets cannot use
+  the easiest hourly probability in the window.
 
 Strategy thesis ranking from the audit:
 

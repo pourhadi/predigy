@@ -88,6 +88,15 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 - Phase 6.1 active exits: take-profit 8¢ / stop-loss 5¢, defaults.
   Closing IOCs use idempotent
   `stat-exit:{ticker}:{side}:{tp|sl}:{minute_bucket}` cids.
+- 2026-05-07 safety note: `stat` and `wx-stat` were halted after a
+  same-day SFO high-temperature rule bought YES on a below-62 market after
+  observed high had already reached 64°F. `wx-stat-curator` now gates
+  same-day/past temperature markets through ASOS observed extremes over the
+  airport's local Kalshi settlement day before forecast/NBM scoring; current
+  local-day pulls bypass the observation cache so intraday extrema cannot go
+  stale. A second wx-stat bug on PHX below-98 for May 8 found that NBM used
+  max hourly probability for all strike directions; daily-high `less` and
+  daily-low `greater` now use the constraining all-hours probability instead.
 
 ### `settlement` (sports tape-reading near close)
 
@@ -134,10 +143,18 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    `implication-arb`, `internal-arb`, and measured `settlement`.
    Shadow or tightly gate `book-imbalance`, `variance-fade`, `latency`,
    and `news-trader` until empirical edge exists.
-5. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
+5. **Keep weather kill switches armed until deliberate resume.** The
+   wx-stat rule file was regenerated through the observed-extreme gate and
+   corrected NBM aggregation. `predigy-import` no longer imports
+   `wx-stat-rules.json` as `stat`, and the latest DB refresh disabled all
+   legacy enabled rows from that source; `KXHIGHTSFO-26MAY07-T62` is disabled.
+   `KXHIGHTPHX-26MAY08-T98` was corrected from YES 0.98 to NO 0.066, and the
+   bad 14-contract YES exposure was sold at 3c. Do not disarm `stat`/`wx-stat`
+   until the operator intentionally resumes weather entries.
+6. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
    Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
    do not prioritize FIX above the safety blockers.
-6. **Phase 7 — retire legacy daemons** completely (delete
+7. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.

@@ -42,6 +42,12 @@ Live evidence from the audit window:
 Do not raise caps until the Priority 0 and Priority 1 items below are
 complete and live-observed cleanly.
 
+2026-05-07 weather safety addendum: same-day temperature markets must be
+gated against observed ASOS daily extremes before any forecast/NBM model can
+emit a rule. This was added after `stat`/`wx-stat` bought YES on
+`KXHIGHTSFO-26MAY07-T62` even though SFO had already observed 64°F, making
+the below-62 YES side impossible.
+
 ## Priority 0: Immediate Safety Fixes
 
 These were scale blockers. Items 1-5 were implemented and redeployed live
@@ -251,6 +257,26 @@ Decision:
 - Add a separately named `panic_flatten` operator command later if
   automatic liquidation is wanted.
 - Do not document kill switch as flattening until flattening exists.
+
+### 7. Same-Day Weather Observed Gate
+
+Problem: wx-stat/stat weather rules could keep trading same-day threshold
+markets from stale forecast/NBM probabilities after the day's observed high
+or low had already decided the contract.
+
+Required behavior:
+
+- For daily-high `greater` markets, observed high > threshold forces YES.
+- For daily-high `less` markets, observed high >= threshold forces NO.
+- For daily-low `less` markets, observed low < threshold forces YES.
+- For daily-low `greater` markets, observed low <= threshold forces NO.
+- Same-day/past markets without required ASOS observations do not fall back
+  to forecast/NBM scoring.
+- Observed-deterministic rules are excluded from NBM calibration samples.
+- NBM probability aggregation must match contract semantics: daily-high
+  `greater` and daily-low `less` are any-hour events, while daily-high
+  `less` and daily-low `greater` are all-hours events and use the
+  constraining hour, not the easiest hour.
 
 ## Priority 2: Strategy Gating
 
