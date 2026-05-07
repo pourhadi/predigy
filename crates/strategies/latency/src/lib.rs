@@ -127,9 +127,9 @@ pub struct LatencyConfig {
     /// current bid (mark-aware unwind, no profit gate). Default
     /// 15 min.
     ///
-    /// Tier 3 (`max_hold_secs`): wide IOC at
-    /// `force_flat_floor_cents` regardless of mark. The
-    /// last-resort floor — guarantees flat. Default 30 min.
+    /// Tier 3 (`max_hold_secs`): wide IOC regardless of mark. Long
+    /// positions sell at `force_flat_floor_cents`; short positions buy to
+    /// cover at `100 - force_flat_floor_cents`. Default 30 min.
     ///
     /// `0` on any tier disables that tier.
     pub tier1_secs: i64,
@@ -453,7 +453,10 @@ impl LatencyStrategy {
                 && pnl_per.unwrap_or(0) > 0;
 
             let (tier_tag, limit_cents) = if tier3_active {
-                ("t3", self.config.force_flat_floor_cents.clamp(1, 99))
+                (
+                    "t3",
+                    tier3_limit_cents(pos.signed_qty, self.config.force_flat_floor_cents),
+                )
             } else if tier2_active {
                 // Mark-aware force-flat. If we don't have a mark
                 // yet, defer to tier3 — wait until the position
@@ -529,6 +532,11 @@ fn position_key(ticker: &str, side: Side) -> String {
         Side::No => 'n',
     };
     format!("{ticker}:{tag}")
+}
+
+fn tier3_limit_cents(signed_qty: i32, force_flat_floor_cents: i32) -> i32 {
+    let floor = force_flat_floor_cents.clamp(1, 99);
+    if signed_qty > 0 { floor } else { 100 - floor }
 }
 
 #[async_trait]
@@ -827,6 +835,24 @@ mod tests {
         assert_eq!(intent.price_cents, Some(1));
         assert_eq!(intent.tif, Tif::Ioc);
         assert!(intent.client_id.starts_with("latency-flat:WX-A:Y:"));
+    }
+
+    #[test]
+    fn tier3_short_buys_to_cover_with_wide_ceiling() {
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(7200);
+        s.positions.insert(
+            position_key("WX-SHORT", Side::Yes),
+            cached_position(Side::Yes, -3, 80, opened),
+        );
+
+        let intents = s.evaluate_force_flats(now);
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].action, IntentAction::Buy);
+        assert_eq!(intents[0].price_cents, Some(99));
+        assert!(intents[0].client_id.contains(":t3:"));
     }
 
     #[test]

@@ -685,7 +685,7 @@ async fn load_observed_extremes(
                 "observed: loaded ASOS local-day extremes"
             ),
             Err(e) => {
-                warn!(station = %key.station, date = %key.date, utc_offset_hours = key.utc_offset_hours, error = %e, "observed: ASOS local-day extremes unavailable")
+                warn!(station = %key.station, date = %key.date, utc_offset_hours = key.utc_offset_hours, error = %e, "observed: ASOS local-day extremes unavailable");
             }
         }
         out.insert((key.station, key.date), result);

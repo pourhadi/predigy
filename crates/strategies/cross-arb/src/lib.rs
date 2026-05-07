@@ -284,9 +284,6 @@ impl CrossArbStrategy {
     }
 
     fn apply_pair_update(&mut self, added: &[KalshiPolyPair], removed: &[MarketTicker]) {
-        for p in added {
-            self.add_pair(p.kalshi_ticker.clone(), p.poly_asset_id.clone());
-        }
         for t in removed {
             // Drop the poly_ref tied to the removed pair too. If
             // multiple kalshi markets shared one poly asset we'd
@@ -294,6 +291,9 @@ impl CrossArbStrategy {
             if let Some(asset_id) = self.remove_pair(t) {
                 self.poly_ref.remove(&asset_id);
             }
+        }
+        for p in added {
+            self.add_pair(p.kalshi_ticker.clone(), p.poly_asset_id.clone());
         }
         info!(
             n_pairs = self.market_map.len(),
@@ -305,12 +305,8 @@ impl CrossArbStrategy {
 
     fn update_poly(&mut self, asset_id: &str, best_bid: Option<f64>, best_ask: Option<f64>) {
         let entry = self.poly_ref.entry(asset_id.to_string()).or_default();
-        if best_bid.is_some() {
-            entry.best_bid = best_bid;
-        }
-        if best_ask.is_some() {
-            entry.best_ask = best_ask;
-        }
+        entry.best_bid = best_bid;
+        entry.best_ask = best_ask;
     }
 
     fn evaluate(&mut self, market: &MarketTicker, book: &OrderBook, now: Instant) -> Vec<Intent> {
@@ -948,6 +944,38 @@ mod tests {
         assert_eq!(s.pair_count(), 0);
         assert!(!s.poly_ref.contains_key("0xabc"));
         assert!(!s.last_submit_at.contains_key(&MarketTicker::new("X")));
+    }
+
+    #[test]
+    fn pair_update_changed_asset_replaces_mapping() {
+        let mut s = CrossArbStrategy::new(cfg());
+        s.add_pair(MarketTicker::new("X"), "0xold".into());
+        s.update_poly("0xold", Some(0.5), Some(0.6));
+
+        s.apply_pair_update(
+            &[KalshiPolyPair {
+                kalshi_ticker: MarketTicker::new("X"),
+                poly_asset_id: "0xnew".into(),
+            }],
+            &[MarketTicker::new("X")],
+        );
+
+        assert_eq!(
+            s.market_map.get(&MarketTicker::new("X")),
+            Some(&"0xnew".to_string())
+        );
+        assert!(!s.poly_ref.contains_key("0xold"));
+    }
+
+    #[test]
+    fn poly_update_clears_missing_sides() {
+        let mut s = CrossArbStrategy::new(cfg());
+        s.update_poly("0xabc", Some(0.40), Some(0.60));
+        s.update_poly("0xabc", Some(0.41), None);
+
+        let r = s.poly_ref.get("0xabc").unwrap();
+        assert_eq!(r.best_bid, Some(0.41));
+        assert_eq!(r.best_ask, None);
     }
 
     #[test]

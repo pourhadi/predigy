@@ -15,9 +15,8 @@ pub struct PolyMarket {
     pub id: String,
     pub question: String,
     pub description: String,
-    /// First entry = YES `asset_id`, second = NO. The
-    /// `cross-arb-trader` `--pair` flag wires Kalshi to the YES
-    /// side, so we surface that one.
+    /// Polymarket YES `asset_id`, selected by outcome label rather than token
+    /// order.
     pub yes_token_id: String,
     pub end_date_iso: Option<String>,
     pub yes_price: f64,
@@ -92,6 +91,9 @@ struct RawMarket {
     /// returns this as a string, not as an array.
     #[serde(default, rename = "clobTokenIds")]
     clob_token_ids: Option<String>,
+    /// JSON-encoded outcome labels in the same order as `clobTokenIds`.
+    #[serde(default)]
+    outcomes: Option<String>,
     /// Same: stringified JSON `["0.555", "0.445"]`.
     #[serde(default, rename = "outcomePrices")]
     outcome_prices: Option<String>,
@@ -110,11 +112,18 @@ impl RawMarket {
         let description = self.description.unwrap_or_default();
         let token_ids: Vec<String> =
             serde_json::from_str(self.clob_token_ids.as_deref().unwrap_or("[]")).ok()?;
-        let yes_token_id = token_ids.into_iter().next()?;
+        let outcomes: Vec<String> = serde_json::from_str(self.outcomes.as_deref()?).ok()?;
+        let yes_idx = outcomes
+            .iter()
+            .position(|o| o.trim().eq_ignore_ascii_case("yes"))?;
+        let no_idx = outcomes
+            .iter()
+            .position(|o| o.trim().eq_ignore_ascii_case("no"))?;
         let prices: Vec<String> =
             serde_json::from_str(self.outcome_prices.as_deref().unwrap_or("[]")).ok()?;
-        let yes_price = prices.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-        let no_price = prices.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let yes_token_id = token_ids.get(yes_idx)?.clone();
+        let yes_price = prices.get(yes_idx).and_then(|s| s.parse().ok())?;
+        let no_price = prices.get(no_idx).and_then(|s| s.parse().ok())?;
         // Polymarket gives prices in [0,1]; outcome_prices sums to ~1.
         // Drop markets in the rails (resolved already in spirit).
         if !(0.02..=0.98).contains(&yes_price) {
@@ -144,6 +153,7 @@ mod tests {
             "id": "540816",
             "question": "Russia-Ukraine Ceasefire before GTA VI?",
             "description": "Resolves YES if X.",
+            "outcomes": "[\"Yes\", \"No\"]",
             "clobTokenIds": "[\"850\", \"252\"]",
             "outcomePrices": "[\"0.555\", \"0.445\"]",
             "endDateIso": "2026-07-31",
@@ -163,6 +173,7 @@ mod tests {
             "id": "1",
             "question": "Q",
             "description": "",
+            "outcomes": "[\"Yes\", \"No\"]",
             "clobTokenIds": "[\"a\", \"b\"]",
             "outcomePrices": "[\"0.99\", \"0.01\"]",
             "endDateIso": "",
@@ -179,7 +190,44 @@ mod tests {
             "id": "2",
             "question": "Q",
             "description": "",
+            "outcomes": "[\"Yes\", \"No\"]",
             "clobTokenIds": "[]",
+            "outcomePrices": "[\"0.5\", \"0.5\"]",
+            "endDateIso": "",
+            "volumeNum": 10,
+            "liquidityNum": 10
+        }"#;
+        let r: RawMarket = serde_json::from_str(raw).unwrap();
+        assert!(r.into_market().is_none());
+    }
+
+    #[test]
+    fn raw_market_maps_yes_token_by_outcome_label() {
+        let raw = r#"{
+            "id": "3",
+            "question": "Q",
+            "description": "",
+            "outcomes": "[\"No\", \"Yes\"]",
+            "clobTokenIds": "[\"no-token\", \"yes-token\"]",
+            "outcomePrices": "[\"0.40\", \"0.60\"]",
+            "endDateIso": "",
+            "volumeNum": 10,
+            "liquidityNum": 10
+        }"#;
+        let r: RawMarket = serde_json::from_str(raw).unwrap();
+        let m = r.into_market().unwrap();
+        assert_eq!(m.yes_token_id, "yes-token");
+        assert!((m.yes_price - 0.60).abs() < 1e-6);
+        assert!((m.no_price - 0.40).abs() < 1e-6);
+    }
+
+    #[test]
+    fn raw_market_drops_missing_outcome_labels() {
+        let raw = r#"{
+            "id": "4",
+            "question": "Q",
+            "description": "",
+            "clobTokenIds": "[\"a\", \"b\"]",
             "outcomePrices": "[\"0.5\", \"0.5\"]",
             "endDateIso": "",
             "volumeNum": 10,

@@ -29,6 +29,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+type DailyPnlMarkRow = (
+    i32,
+    i32,
+    i64,
+    i64,
+    Option<i32>,
+    Option<i32>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
 /// Engine execution mode. Production-grade systems should boot
 /// in `Shadow` until parity is verified against the legacy
 /// daemon, then operator flips to `Live`.
@@ -958,15 +968,7 @@ async fn daily_pnl_with_marks(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     strategy: &str,
 ) -> EngineResult<DailyPnlSnapshot> {
-    let rows: Vec<(
-        i32,
-        i32,
-        i64,
-        i64,
-        Option<i32>,
-        Option<i32>,
-        Option<chrono::DateTime<chrono::Utc>>,
-    )> = sqlx::query_as(
+    let rows: Vec<DailyPnlMarkRow> = sqlx::query_as(
         "SELECT p.current_qty,
                 p.avg_entry_cents,
                 p.realized_pnl_cents,

@@ -190,14 +190,14 @@ async fn run(
         }
 
         // Update bookkeeping.
+        for t in &removed {
+            current.remove(t.as_str());
+        }
         for p in &added {
             current.insert(
                 p.kalshi_ticker.as_str().to_string(),
                 p.poly_asset_id.clone(),
             );
-        }
-        for t in &removed {
-            current.remove(t.as_str());
         }
         last_mtime = Some(mtime);
     }
@@ -243,17 +243,26 @@ fn diff(
 ) -> (Vec<KalshiPolyPair>, Vec<MarketTicker>) {
     let prev_keys: HashSet<&String> = prev.keys().collect();
     let next_keys: HashSet<&String> = next.keys().collect();
-    let added: Vec<KalshiPolyPair> = next_keys
+    let mut added: Vec<KalshiPolyPair> = next_keys
         .difference(&prev_keys)
         .map(|k| KalshiPolyPair {
             kalshi_ticker: MarketTicker::new((*k).clone()),
             poly_asset_id: next[*k].clone(),
         })
         .collect();
-    let removed: Vec<MarketTicker> = prev_keys
+    let mut removed: Vec<MarketTicker> = prev_keys
         .difference(&next_keys)
         .map(|k| MarketTicker::new((*k).clone()))
         .collect();
+    for k in prev_keys.intersection(&next_keys) {
+        if prev[*k] != next[*k] {
+            removed.push(MarketTicker::new((*k).clone()));
+            added.push(KalshiPolyPair {
+                kalshi_ticker: MarketTicker::new((*k).clone()),
+                poly_asset_id: next[*k].clone(),
+            });
+        }
+    }
     (added, removed)
 }
 
@@ -321,6 +330,22 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert_eq!(added[0].kalshi_ticker.as_str(), "C");
         assert_eq!(added[0].poly_asset_id, "0xc");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].as_str(), "A");
+    }
+
+    #[test]
+    fn diff_treats_changed_poly_asset_as_remove_and_add() {
+        let mut prev = HashMap::new();
+        prev.insert("A".to_string(), "0xold".to_string());
+        let mut next = HashMap::new();
+        next.insert("A".to_string(), "0xnew".to_string());
+
+        let (added, removed) = diff(&prev, &next);
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].kalshi_ticker.as_str(), "A");
+        assert_eq!(added[0].poly_asset_id, "0xnew");
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].as_str(), "A");
     }

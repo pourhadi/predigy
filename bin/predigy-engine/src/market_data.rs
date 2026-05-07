@@ -652,6 +652,60 @@ fn dollars_str_to_cents(s: &str) -> Option<i32> {
     Some((v * 100.0).round() as i32)
 }
 
+fn known_sid_markets(state: &RouterState, sid: u64) -> Vec<String> {
+    state
+        .sid_to_tickers
+        .get(&sid)
+        .map(|markets| markets.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn pending_snapshot(state: &RouterState, sid: u64, market: &str) -> bool {
+    state
+        .sid_snapshot_pending
+        .get(&sid)
+        .is_some_and(|pending| pending.contains(market))
+}
+
+fn mark_snapshot_ready(state: &mut RouterState, sid: u64, market: &str) {
+    if let Some(pending) = state.sid_snapshot_pending.get_mut(&sid) {
+        pending.remove(market);
+        if pending.is_empty() {
+            state.sid_snapshot_pending.remove(&sid);
+        }
+    }
+}
+
+async fn request_sid_snapshot(
+    state: &mut RouterState,
+    connection: &mut MdConnection,
+    sid: u64,
+    markets: Vec<String>,
+) -> anyhow::Result<()> {
+    if markets.is_empty() {
+        anyhow::bail!("sid {sid} has no known markets to resnapshot");
+    }
+    if state
+        .sid_snapshot_pending
+        .get(&sid)
+        .is_some_and(|pending| !pending.is_empty())
+    {
+        debug!(sid, "router: WS snapshot request already pending");
+        return Ok(());
+    }
+
+    let pending: HashSet<String> = markets.iter().cloned().collect();
+    let req_id = connection.get_snapshot(sid, &markets).await?;
+    state.sid_snapshot_pending.insert(sid, pending);
+    info!(
+        sid,
+        req_id,
+        n_markets = markets.len(),
+        "router: WS snapshot request submitted"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,58 +760,4 @@ mod tests {
             SeqObservation::Fresh
         );
     }
-}
-
-fn known_sid_markets(state: &RouterState, sid: u64) -> Vec<String> {
-    state
-        .sid_to_tickers
-        .get(&sid)
-        .map(|markets| markets.iter().cloned().collect())
-        .unwrap_or_default()
-}
-
-fn pending_snapshot(state: &RouterState, sid: u64, market: &str) -> bool {
-    state
-        .sid_snapshot_pending
-        .get(&sid)
-        .is_some_and(|pending| pending.contains(market))
-}
-
-fn mark_snapshot_ready(state: &mut RouterState, sid: u64, market: &str) {
-    if let Some(pending) = state.sid_snapshot_pending.get_mut(&sid) {
-        pending.remove(market);
-        if pending.is_empty() {
-            state.sid_snapshot_pending.remove(&sid);
-        }
-    }
-}
-
-async fn request_sid_snapshot(
-    state: &mut RouterState,
-    connection: &mut MdConnection,
-    sid: u64,
-    markets: Vec<String>,
-) -> anyhow::Result<()> {
-    if markets.is_empty() {
-        anyhow::bail!("sid {sid} has no known markets to resnapshot");
-    }
-    if state
-        .sid_snapshot_pending
-        .get(&sid)
-        .is_some_and(|pending| !pending.is_empty())
-    {
-        debug!(sid, "router: WS snapshot request already pending");
-        return Ok(());
-    }
-
-    let pending: HashSet<String> = markets.iter().cloned().collect();
-    let req_id = connection.get_snapshot(sid, &markets).await?;
-    state.sid_snapshot_pending.insert(sid, pending);
-    info!(
-        sid,
-        req_id,
-        n_markets = markets.len(),
-        "router: WS snapshot request submitted"
-    );
-    Ok(())
 }
