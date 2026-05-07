@@ -473,8 +473,8 @@ impl ImbalanceStrategy {
         };
         let ts_min = chrono::Utc::now().timestamp() as u32 / 60;
         let client_id = format!(
-            "book-imbalance-flat:{cid_t}:{side_tag}:{bid:02}:{qty:04}:{ts:08x}",
-            cid_t = cid_safe_ticker(key),
+            "bi-flat:{suffix}:{side_tag}:{bid:02}:{qty:02}:{ts:08x}",
+            suffix = short_ticker_hash(key),
             bid = bid_cents,
             ts = ts_min,
         );
@@ -492,6 +492,15 @@ impl ImbalanceStrategy {
             reason: Some("book-imbalance flatten before reversal".into()),
         })
     }
+}
+
+fn short_ticker_hash(ticker: &str) -> String {
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    for b in ticker.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 #[async_trait]
@@ -880,5 +889,26 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn flatten_client_id_stays_short_enough_for_kalshi() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markets.json");
+        write_markets(&path, &["KXVOTEHUBTRUMPUPDOWN-26MAY07"]);
+        let mut s = ImbalanceStrategy::new(cfg(path));
+        s.reload_markets();
+        let intent = s
+            .flatten_opposite(
+                "KXVOTEHUBTRUMPUPDOWN-26MAY07",
+                &MarketTicker::new("KXVOTEHUBTRUMPUPDOWN-26MAY07"),
+                Side::Yes,
+                10,
+                80,
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(intent.client_id.len() <= 64, "{}", intent.client_id);
+        assert!(intent.client_id.starts_with("bi-flat:"));
     }
 }
