@@ -93,6 +93,21 @@ pub struct SettlementConfig {
     pub size: u32,
     /// Per-market cooldown after a fire.
     pub cooldown: Duration,
+    /// **Audit A6 — settlement profit lock**:
+    /// When the position has shown ≥ this many cents of
+    /// per-contract favorable movement AND there's at least
+    /// `profit_lock_min_secs_to_close` seconds until settlement,
+    /// emit a closing IOC at the current mark instead of
+    /// riding to venue settlement. Locks profit + reduces
+    /// settlement-race risk. `0` disables.
+    pub profit_lock_threshold_cents: i32,
+    /// Only profit-lock if there's at least this much time left
+    /// until settlement; otherwise let it ride.
+    pub profit_lock_min_secs_to_close: i64,
+    /// How often to refresh the open-position cache from
+    /// Postgres. Settlement positions are short-lived
+    /// (<10 min), so a 30s cadence is fine.
+    pub position_refresh_interval: Duration,
 }
 
 impl Default for SettlementConfig {
@@ -108,8 +123,26 @@ impl Default for SettlementConfig {
             bid_to_ask_ratio: 5,
             size: 1,
             cooldown: Duration::from_secs(60),
+            // A6: lock profit on a 5¢ favourable move with at
+            // least 3 min still on the clock. Below 3 min the
+            // venue-side settlement is so close that we'd
+            // rather take the binary outcome than the touch.
+            profit_lock_threshold_cents: 5,
+            profit_lock_min_secs_to_close: 180,
+            position_refresh_interval: Duration::from_secs(30),
         }
     }
+}
+
+/// A6 — in-memory position snapshot for the profit-lock check.
+/// Refreshed from Postgres on each Tick; stale up to one
+/// `position_refresh_interval` (30s default).
+#[derive(Debug, Clone)]
+struct CachedPosition {
+    side: Side,
+    /// Signed: positive = long.
+    signed_qty: i32,
+    avg_entry_cents: i32,
 }
 
 #[derive(Debug)]
@@ -120,6 +153,11 @@ pub struct SettlementStrategy {
     close_times: HashMap<MarketTicker, i64>,
     /// Per-market last-fire wall-clock; cooldown filter.
     last_fired: HashMap<MarketTicker, Instant>,
+    /// A6 — open positions per (ticker, side).
+    positions: HashMap<String, CachedPosition>,
+    /// A6 — per-position exit cooldown.
+    last_exit_at: HashMap<String, Instant>,
+    last_position_refresh: Option<Instant>,
 }
 
 impl SettlementStrategy {
@@ -128,6 +166,9 @@ impl SettlementStrategy {
             config,
             close_times: HashMap::new(),
             last_fired: HashMap::new(),
+            positions: HashMap::new(),
+            last_exit_at: HashMap::new(),
+            last_position_refresh: None,
         }
     }
 
@@ -230,6 +271,150 @@ impl SettlementStrategy {
             "settlement: close-time map updated"
         );
     }
+
+    /// A6 — refresh the open-position cache from Postgres.
+    async fn refresh_positions(
+        &mut self,
+        state: &mut StrategyState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let rows = state.db.open_positions(Some(STRATEGY_ID.0)).await?;
+        let n = rows.len();
+        let mut next: HashMap<String, CachedPosition> = HashMap::with_capacity(n);
+        for r in rows {
+            let side = match r.side.as_str() {
+                "yes" => Side::Yes,
+                "no" => Side::No,
+                _ => continue,
+            };
+            let key = position_key(&r.ticker, side);
+            next.insert(
+                key,
+                CachedPosition {
+                    side,
+                    signed_qty: r.current_qty,
+                    avg_entry_cents: r.avg_entry_cents,
+                },
+            );
+        }
+        self.positions = next;
+        self.last_position_refresh = Some(Instant::now());
+        debug!(n_positions = n, "settlement: position cache refreshed");
+        Ok(())
+    }
+
+    /// A6 — profit-lock exit. Settlement positions normally ride
+    /// to venue settlement at $1/$0; this branch closes early
+    /// when the touch has moved sufficiently in our favor AND
+    /// there's still time on the clock.
+    fn evaluate_exit(
+        &mut self,
+        market: &MarketTicker,
+        book: &OrderBook,
+        now_unix: i64,
+        now_instant: Instant,
+    ) -> Option<Intent> {
+        if self.config.profit_lock_threshold_cents <= 0 {
+            return None;
+        }
+        // Only check the side we entered on. Settlement entries
+        // are always YES-buy, so the position should be long-YES;
+        // we still parametrize for forward compat.
+        for side in [Side::Yes, Side::No] {
+            let key = position_key(market.as_str(), side);
+            let pos = match self.positions.get(&key) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            if pos.signed_qty == 0 {
+                continue;
+            }
+            if let Some(&last) = self.last_exit_at.get(&key)
+                && now_instant.duration_since(last) < self.config.cooldown
+            {
+                continue;
+            }
+
+            // Time-to-close gate. If we're inside
+            // `profit_lock_min_secs_to_close` of settlement, let
+            // the venue settle for us — race risk on the early
+            // close > expected slippage.
+            let close_time = self.close_times.get(market).copied()?;
+            let secs_to_close = close_time.saturating_sub(now_unix);
+            if secs_to_close < self.config.profit_lock_min_secs_to_close {
+                continue;
+            }
+
+            // Mark = price we'd realize unwinding.
+            let mark_cents = match (pos.side, pos.signed_qty.is_positive()) {
+                (Side::Yes, true) => i32::from(book.best_yes_bid()?.0.cents()),
+                (Side::No, true) => i32::from(book.best_no_bid()?.0.cents()),
+                (Side::Yes, false) => 100i32 - i32::from(book.best_no_bid()?.0.cents()),
+                (Side::No, false) => 100i32 - i32::from(book.best_yes_bid()?.0.cents()),
+            };
+            let pnl_per = if pos.signed_qty > 0 {
+                mark_cents - pos.avg_entry_cents
+            } else {
+                pos.avg_entry_cents - mark_cents
+            };
+            if pnl_per < self.config.profit_lock_threshold_cents {
+                continue;
+            }
+
+            let abs_qty = pos.signed_qty.unsigned_abs() as i32;
+            let limit_cents = mark_cents.clamp(1, 99);
+            let action = if pos.signed_qty > 0 {
+                IntentAction::Sell
+            } else {
+                IntentAction::Buy
+            };
+            let side_tag = match pos.side {
+                Side::Yes => "Y",
+                Side::No => "N",
+            };
+            let minute = (now_unix / 60) as u32;
+            let client_id = format!(
+                "settlement-exit:{ticker}:{side_tag}:tp:{minute:08x}",
+                ticker = cid_safe_ticker(market.as_str()),
+            );
+            let intent = Intent {
+                client_id,
+                strategy: STRATEGY_ID.0,
+                market: market.clone(),
+                side: pos.side,
+                action,
+                price_cents: Some(limit_cents),
+                qty: abs_qty,
+                order_type: OrderType::Limit,
+                tif: Tif::Ioc,
+                reason: Some(format!(
+                    "settlement-exit: tp entry={}¢ mark={}¢ pnl={}¢/contract \
+                     secs_to_close={secs_to_close}",
+                    pos.avg_entry_cents, mark_cents, pnl_per
+                )),
+            };
+            info!(
+                market = %market.as_str(),
+                side = ?pos.side,
+                signed_qty = pos.signed_qty,
+                avg_entry = pos.avg_entry_cents,
+                mark = mark_cents,
+                pnl_per,
+                secs_to_close,
+                "settlement: profit-lock fires"
+            );
+            self.last_exit_at.insert(key, now_instant);
+            return Some(intent);
+        }
+        None
+    }
+}
+
+fn position_key(ticker: &str, side: Side) -> String {
+    let tag = match side {
+        Side::Yes => 'y',
+        Side::No => 'n',
+    };
+    format!("{ticker}:{tag}")
 }
 
 #[async_trait]
@@ -262,21 +447,34 @@ impl Strategy for SettlementStrategy {
     async fn on_event(
         &mut self,
         ev: &Event,
-        _state: &mut StrategyState,
+        state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
+        // A6 — refresh position cache on cadence + first call.
+        let needs_refresh = self
+            .last_position_refresh
+            .is_none_or(|t| t.elapsed() >= self.config.position_refresh_interval);
+        if needs_refresh {
+            self.refresh_positions(state).await?;
+        }
+
         match ev {
             Event::BookUpdate { market, book } => {
                 let now_unix = current_unix();
-                let intent = self.evaluate(market, book, now_unix, Instant::now());
-                if let Some(ref i) = intent {
+                let now_instant = Instant::now();
+                let mut intents = Vec::new();
+                if let Some(entry) = self.evaluate(market, book, now_unix, now_instant) {
                     debug!(
                         market = %market.as_str(),
-                        price_cents = ?i.price_cents,
-                        qty = i.qty,
+                        price_cents = ?entry.price_cents,
+                        qty = entry.qty,
                         "settlement: firing"
                     );
+                    intents.push(entry);
                 }
-                Ok(intent.into_iter().collect())
+                if let Some(exit) = self.evaluate_exit(market, book, now_unix, now_instant) {
+                    intents.push(exit);
+                }
+                Ok(intents)
             }
             Event::DiscoveryDelta { added, removed } => {
                 self.apply_discovery(added, removed);
@@ -287,6 +485,12 @@ impl Strategy for SettlementStrategy {
             | Event::PairUpdate { .. }
             | Event::CrossStrategy { .. } => Ok(Vec::new()),
         }
+    }
+
+    fn tick_interval(&self) -> Option<Duration> {
+        // A6 — Tick drives position-cache refresh; keep at the
+        // configured cadence.
+        Some(self.config.position_refresh_interval)
     }
 }
 
@@ -322,6 +526,19 @@ mod tests {
             bid_to_ask_ratio: 5,
             size: 1,
             cooldown: Duration::from_secs(60),
+            // A6 disabled by default in tests; A6 tests set
+            // explicit values to exercise the branch.
+            profit_lock_threshold_cents: 0,
+            profit_lock_min_secs_to_close: 180,
+            position_refresh_interval: Duration::from_secs(30),
+        }
+    }
+
+    fn cached_position(side: Side, signed_qty: i32, avg_entry_cents: i32) -> CachedPosition {
+        CachedPosition {
+            side,
+            signed_qty,
+            avg_entry_cents,
         }
     }
 
@@ -510,5 +727,108 @@ mod tests {
         // returns the expected discovery_subscriptions config.
         let s = SettlementStrategy::new(cfg());
         assert!(!s.discovery_subscriptions().is_empty());
+    }
+
+    // ─── A6 settlement profit-lock tests ─────────────────────
+
+    #[test]
+    fn profit_lock_fires_when_in_band_with_time_remaining() {
+        // Long YES at 93¢. Mark = 99¢ → PnL +6 ≥ threshold(5).
+        // settle_unix is 5 minutes (300s) past now → 300 ≥ 180.
+        let mut c = cfg();
+        c.profit_lock_threshold_cents = 5;
+        c.profit_lock_min_secs_to_close = 180;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-PL-A");
+        // 5 minutes ahead of test "now".
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        s.positions.insert(
+            position_key("KX-PL-A", Side::Yes),
+            cached_position(Side::Yes, 4, 93),
+        );
+        let book = book_with((99, 100), (1, 100));
+        let intent = s
+            .evaluate_exit(&m, &book, now_unix, Instant::now())
+            .expect("profit-lock fires");
+        assert_eq!(intent.side, Side::Yes);
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.qty, 4);
+        assert_eq!(intent.price_cents, Some(99));
+        assert!(intent.client_id.starts_with("settlement-exit:"));
+        assert!(intent.client_id.contains(":Y:tp:"));
+    }
+
+    #[test]
+    fn profit_lock_skips_when_below_threshold() {
+        let mut c = cfg();
+        c.profit_lock_threshold_cents = 5;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-PL-B");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        s.positions.insert(
+            position_key("KX-PL-B", Side::Yes),
+            cached_position(Side::Yes, 4, 93),
+        );
+        // Mark 96 → PnL +3 < threshold 5.
+        let book = book_with((96, 100), (3, 100));
+        assert!(
+            s.evaluate_exit(&m, &book, now_unix, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn profit_lock_skips_when_too_close_to_settlement() {
+        // Profit threshold met but only 60s left on the clock.
+        let mut c = cfg();
+        c.profit_lock_threshold_cents = 5;
+        c.profit_lock_min_secs_to_close = 180;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-PL-C");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 60);
+        s.positions.insert(
+            position_key("KX-PL-C", Side::Yes),
+            cached_position(Side::Yes, 4, 93),
+        );
+        let book = book_with((99, 100), (1, 100));
+        assert!(
+            s.evaluate_exit(&m, &book, now_unix, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn profit_lock_disabled_when_threshold_zero() {
+        let mut s = SettlementStrategy::new(cfg());
+        let m = MarketTicker::new("KX-PL-D");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        s.positions.insert(
+            position_key("KX-PL-D", Side::Yes),
+            cached_position(Side::Yes, 4, 93),
+        );
+        let book = book_with((99, 100), (1, 100));
+        assert!(
+            s.evaluate_exit(&m, &book, now_unix, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn profit_lock_skips_unknown_position() {
+        let mut c = cfg();
+        c.profit_lock_threshold_cents = 5;
+        let mut s = SettlementStrategy::new(c);
+        let m = MarketTicker::new("KX-NO-POS");
+        let now_unix = 1_777_910_000;
+        s.close_times.insert(m.clone(), now_unix + 300);
+        let book = book_with((99, 100), (1, 100));
+        assert!(
+            s.evaluate_exit(&m, &book, now_unix, Instant::now())
+                .is_none()
+        );
     }
 }
