@@ -50,6 +50,10 @@ use predigy_strategy_latency::LatencyStrategy;
 use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
 use predigy_strategy_stat::{StatConfig, StatStrategy};
 use predigy_strategy_wx_stat::{WxStatConfig, WxStatStrategy, rule_file_from_env as wx_stat_rule_file_from_env};
+use predigy_strategy_internal_arb::{
+    InternalArbConfig, InternalArbStrategy,
+    config_file_from_env as internal_arb_config_from_env,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -465,6 +469,18 @@ async fn register_strategies(registry: &StrategyRegistry) {
             }))
             .await;
     }
+
+    // Internal-arb (S3): mutually-exclusive Kalshi event-family
+    // sum-to-1 arbitrage. Skip if the family-config file env var
+    // is unset.
+    use predigy_strategy_internal_arb::STRATEGY_ID as INTERNAL_ARB_ID;
+    if let Some(path) = internal_arb_config_from_env() {
+        registry
+            .register(StrategyHandle::new(INTERNAL_ARB_ID, move || {
+                Box::new(InternalArbStrategy::new(InternalArbConfig::from_env(path.clone()))) as Box<dyn Strategy>
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -496,6 +512,15 @@ fn strategy_factory(
             .expect("WX_STAT_ID registered without a rule-file path; engine startup invariant");
         Box::new(move || {
             Box::new(WxStatStrategy::new(WxStatConfig::from_env(path.clone()))) as Box<dyn Strategy>
+        })
+    } else if id == predigy_strategy_internal_arb::STRATEGY_ID {
+        let path = internal_arb_config_from_env().expect(
+            "internal-arb registered without a config-file path; engine startup invariant",
+        );
+        Box::new(move || {
+            Box::new(InternalArbStrategy::new(InternalArbConfig::from_env(
+                path.clone(),
+            ))) as Box<dyn Strategy>
         })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))

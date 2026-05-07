@@ -9,7 +9,8 @@
 
 use predigy_engine_core::error::EngineResult;
 use predigy_engine_core::events::Event;
-use predigy_engine_core::oms::{Oms, SubmitOutcome};
+use predigy_engine_core::intent::LegGroup;
+use predigy_engine_core::oms::{Oms, SubmitGroupOutcome, SubmitOutcome};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use std::sync::Arc;
@@ -222,6 +223,18 @@ async fn run_one_lifecycle(
                         warn!(error = %e, "supervisor: oms submit error");
                     }
                 }
+                // **Audit I7** — after every on_event the
+                // supervisor drains any buffered atomic
+                // multi-leg groups the strategy queued and
+                // routes each through Oms::submit_group. Default
+                // impl returns empty; only multi-leg arb
+                // strategies (S3, S9) override.
+                let groups = strategy.drain_pending_groups();
+                for group in groups {
+                    if let Err(e) = submit_group_one(oms, group).await {
+                        warn!(error = %e, "supervisor: oms submit_group error");
+                    }
+                }
             }
             Err(e) => {
                 return LoopOutcome::Crashed(e.to_string());
@@ -246,6 +259,38 @@ async fn submit_one(oms: &Arc<dyn Oms>, intent: predigy_engine_core::Intent) -> 
         }
         SubmitOutcome::Rejected { reason } => {
             tracing::warn!(reason = %reason, "oms: rejected");
+            Ok(())
+        }
+    }
+}
+
+async fn submit_group_one(oms: &Arc<dyn Oms>, group: LegGroup) -> EngineResult<()> {
+    let n_legs = group.intents.len();
+    let group_id = group.group_id;
+    match oms.submit_group(group).await? {
+        SubmitGroupOutcome::Submitted {
+            group_id, venue, ..
+        } => {
+            tracing::info!(%group_id, n_legs, ?venue, "oms: leg-group submitted");
+            Ok(())
+        }
+        SubmitGroupOutcome::Idempotent { group_id, .. } => {
+            tracing::debug!(%group_id, n_legs, "oms: leg-group idempotent (no-op)");
+            Ok(())
+        }
+        SubmitGroupOutcome::Rejected {
+            reason,
+            failing_client_id,
+        } => {
+            tracing::warn!(%group_id, reason = %reason, %failing_client_id, "oms: leg-group rejected");
+            Ok(())
+        }
+        SubmitGroupOutcome::PartialCollision { existing } => {
+            tracing::error!(
+                %group_id,
+                n_existing = existing.len(),
+                "oms: leg-group submit collided with existing rows; refusing to graft"
+            );
             Ok(())
         }
     }

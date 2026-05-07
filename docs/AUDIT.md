@@ -6,12 +6,11 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2 all shipped (see
+> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3 all shipped (see
 > commits 57a28fc through this one). B1, B7 are operator-action
 > items. B4 (FIX) + B5 (maker rebates) + S7 (MM) + I1 (maker exec)
-> gated on Kalshi access or $25K capital. S3, S4, S5, S6, S8, S9
-> still pending — S3 and S9 now unblocked since I7 (their
-> infrastructure dependency) shipped.
+> gated on Kalshi access or $25K capital. S4, S5, S6, S8, S9
+> still pending. S3 just shipped and validates the I7 plumbing.
 
 ---
 
@@ -265,15 +264,57 @@ settlement; the original entry thesis is by definition
 settlement-resolved. Layer in TP/SL only if empirical data later
 justifies it.
 
-### S3 — Kalshi-internal sum-to-1 arb (cost: M)
+### S3 — Kalshi-internal sum-to-1 arb (cost: M) **SHIPPED 2026-05-07**
 
-Mutually-exclusive markets (e.g. "Trump wins NV" + "Harris wins
-NV" + "Other") should sum to ≤ 1 minus venue fees. Sometimes
-they don't. Sell each leg.
+New `predigy-strategy-internal-arb` (`STRATEGY_ID="internal-arb"`)
+fires when the YES side of a mutually-exclusive event family
+sums below 100¢ minus fees minus the operator's edge threshold.
 
-No cross-venue dependency. Pure microstructure on a single Kalshi
-event family. Need event-family detection (curator) + multi-leg
-order coordination (engine — currently single-leg only).
+Mechanism:
+- JSON-config file lists event families: each is a list of
+  Kalshi tickers known to be mutually-exclusive.
+- Strategy subscribes to all listed tickers via
+  `subscribed_markets()` (loaded from the config file at
+  construction time so the engine can wire the router
+  correctly), and recomputes per-family arb on every
+  `Event::BookUpdate` for any leg.
+- Per-leg YES-ask is derived `100 - best_no_bid`. Per-leg taker
+  fee from `predigy_core::fees::taker_fee`. Aggregate edge =
+  `100 - Σ ask - Σ fee - extra_fee_padding`.
+- When `edge ≥ min_edge_cents`, the strategy queues a
+  `LegGroup` of YES-buy IOC limits (one per leg) into its
+  `pending_groups` buffer. The supervisor drains and forwards
+  via `Oms::submit_group` (Audit I7).
+- Per-family cooldown (default 60s) prevents re-firing while
+  the existing group is still working at the venue.
+
+Foundation lift in this round:
+- New `Strategy::drain_pending_groups()` trait method (default
+  empty); supervisor drains after every `on_event` and routes
+  each group through I7's atomic submit. Existing single-leg
+  strategies inherit the default and stay untouched.
+
+What S3 doesn't do (by design):
+- No event-family auto-detection. Operator (or future curator)
+  authors the JSON. Auto-discovery via Kalshi event taxonomy is
+  a follow-up.
+- No NO-side mirror arb (`Σ no_ask > (n-1) + edge`). Easy to
+  add later if YES-side proves out.
+- No partial-fill recovery: I7's cascade cancels siblings on
+  full venue rejection, but if leg 1 fully fills and leg 2
+  partially fills, the operator is left with asymmetric
+  exposure. IOC TIF bounds the worst case to one tick.
+
+Operational:
+- `PREDIGY_INTERNAL_ARB_CONFIG` (path) — required.
+- `PREDIGY_INTERNAL_ARB_MIN_EDGE_CENTS` / `_SIZE` /
+  `_COOLDOWN_MS` / `_REFRESH_MS` — tunables.
+
+Tests (6 unit, all passing): fires when total ask clears
+threshold, skips when at-or-above 100¢, skips when a leg has no
+book, cooldown blocks repeats, family with <2 tickers rejected
+at load, ticker→families reverse index built correctly across
+overlapping families.
 
 ### S4 — Order-book mean reversion (cost: M)
 

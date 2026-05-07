@@ -29,6 +29,7 @@ predigy-strategy-settlement = { workspace = true }
 predigy-strategy-latency = { workspace = true }
 predigy-strategy-cross-arb = { workspace = true }
 predigy-strategy-wx-stat = { workspace = true }
+predigy-strategy-internal-arb = { workspace = true }
 uuid = { workspace = true }
 
 sqlx = { workspace = true }

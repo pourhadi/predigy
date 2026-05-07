@@ -8,7 +8,7 @@
 
 use crate::discovery::DiscoverySubscription;
 use crate::events::{Event, ExternalEvent};
-use crate::intent::Intent;
+use crate::intent::{Intent, LegGroup};
 use crate::state::StrategyState;
 use async_trait::async_trait;
 use predigy_core::market::MarketTicker;
@@ -68,6 +68,19 @@ pub trait Strategy: Send + Sync {
     /// for re-evaluating held positions. `None` = no tick.
     fn tick_interval(&self) -> Option<std::time::Duration> {
         None
+    }
+
+    /// **Audit I7 / S3 / S9** — drain any buffered atomic
+    /// multi-leg submissions queued by `on_event`. The supervisor
+    /// calls this immediately after each `on_event` and routes
+    /// every returned `LegGroup` through `Oms::submit_group`.
+    ///
+    /// Default returns empty — strategies that don't construct
+    /// multi-leg groups (the existing five) inherit this and stay
+    /// untouched. Multi-leg arb strategies (S3 sum-to-1,
+    /// S9 settlement-time) override.
+    fn drain_pending_groups(&mut self) -> Vec<LegGroup> {
+        Vec::new()
     }
 }
 
