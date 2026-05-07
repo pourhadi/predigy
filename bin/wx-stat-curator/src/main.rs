@@ -106,6 +106,14 @@ struct Args {
     /// from accumulated (forecast, outcome) pairs.
     #[arg(long, default_value = "data/wx_stat_calibration.json")]
     nbm_calibration: PathBuf,
+
+    /// Directory where per-run prediction records are appended
+    /// (one JSONL file per UTC date). The fit driver
+    /// (`wx-stat-fit-calibration`) reads these later to compute
+    /// (raw_p, outcome) pairs against realised observations.
+    /// Pass `""` to skip prediction logging entirely.
+    #[arg(long, default_value = "data/wx_stat_predictions")]
+    nbm_predictions_dir: PathBuf,
 }
 
 #[tokio::main]
@@ -179,14 +187,23 @@ async fn main() -> Result<()> {
                 None
             }
         };
-        let outcomes =
-            curate_via_nbm(&nbm_client, &args.nbm_cache, cycle, &markets, calibration.as_ref())
-                .await;
+        let run_ts_utc = format_now_utc_iso();
+        let outcomes = curate_via_nbm(
+            &nbm_client,
+            &args.nbm_cache,
+            cycle,
+            &markets,
+            calibration.as_ref(),
+            &run_ts_utc,
+        )
+        .await;
+        let mut predictions: Vec<wx_stat_curator::predictions::PredictionRecord> = Vec::new();
         for (m, outcome) in markets.iter().zip(outcomes.into_iter()) {
             match outcome {
                 NbmCurateOutcome::Rule(out) => {
                     info!(audit = %out.audit, "accepted rule (nbm)");
                     rules.push(out.rule);
+                    predictions.push(out.prediction);
                     inspections.push(RuleInspection {
                         ticker: out.ticker,
                         title: out.title,
@@ -209,6 +226,26 @@ async fn main() -> Result<()> {
                     *skip_counts.entry("error").or_insert(0) += 1;
                     skipped.push((m.ticker.clone(), reason));
                 }
+            }
+        }
+        // Phase 2E: persist per-rule prediction records for the
+        // calibration fitter. Skip if the operator pointed
+        // --nbm-predictions-dir at an empty path.
+        if !args.nbm_predictions_dir.as_os_str().is_empty() && !predictions.is_empty() {
+            match wx_stat_curator::predictions::append_records(
+                &args.nbm_predictions_dir,
+                &predictions,
+            ) {
+                Ok(n) => info!(
+                    n,
+                    dir = %args.nbm_predictions_dir.display(),
+                    "nbm: appended prediction records"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    dir = %args.nbm_predictions_dir.display(),
+                    "nbm: prediction-record append failed"
+                ),
             }
         }
     } else {
@@ -605,6 +642,58 @@ fn now_unix() -> i64 {
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .unwrap_or(0)
+}
+
+/// Current UTC instant as ISO-8601 (e.g. `"2026-05-07T03:14:15Z"`).
+/// Used as the `run_ts_utc` field on Phase 2E prediction records.
+/// No chrono dep — small custom formatter.
+fn format_now_utc_iso() -> String {
+    let secs = now_unix().max(0) as u64;
+    let total_secs = secs;
+    let hour = ((total_secs / 3600) % 24) as u8;
+    let minute = ((total_secs / 60) % 60) as u8;
+    let second = (total_secs % 60) as u8;
+    let days_since_epoch = (total_secs / 86_400) as u32;
+    let mut year: u16 = 1970;
+    let mut remaining = days_since_epoch;
+    loop {
+        let dy = if (year.is_multiple_of(4) && !year.is_multiple_of(100))
+            || year.is_multiple_of(400)
+        {
+            366
+        } else {
+            365
+        };
+        if remaining < dy {
+            break;
+        }
+        remaining -= dy;
+        year += 1;
+    }
+    let mut month: u8 = 1;
+    loop {
+        let dim: u32 = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if (year.is_multiple_of(4) && !year.is_multiple_of(100))
+                    || year.is_multiple_of(400)
+                {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 31,
+        };
+        if remaining < dim {
+            break;
+        }
+        remaining -= dim;
+        month += 1;
+    }
+    let day = u8::try_from(remaining + 1).unwrap_or(1);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn init_tracing() {

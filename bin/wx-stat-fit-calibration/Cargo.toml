@@ -1,5 +1,5 @@
 [package]
-name = "wx-stat-curator"
+name = "wx-stat-fit-calibration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,17 +10,11 @@ repository.workspace = true
 workspace = true
 
 [[bin]]
-name = "wx-stat-curator"
+name = "wx-stat-fit-calibration"
 path = "src/main.rs"
 
-[lib]
-path = "src/lib.rs"
-
 [dependencies]
-predigy-core = { workspace = true }
-predigy-kalshi-rest = { workspace = true }
-predigy-ext-feeds = { workspace = true }
-stat-trader = { workspace = true }
+wx-stat-curator = { path = "../wx-stat-curator" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -29,8 +23,3 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-reqwest = { workspace = true }
-
-[dev-dependencies]
-rand = { workspace = true }
-tempfile = { workspace = true }

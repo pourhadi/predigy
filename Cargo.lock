@@ -2829,13 +2829,31 @@ dependencies = [
  "predigy-core",
  "predigy-ext-feeds",
  "predigy-kalshi-rest",
+ "rand 0.8.6",
+ "reqwest",
  "serde",
  "serde_json",
  "stat-trader",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "wx-stat-fit-calibration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wx-stat-curator",
 ]
 
 [[package]]

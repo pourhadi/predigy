@@ -25,6 +25,7 @@ members = [
     "bin/cross-arb-curator",
     "bin/stat-curator",
     "bin/wx-stat-curator",
+    "bin/wx-stat-fit-calibration",
 ]
 
 [workspace.package]

@@ -24,6 +24,7 @@ use crate::kalshi_scan::TempMarket;
 use crate::nbm_path::{
     DAILY_HIGH_LOCAL_HOURS, DAILY_LOW_LOCAL_HOURS, approx_utc_offset_hours, forecast_hour_window,
 };
+use crate::predictions::{PredictionMeasurement, PredictionRecord};
 use crate::ticker_parse::{TempMarketSpec, TempMeasurement, TempStrikeKind, parse_temp_market};
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
@@ -56,6 +57,11 @@ pub struct NbmRuleOut {
     pub side: Side,
     pub quoted_ask_cents: u8,
     pub apparent_edge_cents: i32,
+    /// Sidecar prediction record for Phase 2E calibration. Every
+    /// rule emits one of these alongside; the operator persists
+    /// them via `predictions::append_records` so the fit driver
+    /// can later join with realised observations.
+    pub prediction: PredictionRecord,
 }
 
 /// Outcome for one market — either a rule or a structured skip.
@@ -79,6 +85,7 @@ pub async fn curate_via_nbm(
     cycle: NbmCycle,
     markets: &[TempMarket],
     calibration: Option<&Calibration>,
+    run_ts_utc: &str,
 ) -> Vec<NbmCurateOutcome> {
     // ---- Pass 1: plan ----
     let mut plans: Vec<Plan> = Vec::new();
@@ -146,7 +153,7 @@ pub async fn curate_via_nbm(
 
     // ---- Pass 3: emit per market ----
     for plan in plans {
-        match score_plan(&plan, &fetched, calibration) {
+        match score_plan(&plan, &fetched, calibration, run_ts_utc) {
             Ok(out) => outcomes.push(NbmCurateOutcome::Rule(out)),
             Err(reason) => outcomes.push(NbmCurateOutcome::Skip { reason }),
         }
@@ -214,6 +221,7 @@ fn score_plan(
     plan: &Plan,
     fetched: &HashMap<(u16, &'static str), AirportQuantiles>,
     calibration: Option<&Calibration>,
+    run_ts_utc: &str,
 ) -> Result<NbmRuleOut, String> {
     // Threshold in Kelvin (NBM is K).
     let threshold_k = match plan.spec.kind {
@@ -317,6 +325,21 @@ fn score_plan(
         side,
         min_edge_cents: 5,
     };
+    let prediction = PredictionRecord {
+        run_ts_utc: run_ts_utc.to_string(),
+        ticker: plan.market.ticker.clone(),
+        airport: plan.airport.code.to_string(),
+        settlement_date: plan.spec.settlement_date.clone(),
+        threshold_k,
+        yes_when_above: matches!(plan.spec.kind, TempStrikeKind::Greater { .. }),
+        measurement: match plan.spec.measurement {
+            TempMeasurement::DailyHigh => PredictionMeasurement::DailyHigh,
+            TempMeasurement::DailyLow => PredictionMeasurement::DailyLow,
+        },
+        raw_p,
+        model_p,
+        forecast_50pct_f: forecast_value_f,
+    };
     Ok(NbmRuleOut {
         rule,
         audit,
@@ -329,6 +352,7 @@ fn score_plan(
         side,
         quoted_ask_cents,
         apparent_edge_cents,
+        prediction,
     })
 }
 
