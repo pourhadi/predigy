@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- predigy-engine: the consolidated trading engine.
+
+         Defaults to PREDIGY_ENGINE_MODE=shadow — the engine
+         persists every intent it would have fired to Postgres
+         at status='shadow' but does NOT submit to Kalshi. The
+         legacy per-strategy daemons (stat-trader,
+         settlement-trader, latency-trader, cross-arb-trader)
+         keep trading as the sole live source while shadow runs
+         alongside.
+
+         Operator flow (see docs/CUTOVER.md):
+           1. Run engine in shadow for ≥24h.
+           2. Run `predigy-parity` to compare engine-shadow
+              intents vs legacy daemon ledgers.
+           3. If parity holds, flip
+              PREDIGY_ENGINE_MODE=live in ~/.zprofile and
+              `launchctl kickstart -k gui/$(id -u)/com.predigy.engine`.
+           4. Disable the legacy launchd job for whichever
+              strategy you're cutting over (one at a time).
+
+         Risk caps default to the same shake-down envelope as
+         the legacy daemons; override via env vars listed in
+         engine-run.sh.
+
+         Long-running. KeepAlive on crash. ThrottleInterval 30s
+         matches the legacy daemons.
+    -->
+    <key>Label</key>
+    <string>com.predigy.engine</string>
+
+    <key>Disabled</key>
+    <false/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/engine-run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/engine.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/engine.stderr.log</string>
+</dict>
+</plist>
