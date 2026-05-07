@@ -506,8 +506,12 @@ Strategy ports (one crate per strategy under `crates/strategies/`):
       loaded from JSON file at `PREDIGY_LATENCY_RULE_FILE`. Ships
       alongside the new external-feed dispatcher infrastructure
       (see below).
-- [ ] cross-arb (Polymarket-coupled; needs poly-md handle in
-      external-feed dispatcher — Phase 6 work).
+- [x] **cross-arb-trader** → `crates/strategies/cross-arb`
+      (Phase 5, shipped 2026-05-07). Pair-file driven; pairs
+      come from `PREDIGY_CROSS_ARB_PAIR_FILE` (curator's output)
+      and are hot-reloaded via the new pair-file service. Ships
+      alongside Polymarket WS support in the external-feed
+      dispatcher.
 - [ ] wx-stat / wx-curator / stat-curator / cross-arb-curator
       (curators run on a different cadence; possibly stay
       external for now).
@@ -561,6 +565,32 @@ alerts, future Polymarket book / NBM cycle publish.
   `PREDIGY_NWS_USER_AGENT` set the engine logs a warning at boot
   and skips spawning the feed; latency-strategy supervisor still
   comes up but never receives an event.
+- Cross-arb is the second consumer (Polymarket feed). The
+  dispatcher exposes a `PolyCommandTx` handle so the pair-file
+  service can dynamically extend the asset-id subscription set
+  as new pairs land in the curator's output file.
+
+#### Pair-file service (shipped 2026-05-07)
+
+Watches the cross-arb-curator's output file
+(`PREDIGY_CROSS_ARB_PAIR_FILE`) for changes and emits
+`Event::PairUpdate` to the cross-arb supervisor. Mtime-poll based
+(default 30s); suitable cadence given the curator runs on a
+10-minute interval.
+
+On each detected change:
+1. **Router subscribe** — added Kalshi tickers via
+   `RouterCommand::AddTickers`.
+2. **Polymarket subscribe** — added asset_ids via
+   `PolyFeedCommand::AddAssets`.
+3. **Polymarket prune** — removed asset_ids drop from the saved-
+   sub set so reconnects don't re-subscribe to dropped pairs
+   (Poly WS has no in-band unsubscribe per the docs).
+4. **Strategy delta** — `Event::PairUpdate { added, removed }`
+   to the cross-arb supervisor's queue.
+
+File format matches the legacy daemon: `KALSHI_TICKER=POLY_ASSET_ID`
+per line, `#` comments + blanks tolerated.
 
 #### Migration plan per strategy
 

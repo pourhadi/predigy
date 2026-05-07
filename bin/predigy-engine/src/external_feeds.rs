@@ -28,6 +28,7 @@ use predigy_engine_core::strategy::StrategyId;
 use predigy_ext_feeds::{
     spawn_nws, NwsAlert, NwsAlertsConfig, MIN_POLL_INTERVAL,
 };
+use predigy_poly_md::{Client as PolyClient, Event as PolyEvent};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,10 +61,34 @@ impl NwsConfig {
     }
 }
 
+/// Command sent to the Polymarket dispatcher's command channel.
+/// Used by the pair-file service to dynamically extend the
+/// asset-id subscription set after the engine boots.
+#[derive(Debug)]
+pub enum PolyFeedCommand {
+    /// Subscribe to additional asset_ids on the Poly WS. Polymarket
+    /// has no in-band unsubscribe — removed pairs simply stop being
+    /// referenced by the strategy; their stream remains open until
+    /// the WS reconnects (saved subs are filtered on reconnect, see
+    /// the `prune_subs` helper).
+    AddAssets(Vec<String>),
+    /// Drop assets from the saved-subscription list so the next
+    /// reconnect doesn't re-subscribe to them.
+    PruneAssets(Vec<String>),
+}
+
+/// Cloneable handle for the Polymarket dispatcher's command
+/// channel. Returned from `ExternalFeeds::start()` so the
+/// pair-file service can issue subscribe requests.
+pub type PolyCommandTx = mpsc::Sender<PolyFeedCommand>;
+
 /// Public handle. Drop or call `shutdown` to abort the spawned
 /// dispatcher tasks.
 pub struct ExternalFeeds {
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Cloneable handle for the Polymarket dispatcher's command
+    /// channel. `None` if poly wasn't spawned this boot.
+    pub poly_tx: Option<PolyCommandTx>,
 }
 
 impl std::fmt::Debug for ExternalFeeds {
@@ -85,6 +110,7 @@ impl ExternalFeeds {
         subscribers: &HashMap<&'static str, Vec<(StrategyId, mpsc::Sender<Event>)>>,
     ) -> Result<Self> {
         let mut tasks = Vec::new();
+        let mut poly_tx: Option<PolyCommandTx> = None;
 
         if let Some(cfg) = nws {
             if let Some(consumers) = subscribers.get("nws_alerts") {
@@ -110,7 +136,25 @@ impl ExternalFeeds {
             }
         }
 
-        Ok(Self { tasks })
+        if let Some(consumers) = subscribers.get("polymarket") {
+            if !consumers.is_empty() {
+                let client = PolyClient::new()
+                    .map_err(|e| anyhow::anyhow!("poly client: {e}"))?;
+                let connection = client.connect();
+                let (cmd_tx, cmd_rx) = mpsc::channel::<PolyFeedCommand>(64);
+                let consumers_arc = Arc::new(consumers.clone());
+                let handle = tokio::spawn(poly_dispatcher_task(
+                    connection,
+                    cmd_rx,
+                    consumers_arc,
+                ));
+                tasks.push(handle);
+                poly_tx = Some(cmd_tx);
+                info!("external_feeds: Polymarket dispatcher started");
+            }
+        }
+
+        Ok(Self { tasks, poly_tx })
     }
 
     pub async fn shutdown(self, grace: Duration) {
@@ -144,6 +188,152 @@ async fn nws_dispatcher_task(
         }
     }
     info!("external_feeds: NWS receiver closed; dispatcher exiting");
+}
+
+/// Polymarket dispatcher loop. Owns the WS connection, multiplexes
+/// `PolyFeedCommand`s and incoming Polymarket events. On each
+/// `Book` or `PriceChange`, derives best-bid/best-ask and fans out
+/// an `ExternalEvent::PolymarketBook` to every subscribed
+/// supervisor.
+async fn poly_dispatcher_task(
+    mut connection: predigy_poly_md::Connection,
+    mut cmd_rx: mpsc::Receiver<PolyFeedCommand>,
+    consumers: Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>,
+) {
+    use std::collections::BTreeSet;
+    let mut saved_subs: BTreeSet<String> = BTreeSet::new();
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    info!("external_feeds: poly cmd channel closed");
+                    return;
+                };
+                match cmd {
+                    PolyFeedCommand::AddAssets(assets) => {
+                        let new: Vec<String> = assets
+                            .into_iter()
+                            .filter(|a| saved_subs.insert(a.clone()))
+                            .collect();
+                        if new.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = connection.subscribe(&new).await {
+                            // Roll back so a retry has a clean shot.
+                            for a in &new {
+                                saved_subs.remove(a);
+                            }
+                            warn!(
+                                n = new.len(),
+                                error = %e,
+                                "external_feeds: poly subscribe failed"
+                            );
+                        } else {
+                            info!(
+                                n_new = new.len(),
+                                n_total = saved_subs.len(),
+                                "external_feeds: poly subscribed to additional assets"
+                            );
+                        }
+                    }
+                    PolyFeedCommand::PruneAssets(assets) => {
+                        for a in assets {
+                            saved_subs.remove(&a);
+                        }
+                    }
+                }
+            }
+            ev = connection.next_event() => {
+                let Some(ev) = ev else {
+                    warn!("external_feeds: poly connection closed");
+                    return;
+                };
+                handle_poly_event(ev, &consumers).await;
+            }
+        }
+    }
+}
+
+async fn handle_poly_event(
+    ev: PolyEvent,
+    consumers: &Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>,
+) {
+    let payload = match ev {
+        PolyEvent::Book(b) => {
+            // Derive best bid/best ask from the L2 levels. Polymarket
+            // emits levels in price order (highest bid / lowest ask
+            // first per the WS docs), but we don't depend on that —
+            // we max/min explicitly.
+            let best_bid = b
+                .bids
+                .iter()
+                .filter_map(|l| l.price.parse::<f64>().ok())
+                .fold(None, |acc, p| {
+                    Some(acc.map_or(p, |a: f64| a.max(p)))
+                });
+            let best_ask = b
+                .asks
+                .iter()
+                .filter_map(|l| l.price.parse::<f64>().ok())
+                .fold(None, |acc, p| {
+                    Some(acc.map_or(p, |a: f64| a.min(p)))
+                });
+            ExternalEvent::PolymarketBook {
+                asset_id: b.asset_id,
+                best_bid,
+                best_ask,
+            }
+        }
+        PolyEvent::PriceChange(p) => {
+            // PriceChange may carry multiple per-asset entries; emit
+            // one ExternalEvent per asset so the strategy's update_poly
+            // map gets the latest best_bid/best_ask for each.
+            for ch in p.price_changes {
+                let payload = ExternalEvent::PolymarketBook {
+                    asset_id: ch.asset_id.clone(),
+                    best_bid: ch.best_bid.as_deref().and_then(|s| s.parse::<f64>().ok()),
+                    best_ask: ch.best_ask.as_deref().and_then(|s| s.parse::<f64>().ok()),
+                };
+                fan_out_external(consumers, payload);
+            }
+            return;
+        }
+        PolyEvent::LastTradePrice(_) | PolyEvent::TickSizeChange(_) => return,
+        PolyEvent::Disconnected { attempt, reason } => {
+            warn!(attempt, reason, "external_feeds: poly disconnected");
+            return;
+        }
+        PolyEvent::Reconnected => {
+            info!("external_feeds: poly reconnected");
+            return;
+        }
+        PolyEvent::Malformed { error, raw } => {
+            warn!(
+                error,
+                raw_excerpt = raw.chars().take(120).collect::<String>().as_str(),
+                "external_feeds: poly malformed frame"
+            );
+            return;
+        }
+    };
+    fan_out_external(consumers, payload);
+}
+
+fn fan_out_external(
+    consumers: &Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>,
+    payload: ExternalEvent,
+) {
+    let ev = Event::External(payload);
+    for (strategy, tx) in consumers.iter() {
+        if let Err(e) = tx.try_send(ev.clone()) {
+            warn!(
+                strategy = strategy.0,
+                error = %e,
+                "external_feeds: poly fan-out failed"
+            );
+        }
+    }
 }
 
 fn nws_alert_to_payload(a: NwsAlert) -> NwsAlertPayload {

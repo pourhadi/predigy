@@ -1678,6 +1678,8 @@ dependencies = [
  "predigy-ext-feeds",
  "predigy-kalshi-md",
  "predigy-kalshi-rest",
+ "predigy-poly-md",
+ "predigy-strategy-cross-arb",
  "predigy-strategy-latency",
  "predigy-strategy-settlement",
  "predigy-strategy-stat",

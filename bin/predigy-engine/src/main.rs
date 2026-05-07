@@ -32,6 +32,7 @@ use predigy_engine::{
     external_feeds::{build_subscriber_map, nws_config_from_env, ExternalFeeds},
     market_data::{MarketDataRouter, RouterConfig},
     oms_db::DbBackedOms,
+    pair_file_service::{pair_file_from_env, PairFileConfig, PairFileService},
     registry::StrategyRegistry,
     supervisor::{RestartPolicy, Supervisor},
     venue_rest::{VenueRest, VenueRestConfig},
@@ -42,6 +43,7 @@ use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use predigy_engine_core::Db;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
+use predigy_strategy_cross_arb::{CrossArbConfig, CrossArbStrategy};
 use predigy_strategy_latency::LatencyStrategy;
 use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
 use predigy_strategy_stat::{StatConfig, StatStrategy};
@@ -243,7 +245,55 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 8b. Discovery service — periodic Kalshi REST scan that
+    // 8b. Pair-file service — watches the cross-arb-curator's
+    //     pair file for changes and emits Event::PairUpdate to
+    //     the cross-arb supervisor. Auto-registers added Kalshi
+    //     tickers with the router AND added Polymarket assets
+    //     with the external-feeds dispatcher. Skipped if either
+    //     PREDIGY_CROSS_ARB_PAIR_FILE isn't set OR there's no
+    //     cross-arb supervisor running OR the polymarket feed
+    //     wasn't started.
+    let pair_file = if let Some(path) = pair_file_from_env() {
+        let cross_arb_sup = supervisors
+            .iter()
+            .find(|s| s.id == predigy_strategy_cross_arb::STRATEGY_ID);
+        match (cross_arb_sup, external_feeds.as_ref().and_then(|f| f.poly_tx.clone())) {
+            (Some(sup), Some(poly_tx)) => {
+                let cfg = PairFileConfig {
+                    path,
+                    poll_interval: Duration::from_secs(30),
+                    strategy: sup.id,
+                };
+                let svc = PairFileService::start(
+                    cfg,
+                    router.command_tx(),
+                    poly_tx,
+                    sup.event_tx.clone(),
+                );
+                info!("predigy-engine: pair-file service started");
+                Some(svc)
+            }
+            (None, _) => {
+                warn!(
+                    "PREDIGY_CROSS_ARB_PAIR_FILE set but cross-arb supervisor not running; \
+                     pair-file watcher disabled"
+                );
+                None
+            }
+            (_, None) => {
+                warn!(
+                    "PREDIGY_CROSS_ARB_PAIR_FILE set but Polymarket feed not started \
+                     (no supervisors declared 'polymarket' subscription); \
+                     pair-file watcher disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 8c. Discovery service — periodic Kalshi REST scan that
     //     auto-registers tickers with the router and pushes
     //     Event::DiscoveryDelta into strategies. Spawned only if
     //     at least one supervised strategy declared a discovery
@@ -283,6 +333,9 @@ async fn main() -> Result<()> {
     info!("predigy-engine: shutdown initiated; draining");
     watcher_handle.abort();
     if let Some(svc) = discovery_service {
+        svc.shutdown(config.shutdown_grace).await;
+    }
+    if let Some(svc) = pair_file {
         svc.shutdown(config.shutdown_grace).await;
     }
     if let Some(svc) = external_feeds {
@@ -329,6 +382,18 @@ async fn register_strategies(registry: &StrategyRegistry) {
             }))
             .await;
     }
+
+    // Cross-arb only registers if a pair-file path is configured.
+    // The strategy is pure pair-file driven; without pairs
+    // there's no reason to claim the supervisor slot.
+    use predigy_strategy_cross_arb::STRATEGY_ID as CROSS_ARB_ID;
+    if pair_file_from_env().is_some() {
+        registry
+            .register(StrategyHandle::new(CROSS_ARB_ID, || {
+                Box::new(CrossArbStrategy::new(CrossArbConfig::default())) as Box<dyn Strategy>
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -339,6 +404,7 @@ fn strategy_factory(
     use predigy_strategy_latency::STRATEGY_ID as LATENCY_ID;
     use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
+    use predigy_strategy_cross_arb::STRATEGY_ID as CROSS_ARB_ID;
     if id == STAT_ID {
         Box::new(|| Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>)
     } else if id == SETTLEMENT_ID {
@@ -349,6 +415,10 @@ fn strategy_factory(
         let path = latency_rules_path()
             .expect("LATENCY_ID registered without a rule-file path; engine startup invariant");
         Box::new(move || build_latency_strategy(&path))
+    } else if id == CROSS_ARB_ID {
+        Box::new(|| {
+            Box::new(CrossArbStrategy::new(CrossArbConfig::default())) as Box<dyn Strategy>
+        })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
     }
