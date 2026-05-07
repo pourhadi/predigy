@@ -23,6 +23,7 @@ pub mod market_data;
 pub mod oms_db;
 pub mod pair_file_service;
 pub mod registry;
+pub mod self_subscribe;
 pub mod supervisor;
 pub mod venue_rest;
 

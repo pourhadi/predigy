@@ -35,6 +35,7 @@ use predigy_engine::{
     oms_db::DbBackedOms,
     pair_file_service::{PairFileConfig, PairFileService, pair_file_from_env},
     registry::StrategyRegistry,
+    self_subscribe::SelfSubscribeDispatcher,
     supervisor::{RestartPolicy, Supervisor},
     venue_rest::{VenueRest, VenueRestConfig},
 };
@@ -190,6 +191,13 @@ async fn main() -> Result<()> {
     // subscriber map is final.
     let (xstrat_tx, xstrat_rx) = CrossStrategyBus::channel();
 
+    // Audit A5 — self-subscribe channel. Strategies that want
+    // dynamic per-position book subscriptions (latency) call
+    // state.subscribe_to_markets which sends here; the
+    // dispatcher (started after supervisor spawn) routes to
+    // the router.
+    let (self_sub_tx, self_sub_rx) = SelfSubscribeDispatcher::channel();
+
     let mut supervisors: Vec<Supervisor> = Vec::new();
     let mut discovery_subs: HashMap<StrategyId, Vec<DiscoverySubscription>> = HashMap::new();
     let mut external_subscribers: Vec<(
@@ -205,7 +213,9 @@ async fn main() -> Result<()> {
     for (id, _) in registry.instantiate_all().await {
         let factory = strategy_factory(id);
         let strategy = factory();
-        let state = StrategyState::new(db.clone(), id.0).with_cross_strategy_tx(xstrat_tx.clone());
+        let state = StrategyState::new(db.clone(), id.0)
+            .with_cross_strategy_tx(xstrat_tx.clone())
+            .with_self_subscribe_tx(self_sub_tx.clone());
         let markets = strategy
             .subscribed_markets(&state)
             .await
@@ -251,6 +261,20 @@ async fn main() -> Result<()> {
     drop(xstrat_tx);
     let by_topic = cross_strategy_bus::build_subscriber_map(xstrat_subscribers);
     let xstrat_bus = CrossStrategyBus::start_dispatching(xstrat_rx, by_topic);
+
+    // Audit A5 — self-subscribe dispatcher. Drop the engine's
+    // local tx; supervisors hold their own clones via
+    // StrategyState. Map each strategy id to its supervisor
+    // event_tx so the dispatcher can route AddTickers commands
+    // back to the right queue.
+    drop(self_sub_tx);
+    let strategy_event_txs: HashMap<StrategyId, tokio::sync::mpsc::Sender<predigy_engine_core::events::Event>> =
+        supervisors
+            .iter()
+            .map(|s| (s.id, s.event_tx.clone()))
+            .collect();
+    let self_sub_dispatcher =
+        SelfSubscribeDispatcher::start(self_sub_rx, router.command_tx(), strategy_event_txs);
 
     // 8a. External-feed dispatcher — single NWS connection
     //     fanned out to every supervisor that opted in via
@@ -368,6 +392,7 @@ async fn main() -> Result<()> {
     if let Some(bus) = xstrat_bus {
         bus.shutdown(config.shutdown_grace).await;
     }
+    self_sub_dispatcher.shutdown(config.shutdown_grace).await;
     if let Some(svc) = pair_file {
         svc.shutdown(config.shutdown_grace).await;
     }

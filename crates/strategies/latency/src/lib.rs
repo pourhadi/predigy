@@ -117,18 +117,26 @@ struct LatencyRuleState {
 /// Loaded separately from the rule JSON.
 #[derive(Debug, Clone)]
 pub struct LatencyConfig {
-    /// Maximum seconds an open position is allowed to sit before
-    /// the strategy force-flats it. Latency entries are bets that
-    /// the alert moves the market within minutes; if the move
-    /// hasn't materialised by `max_hold_secs`, the alert was
-    /// likely a false positive and we'd rather free up risk
-    /// budget than hold indefinitely. `0` disables time-based
-    /// exits.
+    /// **Audit A5** — tiered force-flat thresholds (seconds).
+    ///
+    /// Tier 1 (`tier1_secs`): light TP. Once the position has
+    /// run this long, exit on any positive PnL using the cached
+    /// mark from the book. Default 5 min.
+    ///
+    /// Tier 2 (`tier2_secs`): mark-aware force-flat at the
+    /// current bid (mark-aware unwind, no profit gate). Default
+    /// 15 min.
+    ///
+    /// Tier 3 (`max_hold_secs`): wide IOC at
+    /// `force_flat_floor_cents` regardless of mark. The
+    /// last-resort floor — guarantees flat. Default 30 min.
+    ///
+    /// `0` on any tier disables that tier.
+    pub tier1_secs: i64,
+    pub tier2_secs: i64,
     pub max_hold_secs: i64,
-    /// Floor price (cents) for the wide-IOC force-flat. Latency
-    /// has no book subscription, so the exit limit is set
-    /// conservatively so any standing bid takes us. `1` cent is
-    /// the venue-side floor.
+    /// Floor price (cents) for the tier-3 wide-IOC force-flat.
+    /// Set conservatively (1¢) so any standing bid takes us.
     pub force_flat_floor_cents: i32,
     /// How often to refresh the position cache from Postgres.
     pub position_refresh_interval: Duration,
@@ -138,12 +146,23 @@ pub struct LatencyConfig {
 
 impl LatencyConfig {
     /// Audit B2 + B3 — env-var overrides:
-    /// - `PREDIGY_LATENCY_MAX_HOLD_SECS` (i64)
+    /// - `PREDIGY_LATENCY_TIER1_SECS` / `TIER2_SECS` /
+    ///   `MAX_HOLD_SECS` (i64; tier thresholds)
     /// - `PREDIGY_LATENCY_FORCE_FLAT_FLOOR_CENTS` (i32)
     /// - `PREDIGY_LATENCY_TICK_INTERVAL_MS` (u64)
     #[must_use]
     pub fn from_env() -> Self {
         let mut c = Self::default();
+        if let Ok(v) = std::env::var("PREDIGY_LATENCY_TIER1_SECS") {
+            if let Ok(n) = v.parse() {
+                c.tier1_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_LATENCY_TIER2_SECS") {
+            if let Ok(n) = v.parse() {
+                c.tier2_secs = n;
+            }
+        }
         if let Ok(v) = std::env::var("PREDIGY_LATENCY_MAX_HOLD_SECS") {
             if let Ok(n) = v.parse() {
                 c.max_hold_secs = n;
@@ -166,8 +185,9 @@ impl LatencyConfig {
 impl Default for LatencyConfig {
     fn default() -> Self {
         Self {
-            // Default: force-flat at 30 min. Operator can disable
-            // by setting to 0 if they want to hold indefinitely.
+            // A5 tiers: 5/15/30 min. Tunable per env var below.
+            tier1_secs: 5 * 60,
+            tier2_secs: 15 * 60,
             max_hold_secs: 30 * 60,
             force_flat_floor_cents: 1,
             position_refresh_interval: Duration::from_secs(60),
@@ -197,6 +217,15 @@ pub struct LatencyStrategy {
     /// Phase 6.2 — per-position exit cooldown.
     last_exit_at: HashMap<String, std::time::Instant>,
     last_position_refresh: Option<std::time::Instant>,
+    /// **Audit A5** — latest known book mark per ticker, populated
+    /// from `Event::BookUpdate` on markets we're holding (the
+    /// strategy self-subscribes after firing an entry).
+    /// `(yes_bid_cents, no_bid_cents)` — derive YES/NO marks
+    /// from these.
+    book_marks: HashMap<String, (Option<u8>, Option<u8>)>,
+    /// Tickers we've requested subscriptions for. Bounded growth
+    /// (one entry per market we've ever held).
+    subscribed: std::collections::HashSet<String>,
 }
 
 impl LatencyStrategy {
@@ -217,6 +246,8 @@ impl LatencyStrategy {
             positions: HashMap::new(),
             last_exit_at: HashMap::new(),
             last_position_refresh: None,
+            book_marks: HashMap::new(),
+            subscribed: std::collections::HashSet::new(),
         }
     }
 
@@ -360,54 +391,95 @@ impl LatencyStrategy {
     /// takes us. Returns 0..N closing intents (one per stale
     /// position).
     fn evaluate_force_flats(&mut self, now_utc: chrono::DateTime<chrono::Utc>) -> Vec<Intent> {
-        if self.config.max_hold_secs <= 0 {
-            return Vec::new();
-        }
         let mut out = Vec::new();
         let now_instant = std::time::Instant::now();
         for (key, pos) in self.positions.clone() {
             if pos.signed_qty == 0 {
                 continue;
             }
-            // Per-position cooldown so multiple Ticks within the
-            // tick_interval don't re-fire the close intent. The
-            // OMS cid would dedupe anyway but the cooldown saves
-            // round trips.
             if let Some(last) = self.last_exit_at.get(&key)
                 && now_instant.duration_since(*last) < self.config.tick_interval
             {
                 continue;
             }
             let age_secs = (now_utc - pos.opened_at).num_seconds();
-            if age_secs < self.config.max_hold_secs {
+            let ticker = match key.split_once(':') {
+                Some((t, _)) => t,
+                None => continue,
+            };
+
+            // **A5 — tiered exit selection**:
+            //   tier1 (>=tier1_secs): TP-only, mark-aware, fires
+            //                         only when PnL > 0.
+            //   tier2 (>=tier2_secs): mark-aware force-flat at
+            //                         current bid (no profit gate).
+            //   tier3 (>=max_hold_secs): wide IOC at floor (1¢).
+            //
+            // Determine which tier to fire (highest applicable).
+            // Books for held positions arrive via the
+            // self-subscribe path; the latest mark is in
+            // book_marks. Without a mark we can still fire
+            // tier3.
+            let book_yes = self.book_marks.get(ticker).map(|t| t.0).unwrap_or(None);
+            let book_no = self.book_marks.get(ticker).map(|t| t.1).unwrap_or(None);
+            let mark_cents: Option<i32> = match (pos.side, pos.signed_qty.is_positive()) {
+                (Side::Yes, true) => book_yes.map(i32::from),
+                (Side::No, true) => book_no.map(i32::from),
+                (Side::Yes, false) => book_no.map(|c| 100 - i32::from(c)),
+                (Side::No, false) => book_yes.map(|c| 100 - i32::from(c)),
+            };
+            let pnl_per = mark_cents.map(|m| {
+                if pos.signed_qty > 0 {
+                    m - pos.avg_entry_cents
+                } else {
+                    pos.avg_entry_cents - m
+                }
+            });
+
+            let tier3_active = self.config.max_hold_secs > 0 && age_secs >= self.config.max_hold_secs;
+            let tier2_active = self.config.tier2_secs > 0 && age_secs >= self.config.tier2_secs;
+            let tier1_active =
+                self.config.tier1_secs > 0 && age_secs >= self.config.tier1_secs && pnl_per.unwrap_or(0) > 0;
+
+            let (tier_tag, limit_cents) = if tier3_active {
+                ("t3", self.config.force_flat_floor_cents.clamp(1, 99))
+            } else if tier2_active {
+                // Mark-aware force-flat. If we don't have a mark
+                // yet, defer to tier3 — wait until the position
+                // ages further.
+                match mark_cents {
+                    Some(m) => ("t2", m.clamp(1, 99)),
+                    None => continue,
+                }
+            } else if tier1_active {
+                // Light TP. Mark is required (we already filtered
+                // on pnl_per > 0 which requires a mark).
+                let m = mark_cents.expect("pnl_per filter implies mark");
+                ("t1", m.clamp(1, 99))
+            } else {
                 continue;
-            }
-            // Construct the force-flat. Sell on the same leg we
-            // hold; buy if we're short. Limit at the wide floor.
+            };
+
             let action = if pos.signed_qty > 0 {
                 IntentAction::Sell
             } else {
                 IntentAction::Buy
             };
-            let limit_cents = self.config.force_flat_floor_cents.clamp(1, 99);
             let abs_qty = pos.signed_qty.unsigned_abs() as i32;
-            // Position-key + open-day bucket for idempotency. The
-            // open-day is stable across ticks so repeated triggers
-            // collapse via the OMS.
             let day_bucket = pos.opened_at.timestamp() / 86_400;
             let side_tag = match pos.side {
                 Side::Yes => "Y",
                 Side::No => "N",
             };
-            let ticker = match key.split_once(':') {
-                Some((t, _)) => t,
-                None => continue,
-            };
             let client_id = format!(
-                "latency-flat:{cid_ticker}:{side_tag}:{day:08x}",
+                "latency-flat:{cid_ticker}:{side_tag}:{tier}:{day:08x}",
                 cid_ticker = cid_safe_ticker(ticker),
+                tier = tier_tag,
                 day = day_bucket as u32,
             );
+            let pnl_str = pnl_per
+                .map(|p| format!("pnl={p}¢"))
+                .unwrap_or_else(|| "no_mark".to_string());
             let intent = Intent {
                 client_id,
                 strategy: STRATEGY_ID.0,
@@ -419,8 +491,8 @@ impl LatencyStrategy {
                 order_type: OrderType::Limit,
                 tif: Tif::Ioc,
                 reason: Some(format!(
-                    "latency-flat: held_{age_secs}s ≥ max_hold_{}s entry={}¢",
-                    self.config.max_hold_secs, pos.avg_entry_cents
+                    "latency-flat:{tier_tag} held_{age_secs}s entry={}¢ limit={}¢ {pnl_str}",
+                    pos.avg_entry_cents, limit_cents
                 )),
             };
             info!(
@@ -429,7 +501,9 @@ impl LatencyStrategy {
                 signed_qty = pos.signed_qty,
                 age_secs,
                 avg_entry = pos.avg_entry_cents,
-                "latency: force-flat aging position"
+                tier = tier_tag,
+                limit_cents,
+                "latency: tiered force-flat firing"
             );
             self.last_exit_at.insert(key, now_instant);
             out.push(intent);
@@ -483,16 +557,31 @@ impl Strategy for LatencyStrategy {
         match ev {
             Event::External(ExternalEvent::NwsAlert(alert)) => {
                 if let Some((_idx, intent)) = self.evaluate(alert) {
+                    // **Audit A5** — self-subscribe to this market
+                    // so subsequent BookUpdates feed
+                    // `book_marks` and tier-1/2 force-flats can
+                    // exit at mark.
+                    let ticker = intent.market.as_str().to_string();
+                    if self.subscribed.insert(ticker.clone()) {
+                        state.subscribe_to_markets(vec![intent.market.clone()]);
+                    }
                     return Ok(vec![intent]);
                 }
                 Ok(Vec::new())
             }
-            Event::Tick => {
-                // Phase 6.2 — Tick-driven force-flat for stale
-                // positions. The strategy has no book access so
-                // exits are time-based only.
-                Ok(self.evaluate_force_flats(chrono::Utc::now()))
+            Event::BookUpdate { market, book } => {
+                // **Audit A5** — cache best bids so tiered
+                // force-flats can compute mark-aware exits. We
+                // record (yes_bid, no_bid); YES/NO marks for any
+                // direction are derived in
+                // `evaluate_force_flats`.
+                let yes_bid = book.best_yes_bid().map(|(p, _)| p.cents());
+                let no_bid = book.best_no_bid().map(|(p, _)| p.cents());
+                self.book_marks
+                    .insert(market.as_str().to_string(), (yes_bid, no_bid));
+                Ok(Vec::new())
             }
+            Event::Tick => Ok(self.evaluate_force_flats(chrono::Utc::now())),
             _ => Ok(Vec::new()),
         }
     }
@@ -698,6 +787,8 @@ mod tests {
 
     fn cfg() -> LatencyConfig {
         LatencyConfig {
+            tier1_secs: 5 * 60,
+            tier2_secs: 15 * 60,
             max_hold_secs: 1800,
             force_flat_floor_cents: 1,
             position_refresh_interval: Duration::from_secs(60),
@@ -784,6 +875,130 @@ mod tests {
         // Immediate repeat: cooldown blocks it.
         let second = s.evaluate_force_flats(now);
         assert!(second.is_empty());
+    }
+
+    // ─── A5 tiered force-flat tests ─────────────────────────
+
+    #[test]
+    fn tier1_takes_profit_with_positive_pnl_mark() {
+        // Position aged 6 min (>tier1=5min, <tier2=15min).
+        // YES long @ 50¢, mark = 60¢, PnL +10¢ → tier1 fires
+        // limit at 60¢.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(360);
+        s.positions.insert(
+            position_key("WX-T1", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        s.book_marks.insert("WX-T1".into(), (Some(60), Some(40)));
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].price_cents, Some(60));
+        assert!(intents[0].client_id.contains(":t1:"));
+    }
+
+    #[test]
+    fn tier1_skips_when_pnl_negative() {
+        // Position aged 6 min, mark 40¢ < entry 50¢. Tier1 needs
+        // PnL > 0 → no fire. Below tier2 too → no fire.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(360);
+        s.positions.insert(
+            position_key("WX-T1N", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        s.book_marks.insert("WX-T1N".into(), (Some(40), Some(60)));
+        assert!(s.evaluate_force_flats(now).is_empty());
+    }
+
+    #[test]
+    fn tier2_force_flats_at_mark_regardless_of_pnl() {
+        // Position aged 16 min (>tier2=15min, <tier3=30min).
+        // No-profit gate at tier2. Mark at 30¢ (loss vs 50¢
+        // entry) → tier2 fires limit 30¢.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(960);
+        s.positions.insert(
+            position_key("WX-T2", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        s.book_marks.insert("WX-T2".into(), (Some(30), Some(70)));
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].price_cents, Some(30));
+        assert!(intents[0].client_id.contains(":t2:"));
+    }
+
+    #[test]
+    fn tier2_skips_without_book_mark_defers_to_tier3() {
+        // Aged 16 min, no book mark. Tier2 requires mark — skip.
+        // Below tier3 — skip too.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(960);
+        s.positions.insert(
+            position_key("WX-T2N", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        assert!(s.evaluate_force_flats(now).is_empty());
+    }
+
+    #[test]
+    fn tier3_wide_floor_fires_without_mark() {
+        // Aged 31 min. No book mark → tier3 fires at floor 1¢.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(1860);
+        s.positions.insert(
+            position_key("WX-T3", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].price_cents, Some(1));
+        assert!(intents[0].client_id.contains(":t3:"));
+    }
+
+    #[test]
+    fn tier3_overrides_tier2_at_max_hold() {
+        // Aged 31 min, with book mark. Tier3 must take priority
+        // over tier2 because tier3 is the hard floor.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(1860);
+        s.positions.insert(
+            position_key("WX-T3M", Side::Yes),
+            cached_position(Side::Yes, 5, 50, opened),
+        );
+        s.book_marks.insert("WX-T3M".into(), (Some(40), Some(60)));
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].price_cents, Some(1));
+        assert!(intents[0].client_id.contains(":t3:"));
+    }
+
+    #[test]
+    fn no_long_handles_mark_via_complement() {
+        // NO long: signed_qty +4, side=No, entry=30¢. Aged
+        // tier2. YES bid is 70 → NO bid stored as 30. Mark for
+        // NO long should equal NO bid = 30 → exit at 30¢ even
+        // though entry was also 30¢.
+        let mut s = LatencyStrategy::with_config(cfg(), Vec::new());
+        let now = chrono::Utc::now();
+        let opened = now - chrono::Duration::seconds(960);
+        s.positions.insert(
+            position_key("WX-NO", Side::No),
+            cached_position(Side::No, 4, 30, opened),
+        );
+        s.book_marks.insert("WX-NO".into(), (Some(70), Some(30)));
+        let intents = s.evaluate_force_flats(now);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].side, Side::No);
+        assert_eq!(intents[0].price_cents, Some(30));
+        assert!(intents[0].client_id.contains(":t2:"));
     }
 
     #[test]

@@ -42,5 +42,5 @@ pub use oms::{
     ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, ReconciliationDiff, RejectionReason,
     RiskCaps, SubmitOutcome, VenueChoice,
 };
-pub use state::StrategyState;
+pub use state::{SelfSubscribeRequest, StrategyState};
 pub use strategy::{Strategy, StrategyId};

@@ -9,6 +9,7 @@
 use crate::cross_strategy::CrossStrategyEvent;
 use crate::db::Db;
 use crate::strategy::StrategyId;
+use predigy_core::market::MarketTicker;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -21,6 +22,21 @@ use tracing::warn;
 pub struct PublishedCrossStrategyEvent {
     pub source: StrategyId,
     pub payload: CrossStrategyEvent,
+}
+
+/// **Audit A5** — request the engine subscribe this strategy's
+/// supervisor to one or more market tickers. Used by latency
+/// (which has no static subscribed_markets) to fan its
+/// held-position books into its own queue so it can do
+/// mark-aware exits.
+///
+/// The engine's adapter resolves this into a
+/// `RouterCommand::AddTickers` and feeds the strategy's own
+/// supervisor event_tx. Sent over a mpsc owned by main.rs.
+#[derive(Debug, Clone)]
+pub struct SelfSubscribeRequest {
+    pub strategy: StrategyId,
+    pub markets: Vec<MarketTicker>,
 }
 
 #[derive(Debug)]
@@ -36,6 +52,10 @@ pub struct StrategyState {
     /// when wiring supervisors. `publish_cross_strategy` is a
     /// no-op when the handle is absent.
     cross_strategy_tx: Option<mpsc::Sender<PublishedCrossStrategyEvent>>,
+    /// **Audit A5** — handle for self-initiated market subscribes
+    /// (latency uses this to fan held-position books into its own
+    /// queue). `None` in unit tests + early boot.
+    self_subscribe_tx: Option<mpsc::Sender<SelfSubscribeRequest>>,
 }
 
 impl StrategyState {
@@ -45,6 +65,7 @@ impl StrategyState {
             strategy_id,
             last_fire: HashMap::new(),
             cross_strategy_tx: None,
+            self_subscribe_tx: None,
         }
     }
 
@@ -64,6 +85,41 @@ impl StrategyState {
     /// fan-out paths) — a slow consumer must never backpressure
     /// a producer's hot path.
     ///
+    /// **Audit A5** — attach a self-subscribe tx. Called once
+    /// by the engine binary when constructing per-supervisor
+    /// states.
+    #[must_use]
+    pub fn with_self_subscribe_tx(
+        mut self,
+        tx: mpsc::Sender<SelfSubscribeRequest>,
+    ) -> Self {
+        self.self_subscribe_tx = Some(tx);
+        self
+    }
+
+    /// **Audit A5** — request a market subscription so the
+    /// strategy's supervisor receives `Event::BookUpdate` for
+    /// the given tickers. No-op when no handle is attached.
+    pub fn subscribe_to_markets(&self, markets: Vec<MarketTicker>) {
+        let Some(tx) = &self.self_subscribe_tx else {
+            return;
+        };
+        if markets.is_empty() {
+            return;
+        }
+        let req = SelfSubscribeRequest {
+            strategy: StrategyId(self.strategy_id),
+            markets,
+        };
+        if let Err(e) = tx.try_send(req) {
+            warn!(
+                source = self.strategy_id,
+                error = %e,
+                "self-subscribe dropped (queue full or closed)"
+            );
+        }
+    }
+
     /// No-op when no bus tx is attached (unit tests; engine
     /// boots with zero supervisors).
     pub fn publish_cross_strategy(&self, payload: CrossStrategyEvent) {

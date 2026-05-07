@@ -5,15 +5,14 @@
 > item is tagged with an estimated dev-cost (S / M / L) and an
 > operator-action requirement (A / —).
 >
-> **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A6,
-> B2, B3, I2, I3, I4, I5, I6, S1 all shipped (see commits 57a28fc
-> through 22e2578). A5 deferred with rationale below. B1, B7 are
-> operator-action items. B4 (FIX) + B5 (maker rebates) + S7 (MM)
-> + I1 (maker exec) gated on Kalshi access or $25K capital. I7
-> (atomic multi-leg) deferred — its only consumers (S3, S9) are
-> also deferred. S2, S4, S5, S6, S8, S9 remain — each needs new
-> infrastructure (curator integration, new feed, price-history
-> store) or coupled to deferred I7. Pick one when ready.
+> **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
+> A6, B2, B3, I2, I3, I4, I5, I6, S1 all shipped (see commits 57a28fc
+> through this one). B1, B7 are operator-action items. B4 (FIX) +
+> B5 (maker rebates) + S7 (MM) + I1 (maker exec) gated on Kalshi
+> access or $25K capital. I7 (atomic multi-leg), S2, S3, S4, S5,
+> S6, S8, S9 still pending — each needs new infrastructure
+> (curator integration, new feed, price-history store) or coupled
+> to deferred I7.
 
 ---
 
@@ -74,20 +73,42 @@ likely the original edge has decayed. Reduce TP threshold by
 ~1¢/hour held. Caps adverse drift; encourages exits before
 settlement risk.
 
-### A5 — Latency tiered force-flat (cost: S)
+### A5 — Latency tiered force-flat (cost: S) **SHIPPED 2026-05-07**
 
-Latency's force-flat is binary: held <30min → keep, ≥30min →
-exit at 1¢. A tiered exit:
+Tiered exit:
 
-- 0–5 min: hold
-- 5–15 min: light TP at any positive PnL
-- 15–30 min: force-flat at last book quote (requires book
-  subscription — see I1)
-- ≥30 min: 1¢ wide IOC (current behavior)
+- 0–`tier1_secs` (default 5min): hold
+- `tier1`–`tier2_secs` (default 15min): light TP at any positive
+  PnL (requires book mark)
+- `tier2`–`max_hold_secs` (default 30min): force-flat at last
+  book quote regardless of PnL
+- ≥`max_hold_secs`: wide IOC at `force_flat_floor_cents` (1¢) —
+  hard floor, fires even without a book mark
 
-The 15–30 min tier is the new value. Without book access we'd
-need to estimate the unwind price from REST `/portfolio/positions`'s
-`average_fill_price` snapshot, which is staler than book data.
+Implementation: `LatencyConfig` gained `tier1_secs` and
+`tier2_secs` (env-overridable via `PREDIGY_LATENCY_TIER1_SECS`/
+`TIER2_SECS`). Strategy gained `book_marks: HashMap<ticker,
+(yes_bid, no_bid)>` populated from `Event::BookUpdate`. After
+firing an entry, the strategy calls
+`state.subscribe_to_markets(...)` so the engine fans the held
+market's book updates back into the strategy's queue
+(see `bin/predigy-engine/src/self_subscribe.rs` —
+`SelfSubscribeDispatcher`).
+
+`evaluate_force_flats()` selects the highest-applicable tier;
+tier-2 defers to tier-3 if no mark is yet cached. Cid format
+gained a `:tN:` segment so each tier produces a distinct
+idempotency key. 7 new tests cover all branches including
+NO-side complement-mark derivation.
+
+Plumbing landed in `crates/engine-core/src/state.rs`
+(`SelfSubscribeRequest`, `with_self_subscribe_tx`,
+`subscribe_to_markets`) and
+`bin/predigy-engine/src/self_subscribe.rs`
+(`SelfSubscribeDispatcher` consumes requests, looks up the
+strategy's own supervisor `event_tx`, dispatches as
+`RouterCommand::AddTickers` so deltas flow back to the
+requester).
 
 ### A6 — Settlement profit lock (cost: S)
 
