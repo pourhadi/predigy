@@ -133,6 +133,27 @@ impl Db {
         .await?;
         Ok(rows)
     }
+
+    /// Non-terminal live intents, optionally filtered by strategy. Used by
+    /// inventory-aware strategies to avoid stacking over orders already working
+    /// through the OMS/venue path.
+    pub async fn active_intents(
+        &self,
+        strategy: Option<&str>,
+    ) -> Result<Vec<ActiveIntent>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, ActiveIntent>(
+            "SELECT client_id, strategy, ticker, side, action,
+                    COALESCE(price_cents, 0) AS price_cents, qty, status
+               FROM intents
+              WHERE status NOT IN ('filled','cancelled','rejected','expired','shadow')
+                AND ($1::TEXT IS NULL OR strategy = $1)
+              ORDER BY submitted_at DESC",
+        )
+        .bind(strategy)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -146,6 +167,18 @@ pub struct OpenPosition {
     pub fees_paid_cents: i64,
     pub opened_at: chrono::DateTime<chrono::Utc>,
     pub last_fill_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ActiveIntent {
+    pub client_id: String,
+    pub strategy: String,
+    pub ticker: String,
+    pub side: String,
+    pub action: String,
+    pub price_cents: i32,
+    pub qty: i32,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]

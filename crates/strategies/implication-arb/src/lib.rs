@@ -59,6 +59,7 @@ use predigy_engine_core::intent::{
 };
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
+use predigy_engine_core::{ActiveIntent, OpenPosition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -92,6 +93,10 @@ pub struct ImplicationArbConfig {
     pub min_edge_cents: i32,
     /// Contracts to trade per leg.
     pub size: u32,
+    pub max_size_per_group: u32,
+    pub max_pair_notional_cents: i64,
+    pub max_cluster_notional_cents: i64,
+    pub max_touch_take_fraction: f64,
     pub cooldown: Duration,
     pub config_refresh_interval: Duration,
 }
@@ -110,6 +115,10 @@ impl ImplicationArbConfig {
             config_file,
             min_edge_cents: 2,
             size: 1,
+            max_size_per_group: 5,
+            max_pair_notional_cents: 500,
+            max_cluster_notional_cents: 1_000,
+            max_touch_take_fraction: 0.20,
             cooldown: Duration::from_secs(60),
             config_refresh_interval: Duration::from_secs(30),
         };
@@ -122,6 +131,28 @@ impl ImplicationArbConfig {
             && let Ok(n) = v.parse()
         {
             c.size = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_IMPLICATION_ARB_MAX_SIZE_PER_GROUP")
+            && let Ok(n) = v.parse()
+        {
+            c.max_size_per_group = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_IMPLICATION_ARB_MAX_PAIR_NOTIONAL_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.max_pair_notional_cents = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_IMPLICATION_ARB_MAX_CLUSTER_NOTIONAL_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.max_cluster_notional_cents = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_IMPLICATION_ARB_MAX_TOUCH_TAKE_FRACTION")
+            && let Ok(n) = v.parse::<f64>()
+            && n > 0.0
+            && n <= 1.0
+        {
+            c.max_touch_take_fraction = n;
         }
         if let Ok(v) = std::env::var("PREDIGY_IMPLICATION_ARB_COOLDOWN_MS")
             && let Ok(n) = v.parse::<u64>()
@@ -158,6 +189,87 @@ struct CachedTouch {
     yes_ask_cents: u8,
     yes_bid_qty: u32,
     yes_ask_qty: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InventoryLeg {
+    qty: i32,
+    notional_cents: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArbInventory {
+    by_ticker_side: HashMap<(String, String), InventoryLeg>,
+    by_cluster_notional: HashMap<String, i64>,
+}
+
+impl ArbInventory {
+    fn from_rows(positions: Vec<OpenPosition>, active_intents: Vec<ActiveIntent>) -> Self {
+        let mut inv = Self::default();
+        for p in positions {
+            let qty = p.current_qty.max(0);
+            if qty == 0 {
+                continue;
+            }
+            inv.add(&p.ticker, &p.side, qty, p.avg_entry_cents);
+        }
+        for i in active_intents {
+            if i.action != "buy" {
+                continue;
+            }
+            inv.add(&i.ticker, &i.side, i.qty.max(0), i.price_cents);
+        }
+        inv
+    }
+
+    fn add(&mut self, ticker: &str, side: &str, qty: i32, price_cents: i32) {
+        if qty <= 0 {
+            return;
+        }
+        let notional = i64::from(qty) * i64::from(price_cents.max(0));
+        let leg = self
+            .by_ticker_side
+            .entry((ticker.to_string(), side.to_string()))
+            .or_default();
+        leg.qty += qty;
+        leg.notional_cents += notional;
+        *self
+            .by_cluster_notional
+            .entry(cluster_key(ticker))
+            .or_default() += notional;
+    }
+
+    fn reserve_group(&mut self, group: &LegGroup) {
+        for intent in &group.intents {
+            if intent.action != IntentAction::Buy {
+                continue;
+            }
+            let side = match intent.side {
+                Side::Yes => "yes",
+                Side::No => "no",
+            };
+            self.add(
+                intent.market.as_str(),
+                side,
+                intent.qty,
+                intent.price_cents.unwrap_or(0),
+            );
+        }
+    }
+
+    fn leg(&self, ticker: &str, side: &str) -> InventoryLeg {
+        self.by_ticker_side
+            .get(&(ticker.to_string(), side.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn cluster_notional(&self, ticker: &str) -> i64 {
+        self.by_cluster_notional
+            .get(&cluster_key(ticker))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug)]
@@ -273,7 +385,12 @@ impl ImplicationArbStrategy {
         }
     }
 
-    fn evaluate_pair(&mut self, idx: usize, now: Instant) -> Option<LegGroup> {
+    fn evaluate_pair(
+        &mut self,
+        idx: usize,
+        now: Instant,
+        inventory: &ArbInventory,
+    ) -> Option<LegGroup> {
         let pair = &self.pairs[idx];
         if let Some(&last) = self.last_fire_at.get(&pair.pair_id)
             && now.duration_since(last) < self.config.cooldown
@@ -325,7 +442,58 @@ impl ImplicationArbStrategy {
             return None;
         }
 
-        let size = self.config.size.min(parent_qty).min(child_qty);
+        let parent_leg = inventory.leg(&pair.parent, "yes");
+        let child_leg = inventory.leg(&pair.child, "no");
+        if parent_leg.qty != child_leg.qty {
+            debug!(
+                pair = pair.pair_id,
+                parent_qty = parent_leg.qty,
+                child_qty = child_leg.qty,
+                "implication-arb: unbalanced package inventory blocks scaling"
+            );
+            return None;
+        }
+
+        let existing_packages = parent_leg.qty.max(0) as u32;
+        let edge_target = self.edge_target_packages(net_edge);
+        if existing_packages >= edge_target {
+            debug!(
+                pair = pair.pair_id,
+                existing_packages, edge_target, "implication-arb: edge-tier package cap reached"
+            );
+            return None;
+        }
+
+        let unit_notional =
+            i64::from(parent_ask) + i64::from(no_child_ask) + i64::from(per_unit_fee);
+        let pair_notional = parent_leg.notional_cents + child_leg.notional_cents;
+        let pair_cap_qty = remaining_cap_qty(
+            self.config.max_pair_notional_cents,
+            pair_notional,
+            unit_notional,
+        )?;
+        let cluster_notional = inventory
+            .cluster_notional(&pair.parent)
+            .max(inventory.cluster_notional(&pair.child));
+        let cluster_cap_qty = remaining_cap_qty(
+            self.config.max_cluster_notional_cents,
+            cluster_notional,
+            unit_notional,
+        )?;
+        let liquidity_qty = ((f64::from(parent_qty.min(child_qty))
+            * self.config.max_touch_take_fraction)
+            .floor() as u32)
+            .max(1);
+        let size = self
+            .config
+            .max_size_per_group
+            .max(self.config.size)
+            .min(parent_qty)
+            .min(child_qty)
+            .min(liquidity_qty)
+            .min(edge_target.saturating_sub(existing_packages))
+            .min(pair_cap_qty)
+            .min(cluster_cap_qty);
         if size == 0 {
             return None;
         }
@@ -394,6 +562,41 @@ impl ImplicationArbStrategy {
         self.last_fire_at.insert(pair.pair_id.clone(), now);
         LegGroup::new(intents)
     }
+
+    fn edge_target_packages(&self, net_edge_cents: i32) -> u32 {
+        let target = if net_edge_cents >= 10 {
+            5
+        } else if net_edge_cents >= 5 {
+            3
+        } else {
+            1
+        };
+        target
+            .max(self.config.size)
+            .min(self.config.max_size_per_group.max(1))
+    }
+}
+
+fn remaining_cap_qty(cap_cents: i64, used_cents: i64, unit_cents: i64) -> Option<u32> {
+    if cap_cents <= 0 {
+        return Some(u32::MAX);
+    }
+    if unit_cents <= 0 || used_cents >= cap_cents {
+        return None;
+    }
+    u32::try_from((cap_cents - used_cents) / unit_cents).ok()
+}
+
+fn cluster_key(ticker: &str) -> String {
+    ticker
+        .split_once("-T")
+        .map(|(prefix, _)| prefix.to_string())
+        .unwrap_or_else(|| {
+            ticker
+                .rsplit_once('-')
+                .map(|(prefix, _)| prefix.to_string())
+                .unwrap_or_else(|| ticker.to_string())
+        })
 }
 
 #[async_trait]
@@ -425,7 +628,7 @@ impl Strategy for ImplicationArbStrategy {
     async fn on_event(
         &mut self,
         ev: &Event,
-        _state: &mut StrategyState,
+        state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
         let needs_refresh = self
             .last_config_refresh
@@ -438,9 +641,14 @@ impl Strategy for ImplicationArbStrategy {
                 self.record_book(market, book);
                 let key = market.as_str().to_string();
                 let candidates = self.ticker_to_pairs.get(&key).cloned().unwrap_or_default();
+                let mut inventory = ArbInventory::from_rows(
+                    state.db.open_positions(Some(STRATEGY_ID.0)).await?,
+                    state.db.active_intents(Some(STRATEGY_ID.0)).await?,
+                );
                 let now = Instant::now();
                 for idx in candidates {
-                    if let Some(group) = self.evaluate_pair(idx, now) {
+                    if let Some(group) = self.evaluate_pair(idx, now, &inventory) {
+                        inventory.reserve_group(&group);
                         self.pending_groups.push(group);
                     }
                 }
@@ -484,6 +692,10 @@ mod tests {
             config_file: path,
             min_edge_cents: 2,
             size: 1,
+            max_size_per_group: 5,
+            max_pair_notional_cents: 500,
+            max_cluster_notional_cents: 1_000,
+            max_touch_take_fraction: 0.20,
             cooldown: Duration::from_secs(60),
             config_refresh_interval: Duration::from_secs(30),
         }
@@ -491,6 +703,12 @@ mod tests {
 
     fn write_pairs(path: &std::path::Path, pairs: &serde_json::Value) {
         std::fs::write(path, serde_json::to_string(pairs).unwrap()).unwrap();
+    }
+
+    fn base_strategy(path: PathBuf) -> ImplicationArbStrategy {
+        let mut c = cfg(path);
+        c.cooldown = Duration::from_secs(0);
+        ImplicationArbStrategy::new(c)
     }
 
     #[test]
@@ -510,7 +728,9 @@ mod tests {
         // raw edge before fees).
         s.record_book(&MarketTicker::new("KX-C"), &book(Some(40), Some(50)));
 
-        let group = s.evaluate_pair(0, Instant::now()).expect("fires");
+        let group = s
+            .evaluate_pair(0, Instant::now(), &ArbInventory::default())
+            .expect("fires");
         assert_eq!(group.intents.len(), 2);
         let parent_leg = &group.intents[0];
         assert_eq!(parent_leg.market.as_str(), "KX-P");
@@ -539,7 +759,10 @@ mod tests {
         // edge.
         s.record_book(&MarketTicker::new("KX-P"), &book(Some(40), Some(50)));
         s.record_book(&MarketTicker::new("KX-C"), &book(Some(30), Some(60)));
-        assert!(s.evaluate_pair(0, Instant::now()).is_none());
+        assert!(
+            s.evaluate_pair(0, Instant::now(), &ArbInventory::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -554,7 +777,10 @@ mod tests {
         s.reload_pairs();
         // Only parent has a book.
         s.record_book(&MarketTicker::new("KX-P"), &book(Some(20), Some(70)));
-        assert!(s.evaluate_pair(0, Instant::now()).is_none());
+        assert!(
+            s.evaluate_pair(0, Instant::now(), &ArbInventory::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -570,8 +796,8 @@ mod tests {
         s.record_book(&MarketTicker::new("KX-P"), &book(Some(20), Some(70)));
         s.record_book(&MarketTicker::new("KX-C"), &book(Some(40), Some(50)));
         let now = Instant::now();
-        assert!(s.evaluate_pair(0, now).is_some());
-        assert!(s.evaluate_pair(0, now).is_none());
+        assert!(s.evaluate_pair(0, now, &ArbInventory::default()).is_some());
+        assert!(s.evaluate_pair(0, now, &ArbInventory::default()).is_none());
     }
 
     #[test]
@@ -588,5 +814,66 @@ mod tests {
         let mut s = ImplicationArbStrategy::new(cfg(path));
         s.reload_pairs();
         assert_eq!(s.pair_count(), 1);
+    }
+
+    #[test]
+    fn high_edge_scales_group_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairs.json");
+        write_pairs(
+            &path,
+            &serde_json::json!({"pairs": [{"parent": "KX-P", "child": "KX-C"}]}),
+        );
+        let mut s = base_strategy(path);
+        s.reload_pairs();
+        s.record_book(&MarketTicker::new("KX-P"), &book(Some(10), Some(80))); // parent ask 20
+        s.record_book(&MarketTicker::new("KX-C"), &book(Some(40), Some(50))); // child bid 40
+
+        let group = s
+            .evaluate_pair(0, Instant::now(), &ArbInventory::default())
+            .expect("high edge fires");
+
+        assert!(
+            group.intents[0].qty > 1,
+            "high edge should scale above one package"
+        );
+        assert_eq!(group.intents[0].qty, group.intents[1].qty);
+    }
+
+    #[test]
+    fn unbalanced_inventory_blocks_scaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairs.json");
+        write_pairs(
+            &path,
+            &serde_json::json!({"pairs": [{"parent": "KX-P", "child": "KX-C"}]}),
+        );
+        let mut s = base_strategy(path);
+        s.reload_pairs();
+        s.record_book(&MarketTicker::new("KX-P"), &book(Some(10), Some(80)));
+        s.record_book(&MarketTicker::new("KX-C"), &book(Some(40), Some(50)));
+        let mut inv = ArbInventory::default();
+        inv.add("KX-P", "yes", 1, 20);
+
+        assert!(s.evaluate_pair(0, Instant::now(), &inv).is_none());
+    }
+
+    #[test]
+    fn existing_edge_tier_inventory_blocks_more_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pairs.json");
+        write_pairs(
+            &path,
+            &serde_json::json!({"pairs": [{"parent": "KX-P", "child": "KX-C"}]}),
+        );
+        let mut s = base_strategy(path);
+        s.reload_pairs();
+        s.record_book(&MarketTicker::new("KX-P"), &book(Some(10), Some(80)));
+        s.record_book(&MarketTicker::new("KX-C"), &book(Some(40), Some(50)));
+        let mut inv = ArbInventory::default();
+        inv.add("KX-P", "yes", 5, 20);
+        inv.add("KX-C", "no", 5, 60);
+
+        assert!(s.evaluate_pair(0, Instant::now(), &inv).is_none());
     }
 }

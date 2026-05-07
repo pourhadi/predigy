@@ -146,17 +146,18 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    `implication-arb`, `internal-arb`, and measured `settlement`.
    Shadow or tightly gate `book-imbalance`, `variance-fade`, `latency`,
    and `news-trader` until empirical edge exists.
-5. **Book-imbalance remains halted.** The 2026-05-07 live audit found it buying
-   both YES and NO on `KXVOTEHUBTRUMPUPDOWN-26MAY07`, plus insufficient-balance
-   rejects. NO-side WS fills and NO-side mark accounting were fixed in the
-   engine after the audit, and the pre-fix NO ledger rows were repaired in
-   Postgres. Corrected mark is about `-30c`, not the pre-repair `-700c`, but
-   the strategy still fee-churned both sides of one market; keep its DB kill
-   switch armed until the same-market churn bug is fixed.
-6. **Implication-arb needs closer observation.** The same NO-accounting repair
-   changed corrected marked PnL from apparently positive to about `-130c` across
-   40 open contracts. It is not halted yet, but don't treat it as proven edge
-   until the open package is reconciled against settlement/marks.
+5. **Book-imbalance has scalable inventory controls.** The 2026-05-07 live
+   audit found it buying both YES and NO on `KXVOTEHUBTRUMPUPDOWN-26MAY07`, plus
+   insufficient-balance rejects. NO-side accounting was fixed and pre-fix ledger
+   rows repaired; corrected mark was about `-30c`, not the pre-repair `-700c`.
+   The strategy now scales only same-side exposure under dynamic imbalance /
+   liquidity caps, blocks while active orders exist, and treats opposite-side
+   signals as flatten-first exits instead of opening the other side.
+6. **Implication-arb has package-aware scale caps.** Corrected marks turned the
+   existing `KXECONSTATU3` package from apparently positive to about `-130c`.
+   The strategy now models parent-YES/child-NO packages, blocks unbalanced pair
+   inventory, scales balanced packages by edge/liquidity/pair cap/cluster cap,
+   and reserves queued groups in-memory so one book event cannot overrun caps.
 7. **Weather stat/wx-stat are intentionally resumed, but keep watching.** The
    wx-stat rule file was regenerated through the observed-extreme gate and
    corrected NBM aggregation. `predigy-import` no longer imports
@@ -164,8 +165,9 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    legacy enabled rows from that source; `KXHIGHTSFO-26MAY07-T62` is disabled.
    `KXHIGHTPHX-26MAY08-T98` was corrected from YES 0.98 to NO 0.066, and the
    bad 14-contract YES exposure was sold at 3c.
-8. **Latency remains halted.** Fix stale NWS alert replay/freshness before
-   disarming its DB kill switch.
+8. **Latency stale-replay guard is fixed.** NWS alerts now require fresh onset
+   or effective timestamps, reject expired or missing-timestamp alerts, and use
+   a stable full-alert SHA-256 hash in cids instead of a shared short prefix.
 9. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
    Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
    do not prioritize FIX above the safety blockers.

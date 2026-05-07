@@ -54,10 +54,11 @@ use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub const STRATEGY_ID: StrategyId = StrategyId("latency");
 
@@ -142,6 +143,10 @@ pub struct LatencyConfig {
     pub position_refresh_interval: Duration,
     /// Periodic timer for re-evaluating exit conditions.
     pub tick_interval: Duration,
+    /// Maximum age for a latency entry trigger. Active NWS alerts can remain in
+    /// the feed long after issuance; old active alerts are stale for a latency
+    /// strategy and must not re-fire after engine restarts.
+    pub max_alert_age_secs: i64,
 }
 
 impl LatencyConfig {
@@ -178,6 +183,11 @@ impl LatencyConfig {
                 c.tick_interval = Duration::from_millis(n);
             }
         }
+        if let Ok(v) = std::env::var("PREDIGY_LATENCY_MAX_ALERT_AGE_SECS") {
+            if let Ok(n) = v.parse::<i64>() {
+                c.max_alert_age_secs = n;
+            }
+        }
         c
     }
 }
@@ -192,6 +202,7 @@ impl Default for LatencyConfig {
             force_flat_floor_cents: 1,
             position_refresh_interval: Duration::from_secs(60),
             tick_interval: Duration::from_secs(60),
+            max_alert_age_secs: 10 * 60,
         }
     }
 }
@@ -273,6 +284,10 @@ impl LatencyStrategy {
     }
 
     fn evaluate(&mut self, alert: &NwsAlertPayload) -> Option<(usize, Intent)> {
+        if !alert_is_fresh(alert, chrono::Utc::now(), self.config.max_alert_age_secs) {
+            debug!(alert_id = %alert.id, event = %alert.event_type, "latency: stale alert skipped");
+            return None;
+        }
         let alert_severity = Severity::from_str(&alert.severity);
         for (idx, state) in self.rules.iter_mut().enumerate() {
             if !state.armed {
@@ -316,21 +331,13 @@ impl LatencyStrategy {
                 Ok(q) if q > 0 => q,
                 _ => continue,
             };
-            // Idempotency: alert.id is unique per NWS alert; using
-            // it in client_id means a duplicate fan-out (alert
-            // edited by NWS) collapses cleanly via the OMS.
-            //
-            // NWS alert ids are URN-format with periods + colons
-            // (e.g. `urn:oid:2.49.0.1.840.0.13fe...`). Kalshi V2
-            // rejects cids with `.`; the existing `cid_safe_ticker`
-            // strips periods, but it's only applied to the ticker
-            // portion. Apply it to alert_short too — and any other
-            // forbidden chars get replaced with hyphens to be
-            // defensive.
-            let alert_short_raw: String = alert.id.chars().take(20).collect();
-            let alert_short = cid_safe_ticker(&alert_short_raw);
+            // Idempotency: hash the full NWS alert id, rule index, and ticker.
+            // Prefix truncation is unsafe because many NWS ids share the same
+            // `urn:oid:` prefix; the hash stays stable across restarts while
+            // remaining Kalshi-cid safe.
+            let alert_hash = alert_hash(&alert.id, idx, &rule.kalshi_market);
             let client_id = format!(
-                "latency:{ticker}:{alert_short}:{idx}",
+                "latency:{ticker}:{alert_hash}:{idx}",
                 ticker = cid_safe_ticker(&rule.kalshi_market),
             );
             let intent = Intent {
@@ -539,6 +546,49 @@ fn tier3_limit_cents(signed_qty: i32, force_flat_floor_cents: i32) -> i32 {
     if signed_qty > 0 { floor } else { 100 - floor }
 }
 
+fn alert_hash(alert_id: &str, rule_idx: usize, ticker: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(alert_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(rule_idx.to_string().as_bytes());
+    hasher.update(b"|");
+    hasher.update(ticker.as_bytes());
+    let digest = hasher.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn alert_is_fresh(
+    alert: &NwsAlertPayload,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age_secs: i64,
+) -> bool {
+    if max_age_secs <= 0 {
+        return false;
+    }
+    if let Some(expires) = alert.expires.as_deref().and_then(parse_rfc3339_utc)
+        && expires <= now
+    {
+        return false;
+    }
+    let Some(started_at) = alert
+        .onset
+        .as_deref()
+        .and_then(parse_rfc3339_utc)
+        .or_else(|| alert.effective.as_deref().and_then(parse_rfc3339_utc))
+    else {
+        warn!(alert_id = %alert.id, "latency: alert missing onset/effective; refusing entry");
+        return false;
+    };
+    let age_secs = now.signed_duration_since(started_at).num_seconds();
+    (0..=max_age_secs).contains(&age_secs)
+}
+
+fn parse_rfc3339_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
 #[async_trait]
 impl Strategy for LatencyStrategy {
     fn id(&self) -> StrategyId {
@@ -619,6 +669,7 @@ mod tests {
     }
 
     fn alert_in(event: &str, area: &str, severity: &str, states: &[&str]) -> NwsAlertPayload {
+        let now = chrono::Utc::now();
         NwsAlertPayload {
             id: format!("urn:oid:test-{event}-{area}-{severity}"),
             event_type: event.into(),
@@ -626,9 +677,9 @@ mod tests {
             urgency: "Immediate".into(),
             area_desc: area.into(),
             states: states.iter().map(|s| (*s).to_string()).collect(),
-            effective: None,
-            onset: None,
-            expires: None,
+            effective: Some((now - chrono::Duration::seconds(30)).to_rfc3339()),
+            onset: Some((now - chrono::Duration::seconds(30)).to_rfc3339()),
+            expires: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
             headline: None,
         }
     }
@@ -812,7 +863,43 @@ mod tests {
             force_flat_floor_cents: 1,
             position_refresh_interval: Duration::from_secs(60),
             tick_interval: Duration::from_secs(60),
+            max_alert_age_secs: 10 * 60,
         }
+    }
+
+    #[test]
+    fn stale_alert_does_not_fire() {
+        let mut s = LatencyStrategy::new(vec![rule("Tornado", None, Severity::Moderate)]);
+        let mut a = alert("Tornado Warning", "Travis, TX", "Severe");
+        let old = chrono::Utc::now() - chrono::Duration::seconds(3600);
+        a.onset = Some(old.to_rfc3339());
+        a.effective = Some(old.to_rfc3339());
+        assert!(s.evaluate(&a).is_none());
+    }
+
+    #[test]
+    fn expired_alert_does_not_fire() {
+        let mut s = LatencyStrategy::new(vec![rule("Tornado", None, Severity::Moderate)]);
+        let mut a = alert("Tornado Warning", "Travis, TX", "Severe");
+        a.expires = Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        assert!(s.evaluate(&a).is_none());
+    }
+
+    #[test]
+    fn missing_alert_time_does_not_fire() {
+        let mut s = LatencyStrategy::new(vec![rule("Tornado", None, Severity::Moderate)]);
+        let mut a = alert("Tornado Warning", "Travis, TX", "Severe");
+        a.onset = None;
+        a.effective = None;
+        assert!(s.evaluate(&a).is_none());
+    }
+
+    #[test]
+    fn alert_hash_uses_full_id() {
+        let a = alert_hash("urn:oid:shared-prefix-A", 1, "WX-TX");
+        let b = alert_hash("urn:oid:shared-prefix-B", 1, "WX-TX");
+        assert_ne!(a, b);
+        assert_eq!(a, alert_hash("urn:oid:shared-prefix-A", 1, "WX-TX"));
     }
 
     #[test]

@@ -42,6 +42,7 @@ use predigy_engine_core::events::Event;
 use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe_ticker};
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
+use predigy_engine_core::{ActiveIntent, OpenPosition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -86,6 +87,13 @@ pub struct ImbalanceConfig {
     pub min_take_ask_cents: u8,
     /// Contracts per fire.
     pub size: u32,
+    /// Maximum inventory on one side of one market. Dynamic signal sizing picks
+    /// a target below this ceiling; this is the absolute per-market guardrail.
+    pub max_contracts_per_market: u32,
+    /// Maximum contracts in a single IOC entry/flatten attempt.
+    pub max_size_per_fire: u32,
+    /// Maximum fraction of displayed touch liquidity to consume.
+    pub max_touch_take_fraction: f64,
     /// Per-market cooldown between fires.
     pub cooldown: Duration,
     pub config_refresh_interval: Duration,
@@ -113,6 +121,9 @@ impl ImbalanceConfig {
             max_take_ask_cents: 90,
             min_take_ask_cents: 5,
             size: 1,
+            max_contracts_per_market: 5,
+            max_size_per_fire: 3,
+            max_touch_take_fraction: 0.20,
             cooldown: Duration::from_secs(60),
             config_refresh_interval: Duration::from_secs(30),
         };
@@ -148,6 +159,23 @@ impl ImbalanceConfig {
         {
             c.size = n;
         }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_IMBALANCE_MAX_CONTRACTS_PER_MARKET")
+            && let Ok(n) = v.parse()
+        {
+            c.max_contracts_per_market = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_IMBALANCE_MAX_SIZE_PER_FIRE")
+            && let Ok(n) = v.parse()
+        {
+            c.max_size_per_fire = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_IMBALANCE_MAX_TOUCH_TAKE_FRACTION")
+            && let Ok(n) = v.parse::<f64>()
+            && n > 0.0
+            && n <= 1.0
+        {
+            c.max_touch_take_fraction = n;
+        }
         if let Ok(v) = std::env::var("PREDIGY_BOOK_IMBALANCE_COOLDOWN_MS")
             && let Ok(n) = v.parse::<u64>()
         {
@@ -173,6 +201,41 @@ pub fn config_file_from_env() -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 struct CachedMarket {
     threshold: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TickerInventory {
+    yes_qty: i32,
+    no_qty: i32,
+    active_orders: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ImbalanceInventory {
+    by_ticker: HashMap<String, TickerInventory>,
+}
+
+impl ImbalanceInventory {
+    fn from_rows(positions: Vec<OpenPosition>, active_intents: Vec<ActiveIntent>) -> Self {
+        let mut by_ticker: HashMap<String, TickerInventory> = HashMap::new();
+        for p in positions {
+            let entry = by_ticker.entry(p.ticker).or_default();
+            match p.side.as_str() {
+                "yes" => entry.yes_qty += p.current_qty.max(0),
+                "no" => entry.no_qty += p.current_qty.max(0),
+                _ => {}
+            }
+        }
+        for i in active_intents {
+            let entry = by_ticker.entry(i.ticker).or_default();
+            entry.active_orders += i.qty.max(1);
+        }
+        Self { by_ticker }
+    }
+
+    fn ticker(&self, ticker: &str) -> TickerInventory {
+        self.by_ticker.get(ticker).copied().unwrap_or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -240,6 +303,7 @@ impl ImbalanceStrategy {
         market: &MarketTicker,
         book: &OrderBook,
         now: Instant,
+        inventory: &ImbalanceInventory,
     ) -> Option<Intent> {
         let key = market.as_str().to_string();
         let entry = self.markets.get(&key)?;
@@ -270,6 +334,25 @@ impl ImbalanceStrategy {
         } else {
             (Side::Yes, "Y")
         };
+        let inv = inventory.ticker(&key);
+        if inv.active_orders > 0 {
+            debug!(ticker = %key, active_orders = inv.active_orders, "book-imbalance: active order present; skip");
+            return None;
+        }
+        let (same_qty, opposite_qty, opposite_side, opposite_bid_cents) = match side {
+            Side::Yes => (inv.yes_qty, inv.no_qty, Side::No, no_bid?.0.cents()),
+            Side::No => (inv.no_qty, inv.yes_qty, Side::Yes, yes_bid?.0.cents()),
+        };
+        if opposite_qty > 0 {
+            return self.flatten_opposite(
+                &key,
+                market,
+                opposite_side,
+                opposite_qty,
+                opposite_bid_cents,
+                now,
+            );
+        }
         // ask = 100 - opposite-side bid.
         let opposite_bid_cents = match side {
             Side::Yes => no_bid?.0.cents(),
@@ -306,7 +389,23 @@ impl ImbalanceStrategy {
             );
             return None;
         }
-        let qty = i32::try_from(self.config.size).ok()?;
+        let dynamic_target = self.dynamic_target_contracts(imbalance.abs(), total);
+        let remaining_capacity = i32::try_from(dynamic_target).ok()?.saturating_sub(same_qty);
+        if remaining_capacity <= 0 {
+            debug!(ticker = %key, same_qty, dynamic_target, "book-imbalance: dynamic inventory cap reached");
+            return None;
+        }
+        let touch_qty = match side {
+            Side::Yes => no_bid?.1,
+            Side::No => yes_bid?.1,
+        };
+        let liquidity_qty =
+            ((f64::from(touch_qty) * self.config.max_touch_take_fraction).floor() as i32).max(1);
+        let per_fire = self.config.max_size_per_fire.max(self.config.size).max(1);
+        let qty = remaining_capacity
+            .min(liquidity_qty)
+            .min(i32::try_from(per_fire).ok()?)
+            .max(1);
         let ts_min = chrono::Utc::now().timestamp() as u32 / 60;
         let client_id = format!(
             "book-imbalance:{cid_t}:{side_tag}:{ask:02}:{size:04}:{ts:08x}",
@@ -341,6 +440,58 @@ impl ImbalanceStrategy {
         self.last_fire_at.insert(key, now);
         Some(intent)
     }
+
+    fn dynamic_target_contracts(&self, imbalance_abs: f64, total_touch_qty: u32) -> u32 {
+        let tier = if imbalance_abs >= 0.90 && total_touch_qty >= self.config.min_total_qty * 4 {
+            5
+        } else if imbalance_abs >= 0.80 && total_touch_qty >= self.config.min_total_qty * 2 {
+            3
+        } else {
+            1
+        };
+        tier.min(self.config.max_contracts_per_market.max(1))
+    }
+
+    fn flatten_opposite(
+        &mut self,
+        key: &str,
+        market: &MarketTicker,
+        side: Side,
+        qty_available: i32,
+        bid_cents: u8,
+        now: Instant,
+    ) -> Option<Intent> {
+        if bid_cents == 0 || bid_cents >= 100 {
+            return None;
+        }
+        let qty = qty_available
+            .min(i32::try_from(self.config.max_size_per_fire.max(1)).ok()?)
+            .max(1);
+        let side_tag = match side {
+            Side::Yes => "Y",
+            Side::No => "N",
+        };
+        let ts_min = chrono::Utc::now().timestamp() as u32 / 60;
+        let client_id = format!(
+            "book-imbalance-flat:{cid_t}:{side_tag}:{bid:02}:{qty:04}:{ts:08x}",
+            cid_t = cid_safe_ticker(key),
+            bid = bid_cents,
+            ts = ts_min,
+        );
+        self.last_fire_at.insert(key.to_string(), now);
+        Some(Intent {
+            client_id,
+            strategy: STRATEGY_ID.0,
+            market: market.clone(),
+            side,
+            action: IntentAction::Sell,
+            price_cents: Some(i32::from(bid_cents)),
+            qty,
+            order_type: OrderType::Limit,
+            tif: Tif::Ioc,
+            reason: Some("book-imbalance flatten before reversal".into()),
+        })
+    }
 }
 
 #[async_trait]
@@ -369,7 +520,7 @@ impl Strategy for ImbalanceStrategy {
     async fn on_event(
         &mut self,
         ev: &Event,
-        _state: &mut StrategyState,
+        state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
         let needs_refresh = self
             .last_config_refresh
@@ -380,7 +531,11 @@ impl Strategy for ImbalanceStrategy {
         match ev {
             Event::BookUpdate { market, book } => {
                 let now = Instant::now();
-                if let Some(intent) = self.evaluate(market, book, now) {
+                let inventory = ImbalanceInventory::from_rows(
+                    state.db.open_positions(Some(STRATEGY_ID.0)).await?,
+                    state.db.active_intents(Some(STRATEGY_ID.0)).await?,
+                );
+                if let Some(intent) = self.evaluate(market, book, now, &inventory) {
                     return Ok(vec![intent]);
                 }
                 Ok(Vec::new())
@@ -419,6 +574,9 @@ mod tests {
             max_take_ask_cents: 90,
             min_take_ask_cents: 5,
             size: 1,
+            max_contracts_per_market: 5,
+            max_size_per_fire: 3,
+            max_touch_take_fraction: 0.20,
             cooldown: Duration::from_secs(60),
             config_refresh_interval: Duration::from_secs(30),
         }
@@ -431,6 +589,24 @@ mod tests {
         std::fs::write(path, serde_json::to_string(&body).unwrap()).unwrap();
     }
 
+    fn inventory(
+        ticker: &str,
+        yes_qty: i32,
+        no_qty: i32,
+        active_orders: i32,
+    ) -> ImbalanceInventory {
+        let mut by_ticker = HashMap::new();
+        by_ticker.insert(
+            ticker.to_string(),
+            TickerInventory {
+                yes_qty,
+                no_qty,
+                active_orders,
+            },
+        );
+        ImbalanceInventory { by_ticker }
+    }
+
     #[test]
     fn fades_dominant_yes_bid_stack() {
         let dir = tempfile::tempdir().unwrap();
@@ -441,7 +617,12 @@ mod tests {
         // yes_bid 100 qty, no_bid 5 qty → imbalance = 0.905 > 0.7.
         let book = book_with_stacks(40, 100, 50, 5);
         let intent = s
-            .evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
+            .evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
             .expect("fades the YES bid stack → buy NO");
         assert_eq!(intent.side, Side::No);
         assert_eq!(intent.action, IntentAction::Buy);
@@ -459,7 +640,12 @@ mod tests {
         // no_bid 100 qty, yes_bid 5 qty → imbalance = -0.905.
         let book = book_with_stacks(40, 5, 50, 100);
         let intent = s
-            .evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
+            .evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
             .expect("fades the NO bid stack → buy YES");
         assert_eq!(intent.side, Side::Yes);
         // ask = 100 - no_bid = 50.
@@ -476,8 +662,13 @@ mod tests {
         // Balanced 50/50.
         let book = book_with_stacks(40, 50, 50, 50);
         assert!(
-            s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
-                .is_none()
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
+            .is_none()
         );
     }
 
@@ -491,8 +682,13 @@ mod tests {
         // Tiny stacks: 5 vs 1 → high ratio but tiny total (6 < 50).
         let book = book_with_stacks(40, 5, 50, 1);
         assert!(
-            s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
-                .is_none()
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
+            .is_none()
         );
     }
 
@@ -506,8 +702,13 @@ mod tests {
         let book = book_with_stacks(40, 100, 50, 5);
         // Different ticker.
         assert!(
-            s.evaluate(&MarketTicker::new("KX-OTHER"), &book, Instant::now())
-                .is_none()
+            s.evaluate(
+                &MarketTicker::new("KX-OTHER"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
+            .is_none()
         );
     }
 
@@ -520,8 +721,24 @@ mod tests {
         s.reload_markets();
         let book = book_with_stacks(40, 100, 50, 5);
         let now = Instant::now();
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &book, now).is_some());
-        assert!(s.evaluate(&MarketTicker::new("KX-T"), &book, now).is_none());
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                now,
+                &ImbalanceInventory::default(),
+            )
+            .is_some()
+        );
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                now,
+                &ImbalanceInventory::default(),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -538,8 +755,13 @@ mod tests {
         // 100 - no_bid. With no_bid 5, yes_ask = 95 → above 90.
         let book = book_with_stacks(2, 5, 5, 100);
         assert!(
-            s.evaluate(&MarketTicker::new("KX-T"), &book, Instant::now())
-                .is_none()
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
+            .is_none()
         );
     }
 
@@ -563,15 +785,25 @@ mod tests {
         let book = book_with_stacks(40, 60, 50, 30);
         // EASY threshold 0.4 — 0.333 still below; no fire.
         assert!(
-            s.evaluate(&MarketTicker::new("KX-EASY"), &book, Instant::now())
-                .is_none()
+            s.evaluate(
+                &MarketTicker::new("KX-EASY"),
+                &book,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
+            .is_none()
         );
         // Now imbalance = (80 - 20)/100 = 0.6. Easy at 0.4 fires;
         // strict at 0.95 doesn't.
         let book2 = book_with_stacks(40, 80, 50, 20);
         assert!(
-            s.evaluate(&MarketTicker::new("KX-EASY"), &book2, Instant::now())
-                .is_some()
+            s.evaluate(
+                &MarketTicker::new("KX-EASY"),
+                &book2,
+                Instant::now(),
+                &ImbalanceInventory::default(),
+            )
+            .is_some()
         );
         // Reset cooldown by waiting on STRICT.
         let book3 = book_with_stacks(40, 80, 50, 20);
@@ -579,10 +811,74 @@ mod tests {
             s.evaluate(
                 &MarketTicker::new("KX-STRICT"),
                 &book3,
-                Instant::now() + Duration::from_secs(120)
+                Instant::now() + Duration::from_secs(120),
+                &ImbalanceInventory::default(),
             )
             .is_none(),
             "STRICT 0.95 threshold should reject 0.6 imbalance"
+        );
+    }
+
+    #[test]
+    fn same_side_inventory_can_scale_under_dynamic_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markets.json");
+        write_markets(&path, &["KX-T"]);
+        let mut c = cfg(path);
+        c.cooldown = Duration::from_secs(0);
+        let mut s = ImbalanceStrategy::new(c);
+        s.reload_markets();
+        let book = book_with_stacks(40, 250, 50, 5);
+        let intent = s
+            .evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &inventory("KX-T", 0, 1, 0),
+            )
+            .expect("same-side NO inventory should scale");
+        assert_eq!(intent.side, Side::No);
+        assert_eq!(intent.action, IntentAction::Buy);
+        assert!(intent.qty >= 1);
+    }
+
+    #[test]
+    fn opposite_inventory_flattens_before_reversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markets.json");
+        write_markets(&path, &["KX-T"]);
+        let mut s = ImbalanceStrategy::new(cfg(path));
+        s.reload_markets();
+        let book = book_with_stacks(40, 250, 50, 5);
+        let intent = s
+            .evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &inventory("KX-T", 2, 0, 0),
+            )
+            .expect("opposite YES inventory should be flattened");
+        assert_eq!(intent.side, Side::Yes);
+        assert_eq!(intent.action, IntentAction::Sell);
+        assert_eq!(intent.price_cents, Some(40));
+    }
+
+    #[test]
+    fn active_order_blocks_new_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("markets.json");
+        write_markets(&path, &["KX-T"]);
+        let mut s = ImbalanceStrategy::new(cfg(path));
+        s.reload_markets();
+        let book = book_with_stacks(40, 250, 50, 5);
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-T"),
+                &book,
+                Instant::now(),
+                &inventory("KX-T", 0, 0, 1),
+            )
+            .is_none()
         );
     }
 }
