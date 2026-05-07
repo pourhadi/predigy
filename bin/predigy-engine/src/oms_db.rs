@@ -141,6 +141,18 @@ impl DbBackedOms {
         .await?;
         let strategy_notional_cents = total.and_then(|t| t.0).unwrap_or(0);
 
+        // Phase 6.2 — total open notional across ALL strategies.
+        // Same shape as the strategy-scoped query, no WHERE
+        // clause on strategy.
+        let global_total: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT SUM(ABS(current_qty)::BIGINT * avg_entry_cents::BIGINT)::BIGINT
+               FROM positions
+              WHERE closed_at IS NULL",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let global_notional_cents = global_total.and_then(|t| t.0).unwrap_or(0);
+
         // In-flight orders (any non-terminal status). 'shadow'
         // is a non-venue terminal (engine never sent it); count
         // it out of in-flight so shadow accumulation doesn't
@@ -168,6 +180,7 @@ impl DbBackedOms {
         Ok(ExposureSnapshot {
             current_contracts,
             strategy_notional_cents,
+            global_notional_cents,
             in_flight: i32::try_from(in_flight.0).unwrap_or(i32::MAX),
             daily_realized_pnl_cents: pnl.0.unwrap_or(0),
         })
@@ -213,6 +226,19 @@ impl DbBackedOms {
                 scope: format!("strategy:{}", intent.strategy),
                 current_cents: exposure.strategy_notional_cents,
                 limit_cents: caps.max_notional_cents,
+            });
+        }
+
+        // Phase 6.2 — global notional cap across all strategies.
+        // 0 disables (per-strategy caps still apply); >0 enforces
+        // a hard ceiling on engine-wide exposure.
+        if caps.max_global_notional_cents > 0
+            && exposure.global_notional_cents + added_notional > caps.max_global_notional_cents
+        {
+            return Err(RejectionReason::NotionalExceeded {
+                scope: "global".into(),
+                current_cents: exposure.global_notional_cents,
+                limit_cents: caps.max_global_notional_cents,
             });
         }
 
@@ -450,6 +476,9 @@ impl Oms for DbBackedOms {
 struct ExposureSnapshot {
     current_contracts: i32,
     strategy_notional_cents: i64,
+    /// Phase 6.2 — total open notional across every strategy in
+    /// `positions`. Used for the global-cap check.
+    global_notional_cents: i64,
     in_flight: i32,
     daily_realized_pnl_cents: i64,
 }

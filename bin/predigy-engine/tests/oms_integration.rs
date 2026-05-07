@@ -101,6 +101,10 @@ fn buy_yes(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent 
 fn permissive_caps() -> RiskCaps {
     RiskCaps {
         max_notional_cents: 1_000_000,
+        // 0 disables; existing integration tests don't exercise
+        // the global cap. The dedicated global-cap test below
+        // overrides it explicitly.
+        max_global_notional_cents: 0,
         max_daily_loss_cents: 1_000_000,
         max_contracts_per_side: 1000,
         max_in_flight: 1000,
@@ -635,4 +639,105 @@ async fn duplicate_venue_fill_id_is_idempotent() {
     .unwrap();
     assert_eq!(pos.0, 3, "duplicate fill must not double the position");
     assert_eq!(pos.1, 30);
+}
+
+#[tokio::test]
+async fn global_notional_cap_blocks_cross_strategy_concentration() {
+    // Phase 6.2 — the global notional cap should bind even when
+    // each per-strategy cap individually has headroom. Setup:
+    //   - per-strategy max_notional_cents: 1_000_000 (no bind)
+    //   - global max_global_notional_cents: 200 (binds)
+    //   - "stat" already holds $2 of open notional; engine
+    //     attempts a second $1 trade on a different strategy.
+    //   - Expected: rejected with NotionalExceeded scope='global'.
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-GLOBAL").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let caps = RiskCaps {
+        max_notional_cents: 1_000_000,
+        max_global_notional_cents: 200, // $2 global cap
+        max_daily_loss_cents: 1_000_000,
+        max_contracts_per_side: 1000,
+        max_in_flight: 1000,
+        max_orders_per_window: 1000,
+        rate_window_ms: 1000,
+    };
+    let oms = DbBackedOms::new(pool.clone(), caps, ks);
+
+    // Pre-seed a $2 ($200 cents) open position on a different
+    // strategy via direct DB insert. The OMS reads from
+    // `positions`, which is what the global query sums.
+    sqlx::query(
+        "INSERT INTO positions
+            (strategy, ticker, side, current_qty, avg_entry_cents,
+             fees_paid_cents, opened_at, last_fill_at)
+         VALUES ('settlement', 'KX-INT-GLOBAL', 'yes', 4, 50, 0, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Now stat tries to add $0.30 more (3 × 10¢) — total would
+    // be $2.30 > $2 global cap → reject.
+    let outcome = oms
+        .submit(buy_yes("test:G:0001", "KX-INT-GLOBAL", 3, 10))
+        .await
+        .unwrap();
+    match outcome {
+        SubmitOutcome::Rejected {
+            reason:
+                RejectionReason::NotionalExceeded {
+                    scope,
+                    current_cents,
+                    limit_cents,
+                },
+        } => {
+            assert_eq!(scope, "global");
+            assert_eq!(current_cents, 200);
+            assert_eq!(limit_cents, 200);
+        }
+        other => panic!("expected NotionalExceeded(global); got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn global_notional_cap_disabled_when_zero() {
+    // max_global_notional_cents=0 disables the global gate.
+    // Per-strategy caps still apply.
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-GZ").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let caps = RiskCaps {
+        max_notional_cents: 1_000_000,
+        max_global_notional_cents: 0, // disabled
+        max_daily_loss_cents: 1_000_000,
+        max_contracts_per_side: 1000,
+        max_in_flight: 1000,
+        max_orders_per_window: 1000,
+        rate_window_ms: 1000,
+    };
+    let oms = DbBackedOms::new(pool.clone(), caps, ks);
+
+    // Pre-seed a large position; with the global cap off the
+    // submit should pass.
+    sqlx::query(
+        "INSERT INTO positions
+            (strategy, ticker, side, current_qty, avg_entry_cents,
+             fees_paid_cents, opened_at, last_fill_at)
+         VALUES ('settlement', 'KX-INT-GZ', 'yes', 100, 90, 0, now(), now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = oms
+        .submit(buy_yes("test:GZ:0001", "KX-INT-GZ", 1, 50))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, SubmitOutcome::Submitted { .. }),
+        "global cap disabled should permit; got {outcome:?}"
+    );
 }

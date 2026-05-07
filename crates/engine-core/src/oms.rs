@@ -136,8 +136,22 @@ impl std::fmt::Display for RejectionReason {
 /// caps both checked; the smaller binding limit wins.
 #[derive(Debug, Clone)]
 pub struct RiskCaps {
-    /// Hard ceiling on open-position notional, in cents.
+    /// Hard ceiling on open-position notional **per strategy**,
+    /// in cents.
     pub max_notional_cents: i64,
+    /// **Phase 6.2** — hard ceiling on open-position notional
+    /// **across all strategies**, in cents. Caps the total
+    /// dollar amount the engine has at risk in the venue at any
+    /// moment. The OMS checks both per-strategy and global; the
+    /// smaller binding limit wins.
+    ///
+    /// This is the cross-strategy correlate of `max_notional_cents`.
+    /// Without it a stat trade + a settlement trade could each be
+    /// within their own per-strategy cap but jointly blow past
+    /// what the operator wants the engine to risk in total.
+    ///
+    /// `0` disables the global cap (per-strategy caps still apply).
+    pub max_global_notional_cents: i64,
     /// Realised + unrealised loss for the day before refusing
     /// new entries.
     pub max_daily_loss_cents: i64,
@@ -157,8 +171,12 @@ impl RiskCaps {
     /// Override per-strategy as confidence grows.
     pub fn shake_down() -> Self {
         Self {
-            max_notional_cents: 500,   // $5
-            max_daily_loss_cents: 200, // $2
+            max_notional_cents: 500, // $5/strategy
+            // 4 strategies × $5/strategy = $20/global. The
+            // global cap is intentionally LESS than the sum so
+            // it actually binds; otherwise it'd be a dead knob.
+            max_global_notional_cents: 1500, // $15
+            max_daily_loss_cents: 200,       // $2
             max_contracts_per_side: 3,
             max_in_flight: 10,
             max_orders_per_window: 5,

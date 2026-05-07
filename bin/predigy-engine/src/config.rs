@@ -170,6 +170,11 @@ fn caps_from_env() -> RiskCaps {
     {
         caps.max_notional_cents = v;
     }
+    if let Ok(v) = std::env::var("PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS")
+        .and_then(|s| s.parse::<i64>().map_err(|_| std::env::VarError::NotPresent))
+    {
+        caps.max_global_notional_cents = v;
+    }
     if let Ok(v) = std::env::var("PREDIGY_MAX_DAILY_LOSS_CENTS")
         .and_then(|s| s.parse::<i64>().map_err(|_| std::env::VarError::NotPresent))
     {
