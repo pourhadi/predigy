@@ -188,7 +188,7 @@ impl Strategy for StatStrategy {
                 // refreshed above. No intents from a bare tick.
                 Ok(Vec::new())
             }
-            Event::External(_) => Ok(Vec::new()),
+            Event::External(_) | Event::DiscoveryDelta { .. } => Ok(Vec::new()),
         }
     }
 

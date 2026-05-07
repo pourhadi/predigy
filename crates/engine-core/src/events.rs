@@ -9,6 +9,7 @@
 //! that consume external feeds opt in via the
 //! `Strategy::external_subscriptions` method.
 
+use crate::discovery::DiscoveredMarket;
 use predigy_book::OrderBook;
 use predigy_core::market::MarketTicker;
 
@@ -22,6 +23,19 @@ pub enum Event {
     /// Periodic timer for re-evaluation of held positions.
     /// Cadence is per-strategy (configured at registration).
     Tick,
+    /// The discovery service found new markets that match this
+    /// strategy's [`crate::DiscoverySubscription`], and/or some
+    /// previously-tracked markets fell out of the window.
+    ///
+    /// The engine has already auto-registered the `added` tickers
+    /// with the market-data router — book updates will start
+    /// flowing on the next snapshot. Strategies should update
+    /// their internal per-market state (close_time, etc.) from
+    /// the `added` payload.
+    DiscoveryDelta {
+        added: Vec<DiscoveredMarket>,
+        removed: Vec<MarketTicker>,
+    },
 }
 
 /// Non-Kalshi inputs. Strategies that care subscribe via

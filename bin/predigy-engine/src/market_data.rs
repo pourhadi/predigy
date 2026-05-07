@@ -92,12 +92,33 @@ struct RouterState {
     sid_to_ticker: HashMap<u64, String>,
     /// REST client used for resnapshot after a sequence gap.
     rest: Arc<RestClient>,
+    /// Tickers we've already subscribed to. Lets `AddTickers`
+    /// skip duplicates (issuing a second subscribe for an already-
+    /// subscribed ticker isn't an error but it wastes a req_id).
+    subscribed_tickers: std::collections::HashSet<String>,
+}
+
+/// Command sent over the router's command channel. Used by
+/// background services (e.g. discovery) to dynamically extend
+/// the subscription set after the initial WS subscribe.
+#[derive(Debug)]
+pub enum RouterCommand {
+    /// Subscribe to an additional ticker for a given strategy.
+    /// The router issues a fresh `Channel::OrderbookDelta +
+    /// Channel::Ticker` subscribe for the new ticker and adds
+    /// the (strategy, tx) pair to the subscriber set.
+    AddTickers {
+        strategy: StrategyId,
+        markets: Vec<String>,
+        tx: StrategyEventTx,
+    },
 }
 
 /// Public handle for the router. Owns the spawned task; drop
 /// to abort.
 pub struct MarketDataRouter {
     subs: Arc<RwLock<Subscriptions>>,
+    cmd_tx: mpsc::Sender<RouterCommand>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -130,15 +151,29 @@ impl MarketDataRouter {
         let connection = md_client.connect();
         let subs = Arc::new(RwLock::new(Subscriptions::default()));
 
+        let (cmd_tx, cmd_rx) = mpsc::channel::<RouterCommand>(128);
+
         let router_state = RouterState {
             subs: subs.clone(),
             books: HashMap::new(),
             sid_to_ticker: HashMap::new(),
             rest,
+            subscribed_tickers: std::collections::HashSet::new(),
         };
 
-        let task = tokio::spawn(router_task(connection, router_state));
-        Ok(Self { subs, task })
+        let task = tokio::spawn(router_task(connection, router_state, cmd_rx));
+        Ok(Self {
+            subs,
+            cmd_tx,
+            task,
+        })
+    }
+
+    /// Cloneable handle for issuing dynamic-subscription commands
+    /// to the router from background services (discovery loop, etc.)
+    /// without exposing the full `MarketDataRouter`.
+    pub fn command_tx(&self) -> mpsc::Sender<RouterCommand> {
+        self.cmd_tx.clone()
     }
 
     /// Register a strategy's interest in a set of markets. The
@@ -173,7 +208,11 @@ impl MarketDataRouter {
     }
 }
 
-async fn router_task(mut connection: MdConnection, mut state: RouterState) {
+async fn router_task(
+    mut connection: MdConnection,
+    mut state: RouterState,
+    mut cmd_rx: mpsc::Receiver<RouterCommand>,
+) {
     // Wait until the engine populates subscriptions before issuing
     // the first subscribe. Polling-based: check the subscription
     // registry every 250ms until it's non-empty, then issue the
@@ -202,6 +241,9 @@ async fn router_task(mut connection: MdConnection, mut state: RouterState) {
                     n_tickers = tickers.len(),
                     "router: subscribe submitted"
                 );
+                for t in &tickers {
+                    state.subscribed_tickers.insert(t.clone());
+                }
                 break;
             }
             Err(e) => {
@@ -211,16 +253,90 @@ async fn router_task(mut connection: MdConnection, mut state: RouterState) {
         }
     }
 
-    // Main event loop — handle Kalshi events.
+    // Main event loop — multiplex Kalshi events with router
+    // commands (dynamic subscribe requests from discovery).
     loop {
-        let Some(ev) = connection.next_event().await else {
-            warn!("router: kalshi-md connection closed");
-            return;
-        };
-        if let Err(e) = handle_event(ev, &mut state).await {
-            warn!(error = %e, "router: event-handling error");
+        tokio::select! {
+            ev = connection.next_event() => {
+                let Some(ev) = ev else {
+                    warn!("router: kalshi-md connection closed");
+                    return;
+                };
+                if let Err(e) = handle_event(ev, &mut state).await {
+                    warn!(error = %e, "router: event-handling error");
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                let Some(cmd) = cmd else {
+                    info!("router: command channel closed; exiting");
+                    return;
+                };
+                if let Err(e) = handle_command(cmd, &mut state, &mut connection).await {
+                    warn!(error = %e, "router: command-handling error");
+                }
+            }
         }
     }
+}
+
+async fn handle_command(
+    cmd: RouterCommand,
+    state: &mut RouterState,
+    connection: &mut MdConnection,
+) -> anyhow::Result<()> {
+    match cmd {
+        RouterCommand::AddTickers {
+            strategy,
+            markets,
+            tx,
+        } => {
+            // Update the subscriber registry first so book updates
+            // for these tickers are routed to the strategy as
+            // soon as the venue starts pushing them.
+            {
+                let mut s = state.subs.write().await;
+                for m in &markets {
+                    s.add(m, strategy, tx.clone());
+                }
+            }
+            // Filter to the tickers we haven't subscribed to yet
+            // — repeated subscribes are harmless but cluttery in
+            // the WS log.
+            let new: Vec<String> = markets
+                .into_iter()
+                .filter(|m| state.subscribed_tickers.insert(m.clone()))
+                .collect();
+            if new.is_empty() {
+                return Ok(());
+            }
+            match connection
+                .subscribe(&[Channel::OrderbookDelta, Channel::Ticker], &new)
+                .await
+            {
+                Ok(req_id) => {
+                    info!(
+                        req_id,
+                        n_new_tickers = new.len(),
+                        strategy = strategy.0,
+                        "router: dynamic subscribe submitted"
+                    );
+                }
+                Err(e) => {
+                    // Roll back the subscribed_tickers entries
+                    // so a retry has a clean shot.
+                    for m in &new {
+                        state.subscribed_tickers.remove(m);
+                    }
+                    warn!(
+                        strategy = strategy.0,
+                        error = %e,
+                        "router: dynamic subscribe failed"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_event(ev: MdEvent, state: &mut RouterState) -> anyhow::Result<()> {

@@ -6,6 +6,7 @@
 //! state. The engine serialises calls per strategy — strategies
 //! don't need to think about concurrency within their own logic.
 
+use crate::discovery::DiscoverySubscription;
 use crate::events::{Event, ExternalEvent};
 use crate::intent::Intent;
 use crate::state::StrategyState;
@@ -33,6 +34,16 @@ pub trait Strategy: Send + Sync {
     /// feeds (`"nws_alerts"`, `"nbm_cycles"`, `"polymarket"`) to
     /// subscribe to.
     fn external_subscriptions(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    /// Discovery subscriptions — see [`crate::DiscoverySubscription`]
+    /// for the lifecycle. Each unique config the strategy returns
+    /// causes the engine to spawn a periodic Kalshi-REST poll +
+    /// auto-register newly-found tickers with the market-data
+    /// router. Default empty: most strategies hold a static
+    /// subscription set.
+    fn discovery_subscriptions(&self) -> Vec<DiscoverySubscription> {
         Vec::new()
     }
 

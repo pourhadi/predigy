@@ -21,6 +21,7 @@
 //! every strategy.
 
 pub mod db;
+pub mod discovery;
 pub mod error;
 pub mod events;
 pub mod intent;
@@ -30,6 +31,7 @@ pub mod state;
 pub mod strategy;
 
 pub use db::{Db, DailyPnl, LatestModelP, OpenPosition, RuleRow};
+pub use discovery::{DiscoveredMarket, DiscoverySubscription};
 pub use error::{EngineError, EngineResult};
 pub use events::{Event, ExternalEvent};
 pub use intent::{Intent, IntentAction, OrderType, Tif};
