@@ -28,6 +28,23 @@ pub struct RestartPolicy {
     /// emits a `EngineError::Strategy` for the engine to surface.
     pub flap_threshold: u32,
     pub flap_window: Duration,
+    /// **Audit I6 — initial-snapshot grace period.** When the
+    /// engine first connects to Kalshi WS, the router emits
+    /// initial-book-state snapshots for every subscribed market
+    /// in a tight burst. Strategies treat each as a fresh
+    /// `BookUpdate` and, with no priors, fire on every market at
+    /// once — bounded by the in-flight cap but noisy.
+    ///
+    /// This grace window suppresses `Event::BookUpdate` delivery
+    /// to the strategy for the first `boot_grace` of its
+    /// lifecycle. Other event variants (Tick, External,
+    /// DiscoveryDelta, PairUpdate, CrossStrategy) pass through
+    /// — they're not part of the snapshot burst and they're
+    /// often needed to populate caches before book updates start
+    /// firing entries.
+    ///
+    /// `Duration::ZERO` disables.
+    pub boot_grace: Duration,
 }
 
 impl Default for RestartPolicy {
@@ -37,6 +54,10 @@ impl Default for RestartPolicy {
             backoff_max: Duration::from_secs(60),
             flap_threshold: 5,
             flap_window: Duration::from_secs(120),
+            // I6: 5s grace. Long enough for the snapshot burst
+            // to land + caches to populate; short enough that
+            // we don't miss real book deltas in a quiet hour.
+            boot_grace: Duration::from_secs(5),
         }
     }
 }
@@ -114,7 +135,22 @@ async fn supervisor_loop(
         // bug, not a runtime hiccup.
         let mut strategy = factory();
 
-        let outcome = run_one_lifecycle(&mut *strategy, &oms, &mut state, &mut event_rx).await;
+        // I6: grace window starts at lifecycle boot. After a
+        // restart, the supervisor re-arms grace from now —
+        // restart is functionally equivalent to fresh boot from
+        // the strategy's perspective.
+        let boot_at = std::time::Instant::now();
+
+        let outcome = run_one_lifecycle(
+            &mut *strategy,
+            &oms,
+            &mut state,
+            &mut event_rx,
+            boot_at,
+            policy.boot_grace,
+            id,
+        )
+        .await;
         match outcome {
             LoopOutcome::Shutdown => {
                 info!(strategy = ?id, "supervisor: event channel closed; exiting");
@@ -155,8 +191,30 @@ async fn run_one_lifecycle(
     oms: &Arc<dyn Oms>,
     state: &mut StrategyState,
     event_rx: &mut mpsc::Receiver<Event>,
+    boot_at: std::time::Instant,
+    boot_grace: Duration,
+    id: StrategyId,
 ) -> LoopOutcome {
+    let mut grace_logged_done = boot_grace.is_zero();
     while let Some(ev) = event_rx.recv().await {
+        // I6: drop BookUpdate events during the grace window so
+        // the strategy doesn't fire on the initial-snapshot
+        // burst. Other event kinds pass through — Tick (cache
+        // refresh), DiscoveryDelta / PairUpdate (subscription
+        // setup), External / CrossStrategy (information feeds).
+        let in_grace = boot_at.elapsed() < boot_grace;
+        if in_grace && matches!(ev, Event::BookUpdate { .. }) {
+            continue;
+        }
+        if !grace_logged_done && !in_grace {
+            info!(
+                strategy = ?id,
+                grace_secs = boot_grace.as_secs(),
+                "supervisor: boot grace ended; book updates active"
+            );
+            grace_logged_done = true;
+        }
+
         match strategy.on_event(&ev, state).await {
             Ok(intents) => {
                 for intent in intents {
