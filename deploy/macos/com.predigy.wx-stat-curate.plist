@@ -3,31 +3,34 @@
 <plist version="1.0">
 <dict>
     <!-- Forecast-driven curator for Kalshi temperature markets.
-         Pulls the NWS hourly point forecast for each market's airport
-         and emits a StatRule when the forecast clears the threshold
-         by the conviction-zone margin (default 5°F).
+         **Phase 2 NBM probabilistic path is on by default.** Pulls
+         NBM 21-quantile model data from NOAA's S3 bucket, samples
+         at each airport's grid cell, interpolates the CDF at the
+         Kalshi-side threshold to get a real calibrated probability,
+         and emits a StatRule per market.
 
-         DISABLED BY DEFAULT — Phase 1 is inspection-only.  The
-         output file (~/.config/predigy/wx-stat-rules.json) is NOT
-         consumed by the running stat-trader; the operator reviews
-         the rules and decides whether to merge them in by hand
-         (or to wait for Phase 2 NBM probabilistic + calibration).
+         Output file (~/.config/predigy/wx-stat-rules.json) is NOT
+         yet consumed by the running stat-trader — the operator
+         reviews + manually copies promoted rules into
+         stat-rules.json. The deliberate two-file split keeps
+         LLM-curated stat rules and forecast-derived wx-stat rules
+         from racing.
 
-         Cadence: every 3h.  NWS hourly forecasts refresh on ~6h
-         intervals (the GFS / NBM model cycles), so 3h captures
-         each refresh shortly after it lands without thrashing.
-         Daily temperature markets settle on the daily high/low at
-         a specific airport — small intra-day forecast updates
-         can flip a marginal market across the conviction threshold.
+         Cadence: every 3h. NBM qmd publishes only at 00/06/12/18
+         UTC (4 cycles/day), but with the 13h lookback the curator
+         lands in a fully-published cycle every tick. The 3h cron
+         schedule means every cycle gets re-run twice as fresh
+         observations / Kalshi quotes come in.
 
          Pre-flight: the script refuses to start if NWS_USER_AGENT
-         isn't set in ~/.zprofile (NWS rejects anonymous traffic).
+         isn't set in ~/.zprofile (NOAA's bucket doesn't gate on
+         it but it's polite + best practice).
     -->
     <key>Label</key>
     <string>com.predigy.wx-stat-curate</string>
 
     <key>Disabled</key>
-    <true/>
+    <false/>
 
     <key>ProgramArguments</key>
     <array>

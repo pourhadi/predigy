@@ -27,7 +27,7 @@
     <string>com.predigy.stat-trader</string>
 
     <key>Disabled</key>
-    <true/>
+    <false/>
 
     <key>ProgramArguments</key>
     <array>

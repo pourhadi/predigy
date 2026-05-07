@@ -229,25 +229,22 @@ considered, model_p, side, and yes_ask side-by-side. One example
 candidate: `KXLOWTOKC-26MAY07-T43` (>43F low) — NWS forecast 53F low
 → model_p=0.97, market yes_ask=50¢. Real ~47¢ pre-fee apparent edge.
 
-**Deploy scaffolding shipped (Disabled=true), not yet enabled:**
+**Deploy: live with Phase 2 NBM as of 2026-05-07.**
 
 - `deploy/scripts/wx-stat-curate.sh` — wrapper. Writes to
   `~/.config/predigy/wx-stat-rules.json` (separate from
   stat-rules.json — the wx-stat output is intentionally
-  quarantined for review in Phase 1).
+  quarantined for review). Phase 2 NBM is the default;
+  set `PREDIGY_WX_STAT_PHASE=1` in `~/.zprofile` to revert to
+  Phase 1.
 - `deploy/macos/com.predigy.wx-stat-curate.plist` — every 3h:
-  00/03/06/09/12/15/18/21 local. **Disabled=true by default.**
-- `deploy/scripts/install-launchd.sh` updated to add the new job.
-- Smoke-tested 2026-05-06: wrapper produces 20 valid rules in
-  `~/.config/predigy/wx-stat-rules.json`.
-
-**To enable Phase 1 inspection-only runs:**
-1. Build: `cargo build --release -p wx-stat-curator`
-2. Edit `deploy/macos/com.predigy.wx-stat-curate.plist` →
-   `<key>Disabled</key><false/>`
-3. Re-run `deploy/scripts/install-launchd.sh`
-4. Watch the rule file refresh every 3h:
-   `tail -f ~/Library/Logs/predigy/wx-stat-curate.stderr.log`
+  00/03/06/09/12/15/18/21 local. **Disabled=false; running.**
+- Cold first run takes ~10-15 min (decoding 21 quantile fields ×
+  ~40 forecast hours through openjpeg/proj). Cache-hit re-runs
+  are <10 seconds.
+- Per-rule prediction records persist to
+  `data/wx_stat_predictions/<UTC-date>.jsonl` for the calibration
+  fitter (`wx-stat-fit-calibration`) to consume later.
 
 **To promote rules to live trading:** wx-stat-rules.json is NOT
 yet read by stat-trader. To put weight on these rules, copy the
