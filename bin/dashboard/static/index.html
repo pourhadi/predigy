@@ -431,9 +431,14 @@ function renderExits(rows) {
     }
     const tbody = rows.map(e => {
         const px = e.price_cents != null ? `${e.price_cents}¢` : '—';
+        // Color: green = profitable / favourable exit;
+        // red = forced / loss-side; neutral for everything else.
         const kindClass =
               e.kind === 'tp'   ? 'num-pos'
+            : e.kind === 'conv' ? 'num-pos'
             : e.kind === 'sl'   ? 'num-neg'
+            : e.kind === 'inv'  ? 'num-neg'
+            : e.kind === 'bd'   ? 'num-neg'
             : '';
         return `
           <tr>

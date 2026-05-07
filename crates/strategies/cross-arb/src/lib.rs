@@ -89,6 +89,19 @@ pub struct CrossArbConfig {
     pub stop_loss_cents: i32,
     /// How often to refresh the open-position cache from Postgres.
     pub position_refresh_interval: Duration,
+    /// **Audit A2 — convergence-aware exit**:
+    /// the strategy's actual thesis is "poly_mid converges to
+    /// kalshi_mark". When the spread shrinks below this many
+    /// cents, the convergence has happened and we can take
+    /// profit even if raw PnL hasn't yet hit `take_profit_cents`.
+    /// `0` disables.
+    pub convergence_exit_spread_cents: i32,
+    /// **Audit A2 — thesis-broken exit**:
+    /// if the poly mid moves contrary to entry such that the
+    /// inverse-spread (poly < kalshi_mark) exceeds this many
+    /// cents, the convergence thesis has flipped — exit before
+    /// further drift. `0` disables.
+    pub thesis_inversion_exit_cents: i32,
 }
 
 impl Default for CrossArbConfig {
@@ -104,6 +117,14 @@ impl Default for CrossArbConfig {
             take_profit_cents: 5,
             stop_loss_cents: 4,
             position_refresh_interval: Duration::from_secs(60),
+            // A2: convergence at 1¢ — when poly and kalshi
+            // marks are within 1¢, the original spread has
+            // closed and there's no more edge to harvest.
+            convergence_exit_spread_cents: 1,
+            // A2: thesis-broken at 3¢ inversion. If poly drops
+            // 3¢ BELOW where Kalshi sits (vs poly being above
+            // at entry), the convergence story is dead — exit.
+            thesis_inversion_exit_cents: 3,
         }
     }
 }
@@ -344,7 +365,53 @@ impl CrossArbStrategy {
             let take =
                 self.config.take_profit_cents > 0 && pnl_per >= self.config.take_profit_cents;
             let stop = self.config.stop_loss_cents > 0 && pnl_per <= -self.config.stop_loss_cents;
-            if !(take || stop) {
+
+            // A2 — convergence-aware exit. Look up the poly mid
+            // for the asset paired to this Kalshi market. The
+            // strategy's actual thesis is "poly_mid converges
+            // to kalshi_mark" — so when the spread shrinks
+            // below `convergence_exit_spread_cents`, the
+            // convergence has happened and we can lock the
+            // gain even if raw PnL hasn't hit `take_profit_cents`.
+            // Symmetric: if the spread INVERTS by more than
+            // `thesis_inversion_exit_cents` (poly drops well
+            // below kalshi_mark vs poly being above at entry),
+            // the convergence story has flipped — exit.
+            //
+            // Compare against the position-side mid. For a long
+            // YES, we paired against poly's YES mid; for a long
+            // NO, we paired against poly_no_mid = 100 -
+            // poly_yes_mid.
+            let mut converged = false;
+            let mut inverted = false;
+            if let Some(asset_id) = self.market_map.get(market)
+                && let Some(poly_ref) = self.poly_ref.get(asset_id)
+                && let Some(poly_yes_mid) = poly_ref.mid()
+                && (0.01..=0.99).contains(&poly_yes_mid)
+            {
+                let poly_yes_cents = (poly_yes_mid * 100.0).round().clamp(1.0, 99.0) as i32;
+                let position_side_poly_cents = match pos.side {
+                    Side::Yes => poly_yes_cents,
+                    Side::No => 100i32 - poly_yes_cents,
+                };
+                // Spread = poly_mid - kalshi_mark. Positive at
+                // entry (poly says it's worth more than kalshi
+                // is asking). Convergence = spread shrinks to
+                // ~0. Inversion = spread goes negative.
+                let spread = position_side_poly_cents - mark_cents;
+                if self.config.convergence_exit_spread_cents > 0
+                    && spread.abs() <= self.config.convergence_exit_spread_cents
+                {
+                    converged = true;
+                }
+                if self.config.thesis_inversion_exit_cents > 0
+                    && spread <= -self.config.thesis_inversion_exit_cents
+                {
+                    inverted = true;
+                }
+            }
+
+            if !(take || stop || converged || inverted) {
                 continue;
             }
 
@@ -359,7 +426,19 @@ impl CrossArbStrategy {
                 Side::Yes => "Y",
                 Side::No => "N",
             };
-            let reason_tag = if take { "tp" } else { "sl" };
+            // Trigger priority: stop-loss (capital first) >
+            // thesis-inverted (story is dead) > convergence
+            // (lock the win) > take-profit. Distinct reason
+            // tags for forensic + dashboard classification.
+            let reason_tag = if stop {
+                "sl"
+            } else if inverted {
+                "inv"
+            } else if converged {
+                "conv"
+            } else {
+                "tp"
+            };
             // No minute-bucket on the exit cid (cross-arb fires
             // sub-second); use the Kalshi limit + qty as the
             // discriminator instead so repeated triggers at the
@@ -609,6 +688,12 @@ mod tests {
             take_profit_cents: 5,
             stop_loss_cents: 4,
             position_refresh_interval: Duration::from_secs(60),
+            // A2 disabled by default in tests; tests that
+            // exercise convergence/inversion set them
+            // explicitly. Existing TP/SL tests keep their
+            // shape.
+            convergence_exit_spread_cents: 0,
+            thesis_inversion_exit_cents: 0,
         }
     }
 
@@ -699,6 +784,8 @@ mod tests {
             take_profit_cents: 5,
             stop_loss_cents: 4,
             position_refresh_interval: Duration::from_secs(60),
+            convergence_exit_spread_cents: 0,
+            thesis_inversion_exit_cents: 0,
         });
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
@@ -719,6 +806,8 @@ mod tests {
             take_profit_cents: 5,
             stop_loss_cents: 4,
             position_refresh_interval: Duration::from_secs(60),
+            convergence_exit_spread_cents: 0,
+            thesis_inversion_exit_cents: 0,
         });
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
@@ -882,5 +971,134 @@ mod tests {
         let market = MarketTicker::new("KX-EXIT-G");
         let book = book(&[(56, 100)], &[(40, 100)]);
         assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
+    }
+
+    // ─── A2 convergence-aware exit tests ─────────────────────
+
+    #[test]
+    fn exit_convergence_when_spread_collapses() {
+        // Long YES at 50¢. Mark = 53¢ (PnL +3, inside TP=5).
+        // Poly mid = 0.54 → 54¢. Spread = 54-53 = 1¢ ≤
+        // convergence_exit_spread_cents(1) → exit:conv.
+        let mut c = cfg();
+        c.convergence_exit_spread_cents = 1;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-CONV-A");
+        s.add_pair(market.clone(), "0xa".into());
+        s.update_poly("0xa", Some(0.53), Some(0.55));
+        s.positions.insert(
+            position_key("KX-CONV-A", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(53, 100)], &[(40, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("convergence fires");
+        assert!(intent.client_id.contains(":conv:"));
+        assert_eq!(intent.action, IntentAction::Sell);
+    }
+
+    #[test]
+    fn no_convergence_when_spread_still_wide() {
+        let mut c = cfg();
+        c.convergence_exit_spread_cents = 1;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-CONV-B");
+        s.add_pair(market.clone(), "0xb".into());
+        // Poly mid 65¢, mark 53¢ → spread 12¢ — still wide.
+        s.update_poly("0xb", Some(0.64), Some(0.66));
+        s.positions.insert(
+            position_key("KX-CONV-B", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(53, 100)], &[(40, 100)]);
+        assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn exit_thesis_inversion_when_poly_below_kalshi() {
+        // Long YES at 50¢. Mark = 52¢ (PnL +2). Poly mid drops
+        // to 47¢. Spread = 47 - 52 = -5 ≤ -inversion(3) →
+        // exit:inv.
+        let mut c = cfg();
+        c.thesis_inversion_exit_cents = 3;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-INV-A");
+        s.add_pair(market.clone(), "0xc".into());
+        s.update_poly("0xc", Some(0.46), Some(0.48));
+        s.positions.insert(
+            position_key("KX-INV-A", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(52, 100)], &[(40, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("thesis-inversion fires");
+        assert!(intent.client_id.contains(":inv:"));
+    }
+
+    #[test]
+    fn no_inversion_when_poly_still_above_kalshi() {
+        let mut c = cfg();
+        c.thesis_inversion_exit_cents = 3;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-INV-B");
+        s.add_pair(market.clone(), "0xd".into());
+        // Poly 55¢ vs mark 52¢ → spread +3, no inversion.
+        s.update_poly("0xd", Some(0.54), Some(0.56));
+        s.positions.insert(
+            position_key("KX-INV-B", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(52, 100)], &[(40, 100)]);
+        assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn convergence_no_side_uses_complement_poly_mid() {
+        // Long NO at 30¢. Mark (no_bid) = 33¢. Poly yes_mid =
+        // 0.66 → poly_no_mid = 100-66 = 34¢. Spread = 34 - 33
+        // = 1¢ → convergence.
+        let mut c = cfg();
+        c.convergence_exit_spread_cents = 1;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-CONV-NO");
+        s.add_pair(market.clone(), "0xe".into());
+        s.update_poly("0xe", Some(0.65), Some(0.67));
+        s.positions.insert(
+            position_key("KX-CONV-NO", Side::No),
+            cached_position(Side::No, 3, 30),
+        );
+        let book = book(&[(60, 100)], &[(33, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("NO convergence fires");
+        assert!(intent.client_id.contains(":N:conv:"));
+    }
+
+    #[test]
+    fn stop_loss_priority_over_convergence_and_inversion() {
+        // Stop-loss + convergence both trip; sl wins.
+        let mut c = cfg();
+        c.convergence_exit_spread_cents = 1;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-PRIO");
+        s.add_pair(market.clone(), "0xf".into());
+        // Mark 45 vs entry 50 → PnL -5, hits SL=4.
+        // Spread also tight: poly 46 vs mark 45 → 1¢.
+        s.update_poly("0xf", Some(0.45), Some(0.47));
+        s.positions.insert(
+            position_key("KX-PRIO", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book(&[(45, 100)], &[(54, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book, Instant::now())
+            .expect("exit fires");
+        assert!(
+            intent.client_id.contains(":sl:"),
+            "sl should win priority; got {}",
+            intent.client_id
+        );
     }
 }

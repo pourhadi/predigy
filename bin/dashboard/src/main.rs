@@ -891,17 +891,28 @@ async fn db_recent_exits(pool: &sqlx::PgPool) -> Result<Vec<ExitRow>, sqlx::Erro
 
 /// Map an exit-cid to its kind for UI grouping. Pattern is
 /// `<strategy>-{exit|flat}:{ticker}:{side}:{tag}:...`.
+/// Tags:
+///   tp   — take-profit
+///   sl   — stop-loss
+///   bd   — belief-drift (stat: rule's model_p moved through us)
+///   conv — convergence (cross-arb: poly mid caught up to kalshi)
+///   inv  — thesis inversion (cross-arb: poly moved below kalshi)
+///   flat — time-based force-flat (latency)
 fn classify_exit_kind(cid: &str) -> String {
     if cid.contains("-flat:") {
         return "flat".to_string();
     }
     if cid.contains("-exit:") {
-        // Look for ":tp:" or ":sl:" component.
-        if cid.contains(":tp:") {
-            return "tp".to_string();
-        }
-        if cid.contains(":sl:") {
-            return "sl".to_string();
+        for (needle, tag) in [
+            (":tp:", "tp"),
+            (":sl:", "sl"),
+            (":bd:", "bd"),
+            (":conv:", "conv"),
+            (":inv:", "inv"),
+        ] {
+            if cid.contains(needle) {
+                return tag.to_string();
+            }
         }
     }
     "unknown".to_string()
@@ -1032,5 +1043,19 @@ mod tests {
         // Entry cids should not be classified as exits.
         assert_eq!(classify_exit_kind("stat:KX-A:50:0001:00abcdef"), "unknown");
         assert_eq!(classify_exit_kind("anything-else"), "unknown");
+    }
+
+    #[test]
+    fn classify_exit_kind_recognises_phase_a_tags() {
+        // A1 belief-drift, A2 convergence + inversion.
+        assert_eq!(classify_exit_kind("stat-exit:KX-A:Y:bd:00abcdef"), "bd");
+        assert_eq!(
+            classify_exit_kind("cross-arb-exit:KX-B:Y:conv:53:0004"),
+            "conv"
+        );
+        assert_eq!(
+            classify_exit_kind("cross-arb-exit:KX-C:Y:inv:52:0004"),
+            "inv"
+        );
     }
 }
