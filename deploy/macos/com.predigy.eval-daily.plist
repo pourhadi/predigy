@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Daily strategy evaluation report.
+
+         Runs `predigy-eval report` once a night at 23:55 local
+         time, writing the markdown output to
+         ~/Library/Logs/predigy/eval/YYYY-MM-DD.md and a
+         persistent latest.md alias the dashboard / operator can
+         tail. Exit code is non-zero when any strategy carries a
+         critical diagnosis — the operator's log-watcher can route
+         that to push notifications.
+
+         Window: 24h. Tune via the script's --since flag if a
+         daily horizon is too noisy (e.g. for sparse-fire
+         strategies, weekly is more honest).
+
+         The report is also produced on operator demand via
+         `predigy-eval report --since 7d --out /tmp/weekly.md` —
+         this launchd job is just the always-on cadence.
+    -->
+    <key>Label</key>
+    <string>com.predigy.eval-daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/eval-daily.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>23</integer>
+        <key>Minute</key>
+        <integer>55</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/eval-daily.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/eval-daily.stderr.log</string>
+</dict>
+</plist>

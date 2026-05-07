@@ -17,6 +17,14 @@ pub struct Db {
 }
 
 impl Db {
+    /// Wrap an existing pool. Used by callers that already manage
+    /// their own pool lifecycle (e.g. the dashboard, which connects
+    /// once at startup with custom acquisition options).
+    #[must_use]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     /// Connect using the canonical predigy connection string. With
     /// peer auth on the local UNIX socket the URL is
     /// `postgresql:///predigy` (no host, no user, no password —

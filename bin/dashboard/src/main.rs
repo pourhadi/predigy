@@ -33,8 +33,8 @@
 use anyhow::{Context as _, Result, anyhow};
 use axum::{
     Router,
-    extract::State,
-    http::header,
+    extract::{Path, Query, State},
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Json},
     routing::{get, post},
 };
@@ -42,6 +42,7 @@ use clap::Parser;
 use predigy_kalshi_rest::types::MarketPosition;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -373,6 +374,13 @@ async fn main() -> Result<()> {
         .route("/api/state", get(serve_state))
         .route("/api/kill", post(serve_kill))
         .route("/healthz", get(|| async { "ok" }))
+        // Audit: strategy evaluation framework JSON endpoints. The
+        // dashboard's static `/eval/` page (eval.html) calls these
+        // for the strategy table + per-strategy drill-down.
+        .route("/eval", get(serve_eval_html))
+        .route("/eval/summary.json", get(serve_eval_summary))
+        .route("/eval/ledger/{strategy}", get(serve_eval_ledger))
+        .route("/eval/diagnose/{strategy}", get(serve_eval_diagnose))
         .with_state(state);
 
     let listener = TcpListener::bind(&args.bind)
@@ -1142,6 +1150,104 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+// ─── Strategy evaluation framework JSON endpoints ────────────────
+
+const EVAL_HTML: &str = include_str!("../static/eval.html");
+
+async fn serve_eval_html() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(EVAL_HTML),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalQuery {
+    /// `1h | 24h | 7d | 30d | all`. Defaults to `24h`.
+    #[serde(default)]
+    since: Option<String>,
+}
+
+fn parse_window(q: Option<&str>) -> Result<predigy_eval_lib::TimeWindow, String> {
+    let s = q.unwrap_or("24h");
+    predigy_eval_lib::TimeWindow::parse(s)
+}
+
+async fn serve_eval_summary(
+    State(state): State<AppState>,
+    Query(q): Query<EvalQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no DB pool".into()))?;
+    let win = parse_window(q.since.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let db = predigy_engine_core::Db::from_pool(pool.clone());
+    let trades = predigy_eval_lib::load_trades(&db, win, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_trades: {e}")))?;
+    let activity = predigy_eval_lib::ledger::load_intent_activity(&db, win, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_intent_activity: {e}")))?;
+    let metrics = predigy_eval_lib::compute_metrics(&trades, &activity, win.start, win.end);
+    let mut diagnoses: HashMap<String, Vec<predigy_eval_lib::Diagnosis>> = HashMap::new();
+    for (s, m) in &metrics {
+        diagnoses.insert(s.clone(), predigy_eval_lib::diagnose(m, &trades));
+    }
+    Ok(Json(serde_json::json!({
+        "metrics": metrics,
+        "diagnoses": diagnoses,
+        "window": { "start": win.start, "end": win.end },
+    })))
+}
+
+async fn serve_eval_ledger(
+    State(state): State<AppState>,
+    Path(strategy): Path<String>,
+    Query(q): Query<EvalQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no DB pool".into()))?;
+    let win = parse_window(q.since.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let db = predigy_engine_core::Db::from_pool(pool.clone());
+    let trades = predigy_eval_lib::load_trades(&db, win, Some(&strategy))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_trades: {e}")))?;
+    Ok(Json(serde_json::json!({ "trades": trades })))
+}
+
+async fn serve_eval_diagnose(
+    State(state): State<AppState>,
+    Path(strategy): Path<String>,
+    Query(q): Query<EvalQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = state
+        .db
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no DB pool".into()))?;
+    let win = parse_window(q.since.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let db = predigy_engine_core::Db::from_pool(pool.clone());
+    let trades = predigy_eval_lib::load_trades(&db, win, Some(&strategy))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_trades: {e}")))?;
+    let activity = predigy_eval_lib::ledger::load_intent_activity(&db, win, Some(&strategy))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("load_intent_activity: {e}")))?;
+    let metrics = predigy_eval_lib::compute_metrics(&trades, &activity, win.start, win.end);
+    let m = metrics.get(&strategy);
+    let diags = m.map(|m| predigy_eval_lib::diagnose(m, &trades)).unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "strategy": strategy,
+        "metrics": m,
+        "diagnoses": diags,
+    })))
 }
 
 #[cfg(test)]

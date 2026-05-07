@@ -24,6 +24,8 @@ members = [
     "crates/strategies/book-imbalance",
     "crates/strategies/variance-fade",
     "crates/strategies/news-trader",
+    "crates/eval",
+    "bin/predigy-eval",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -143,6 +145,7 @@ predigy-strategy-implication-arb = { path = "crates/strategies/implication-arb" 
 predigy-strategy-book-imbalance = { path = "crates/strategies/book-imbalance" }
 predigy-strategy-variance-fade = { path = "crates/strategies/variance-fade" }
 predigy-strategy-news-trader = { path = "crates/strategies/news-trader" }
+predigy-eval-lib = { path = "crates/eval" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
 stat-trader = { path = "bin/stat-trader" }

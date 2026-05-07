@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>predigy eval</title>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117; color: #c9d1d9; margin: 0; padding: 16px; }
+    h1, h2 { color: #58a6ff; }
+    a { color: #58a6ff; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 16px; }
+    th, td { padding: 6px 10px; border-bottom: 1px solid #30363d; text-align: left; font-size: 13px; }
+    th { background: #161b22; position: sticky; top: 0; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tr.health-critical { background: #3a0c0c; }
+    tr.health-warn { background: #3a2a0c; }
+    tr.health-ok { }
+    .pos { color: #3fb950; }
+    .neg { color: #f85149; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-right: 4px; }
+    .pill-critical { background: #f85149; color: white; }
+    .pill-warn { background: #d29922; color: black; }
+    .pill-info { background: #30363d; color: #c9d1d9; }
+    .controls { margin-bottom: 12px; }
+    .controls select { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; }
+    .clickable { cursor: pointer; }
+    .clickable:hover { background: #1f2933; }
+    #drilldown { background: #161b22; padding: 12px; border-radius: 4px; margin-top: 16px; display: none; }
+    .diag { padding: 8px; margin: 4px 0; border-left: 3px solid #30363d; }
+    .diag-critical { border-color: #f85149; }
+    .diag-warn { border-color: #d29922; }
+    .diag-info { border-color: #58a6ff; }
+    .recom { margin-left: 16px; color: #8b949e; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>strategy evaluation</h1>
+  <div class="controls">
+    window:
+    <select id="window">
+      <option value="1h">1h</option>
+      <option value="24h" selected>24h</option>
+      <option value="7d">7d</option>
+      <option value="30d">30d</option>
+      <option value="all">all</option>
+    </select>
+    <span id="status"></span>
+    &middot; <a href="/">main dashboard</a>
+  </div>
+
+  <table id="strategies">
+    <thead>
+      <tr>
+        <th>strategy</th>
+        <th class="num">closed</th>
+        <th class="num">open</th>
+        <th class="num">win%</th>
+        <th class="num">net pnl</th>
+        <th class="num">gross</th>
+        <th class="num">fees</th>
+        <th class="num">E[t]</th>
+        <th class="num">sharpe</th>
+        <th class="num">submits</th>
+        <th class="num">fills</th>
+        <th>diagnoses</th>
+      </tr>
+    </thead>
+    <tbody id="strategies-body"></tbody>
+  </table>
+
+  <div id="drilldown">
+    <h2 id="dd-strategy"></h2>
+    <div id="dd-diagnoses"></div>
+    <h3>ledger (last 50 trades)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>ticker</th>
+          <th>side</th>
+          <th class="num">qty</th>
+          <th class="num">entry</th>
+          <th class="num">exit</th>
+          <th class="num">net pnl</th>
+          <th class="num">fees</th>
+          <th class="num">hold</th>
+          <th>exit reason</th>
+          <th>opened at</th>
+        </tr>
+      </thead>
+      <tbody id="dd-ledger"></tbody>
+    </table>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+async function refresh() {
+  const win = $("window").value;
+  $("status").textContent = "loading…";
+  try {
+    const res = await fetch(`/eval/summary.json?since=${win}`);
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    renderTable(data);
+    $("status").textContent = `loaded ${Object.keys(data.metrics).length} strategies`;
+  } catch (e) {
+    $("status").textContent = `error: ${e.message}`;
+  }
+}
+
+function renderTable(data) {
+  const tbody = $("strategies-body");
+  tbody.innerHTML = "";
+  const strategies = Object.keys(data.metrics).sort();
+  for (const s of strategies) {
+    const m = data.metrics[s];
+    const ds = data.diagnoses[s] || [];
+    const critical = ds.filter(d => d.severity === "Critical").length;
+    const warn = ds.filter(d => d.severity === "Warn").length;
+    const info = ds.filter(d => d.severity === "Info").length;
+    const healthClass = critical > 0 ? "health-critical"
+                       : warn > 0 ? "health-warn"
+                       : "health-ok";
+    const pills = [];
+    if (critical) pills.push(`<span class="pill pill-critical">${critical} critical</span>`);
+    if (warn) pills.push(`<span class="pill pill-warn">${warn} warn</span>`);
+    if (info) pills.push(`<span class="pill pill-info">${info} info</span>`);
+    const tr = document.createElement("tr");
+    tr.className = `${healthClass} clickable`;
+    const npnl = m.net_pnl_cents;
+    const npnlClass = npnl > 0 ? "pos" : npnl < 0 ? "neg" : "";
+    tr.innerHTML = `
+      <td><b>${s}</b></td>
+      <td class="num">${m.n_trades_closed}</td>
+      <td class="num">${m.n_trades_open}</td>
+      <td class="num">${(m.win_rate * 100).toFixed(1)}%</td>
+      <td class="num ${npnlClass}">${npnl >= 0 ? "+" : ""}${npnl}c</td>
+      <td class="num">${m.gross_pnl_cents >= 0 ? "+" : ""}${m.gross_pnl_cents}c</td>
+      <td class="num">${m.fees_paid_cents}c</td>
+      <td class="num">${m.expectancy_cents.toFixed(1)}c</td>
+      <td class="num">${m.sharpe_ratio.toFixed(2)}</td>
+      <td class="num">${m.n_intents_submitted}</td>
+      <td class="num">${m.n_intents_filled}</td>
+      <td>${pills.join("")}</td>
+    `;
+    tr.addEventListener("click", () => drilldown(s));
+    tbody.appendChild(tr);
+  }
+}
+
+async function drilldown(strategy) {
+  const win = $("window").value;
+  const dd = $("drilldown");
+  dd.style.display = "block";
+  $("dd-strategy").textContent = strategy;
+
+  const [diagRes, ledgerRes] = await Promise.all([
+    fetch(`/eval/diagnose/${strategy}?since=${win}`),
+    fetch(`/eval/ledger/${strategy}?since=${win}`),
+  ]);
+  const diagData = await diagRes.json();
+  const ledgerData = await ledgerRes.json();
+
+  const ddDiag = $("dd-diagnoses");
+  ddDiag.innerHTML = "";
+  if (diagData.diagnoses.length === 0) {
+    ddDiag.innerHTML = "<i>no diagnoses fired</i>";
+  } else {
+    for (const d of diagData.diagnoses) {
+      const sev = (d.severity || "").toLowerCase();
+      const div = document.createElement("div");
+      div.className = `diag diag-${sev}`;
+      const recoms = (d.recommendations || []).map(r => {
+        return `<div class="recom">→ ${formatAction(r.action)} <i>(${r.confidence} confidence)</i><br>&nbsp;&nbsp;${r.rationale}</div>`;
+      }).join("");
+      div.innerHTML = `
+        <b>[${d.severity}]</b> ${d.code || ""}<br>
+        ${escapeHtml(d.message)}
+        ${recoms}
+      `;
+      ddDiag.appendChild(div);
+    }
+  }
+
+  const tbody = $("dd-ledger");
+  tbody.innerHTML = "";
+  for (const t of (ledgerData.trades || []).slice(0, 50)) {
+    const tr = document.createElement("tr");
+    const net = t.realized_pnl_cents - t.fees_paid_cents;
+    const exit = t.avg_exit_cents != null ? `${t.avg_exit_cents}c` : "—";
+    const netDisplay = t.closed_at ? `${net >= 0 ? "+" : ""}${net}c` : "open";
+    const npnlClass = !t.closed_at ? "" : net > 0 ? "pos" : net < 0 ? "neg" : "";
+    tr.innerHTML = `
+      <td>${escapeHtml(t.ticker)}</td>
+      <td>${t.side}</td>
+      <td class="num">${t.qty_open}</td>
+      <td class="num">${t.avg_entry_cents}c</td>
+      <td class="num">${exit}</td>
+      <td class="num ${npnlClass}">${netDisplay}</td>
+      <td class="num">${t.fees_paid_cents}c</td>
+      <td class="num">${t.hold_seconds != null ? t.hold_seconds + "s" : "—"}</td>
+      <td>${t.exit_reason || "—"}</td>
+      <td>${t.opened_at}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function formatAction(a) {
+  // a is the serde-tagged enum; clap-style presentation.
+  if (typeof a === "string") return a;
+  const key = Object.keys(a)[0];
+  const v = a[key];
+  switch (key) {
+    case "RaiseMinEdge": return `Raise min_edge ${v.current} → ${v.proposed}`;
+    case "LowerMinEdge": return `Lower min_edge ${v.current} → ${v.proposed}`;
+    case "TightenStopLoss": return `Tighten stop_loss ${v.current} → ${v.proposed}`;
+    case "WidenStopLoss": return `Widen stop_loss ${v.current} → ${v.proposed}`;
+    case "AddTrailingStop": return `Add trailing stop trigger=${v.trigger}, dist=${v.distance}`;
+    case "LowerThreshold": return `Lower ${v.which}: ${v.current} → ${v.proposed}`;
+    case "RaiseThreshold": return `Raise ${v.which}: ${v.current} → ${v.proposed}`;
+    case "RaiseRiskCap": return `Raise ${v.which}: ${v.current} → ${v.proposed}`;
+    case "DisableStrategy": return `Disable strategy: ${v.reason}`;
+    case "EnableStrategy": return `Enable strategy: ${v.reason}`;
+    case "Investigate": return `Investigate: ${v.what}`;
+    default: return key;
+  }
+}
+
+function escapeHtml(s) {
+  return (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+$("window").addEventListener("change", refresh);
+refresh();
+setInterval(refresh, 60_000);
+</script>
+</body>
+</html>
