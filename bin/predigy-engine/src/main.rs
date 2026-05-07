@@ -396,12 +396,12 @@ async fn register_strategies(registry: &StrategyRegistry) {
 
     registry
         .register(StrategyHandle::new(STAT_ID, || {
-            Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>
+            Box::new(StatStrategy::new(StatConfig::from_env())) as Box<dyn Strategy>
         }))
         .await;
     registry
         .register(StrategyHandle::new(SETTLEMENT_ID, || {
-            Box::new(SettlementStrategy::new(SettlementConfig::default())) as Box<dyn Strategy>
+            Box::new(SettlementStrategy::new(SettlementConfig::from_env())) as Box<dyn Strategy>
         }))
         .await;
     // Latency only registers if a rules file is configured —
@@ -423,7 +423,7 @@ async fn register_strategies(registry: &StrategyRegistry) {
     if pair_file_from_env().is_some() {
         registry
             .register(StrategyHandle::new(CROSS_ARB_ID, || {
-                Box::new(CrossArbStrategy::new(CrossArbConfig::default())) as Box<dyn Strategy>
+                Box::new(CrossArbStrategy::new(CrossArbConfig::from_env())) as Box<dyn Strategy>
             }))
             .await;
     }
@@ -439,17 +439,19 @@ fn strategy_factory(
     use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
     if id == STAT_ID {
-        Box::new(|| Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>)
+        Box::new(|| Box::new(StatStrategy::new(StatConfig::from_env())) as Box<dyn Strategy>)
     } else if id == SETTLEMENT_ID {
         Box::new(|| {
-            Box::new(SettlementStrategy::new(SettlementConfig::default())) as Box<dyn Strategy>
+            Box::new(SettlementStrategy::new(SettlementConfig::from_env())) as Box<dyn Strategy>
         })
     } else if id == LATENCY_ID {
         let path = latency_rules_path()
             .expect("LATENCY_ID registered without a rule-file path; engine startup invariant");
         Box::new(move || build_latency_strategy(&path))
     } else if id == CROSS_ARB_ID {
-        Box::new(|| Box::new(CrossArbStrategy::new(CrossArbConfig::default())) as Box<dyn Strategy>)
+        Box::new(|| {
+            Box::new(CrossArbStrategy::new(CrossArbConfig::from_env())) as Box<dyn Strategy>
+        })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
     }
@@ -478,7 +480,10 @@ fn build_latency_strategy(path: &std::path::Path) -> Box<dyn Strategy> {
                 error = %e,
                 "latency: rule file unreadable; running with empty rule set"
             );
-            Box::new(LatencyStrategy::new(Vec::new())) as Box<dyn Strategy>
+            Box::new(LatencyStrategy::with_config(
+                predigy_strategy_latency::LatencyConfig::from_env(),
+                Vec::new(),
+            )) as Box<dyn Strategy>
         }
     }
 }

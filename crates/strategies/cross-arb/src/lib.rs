@@ -110,6 +110,69 @@ pub struct CrossArbConfig {
     pub trailing_distance_cents: i32,
 }
 
+impl CrossArbConfig {
+    /// Audit B2 + B3 — env-var overrides:
+    /// - `PREDIGY_CROSS_ARB_MIN_EDGE_CENTS` (u32)
+    /// - `PREDIGY_CROSS_ARB_MAX_SIZE` (u32)
+    /// - `PREDIGY_CROSS_ARB_COOLDOWN_MS` (u64)
+    /// - `PREDIGY_CROSS_ARB_TAKE_PROFIT_CENTS` (i32)
+    /// - `PREDIGY_CROSS_ARB_STOP_LOSS_CENTS` (i32)
+    /// - `PREDIGY_CROSS_ARB_CONVERGENCE_EXIT_SPREAD_CENTS` (i32) — A2
+    /// - `PREDIGY_CROSS_ARB_THESIS_INVERSION_EXIT_CENTS` (i32) — A2
+    /// - `PREDIGY_CROSS_ARB_TRAILING_TRIGGER_CENTS` (i32) — A3
+    /// - `PREDIGY_CROSS_ARB_TRAILING_DISTANCE_CENTS` (i32) — A3
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_MIN_EDGE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.min_edge_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_MAX_SIZE") {
+            if let Ok(n) = v.parse() {
+                c.max_size = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_COOLDOWN_MS") {
+            if let Ok(n) = v.parse::<u64>() {
+                c.cooldown = Duration::from_millis(n);
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_TAKE_PROFIT_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.take_profit_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_STOP_LOSS_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.stop_loss_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_CONVERGENCE_EXIT_SPREAD_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.convergence_exit_spread_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_THESIS_INVERSION_EXIT_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.thesis_inversion_exit_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_TRAILING_TRIGGER_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.trailing_trigger_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_CROSS_ARB_TRAILING_DISTANCE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.trailing_distance_cents = n;
+            }
+        }
+        c
+    }
+}
+
 impl Default for CrossArbConfig {
     fn default() -> Self {
         Self {

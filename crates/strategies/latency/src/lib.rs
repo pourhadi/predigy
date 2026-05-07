@@ -136,6 +136,33 @@ pub struct LatencyConfig {
     pub tick_interval: Duration,
 }
 
+impl LatencyConfig {
+    /// Audit B2 + B3 — env-var overrides:
+    /// - `PREDIGY_LATENCY_MAX_HOLD_SECS` (i64)
+    /// - `PREDIGY_LATENCY_FORCE_FLAT_FLOOR_CENTS` (i32)
+    /// - `PREDIGY_LATENCY_TICK_INTERVAL_MS` (u64)
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        if let Ok(v) = std::env::var("PREDIGY_LATENCY_MAX_HOLD_SECS") {
+            if let Ok(n) = v.parse() {
+                c.max_hold_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_LATENCY_FORCE_FLAT_FLOOR_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.force_flat_floor_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_LATENCY_TICK_INTERVAL_MS") {
+            if let Ok(n) = v.parse::<u64>() {
+                c.tick_interval = Duration::from_millis(n);
+            }
+        }
+        c
+    }
+}
+
 impl Default for LatencyConfig {
     fn default() -> Self {
         Self {
@@ -194,11 +221,14 @@ impl LatencyStrategy {
     }
 
     /// Load rules from a JSON file containing a top-level array.
+    /// Strategy-level config is taken from the environment via
+    /// `LatencyConfig::from_env()`; rule-level config is in the
+    /// JSON file (per-rule market, side, action, severity, etc.).
     pub fn from_json_file(path: &Path) -> Result<Self, std::io::Error> {
         let bytes = std::fs::read(path)?;
         let rules: Vec<LatencyRule> = serde_json::from_slice(&bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(Self::new(rules))
+        Ok(Self::with_config(LatencyConfig::from_env(), rules))
     }
 
     pub fn rule_count(&self) -> usize {

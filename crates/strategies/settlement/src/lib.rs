@@ -110,6 +110,57 @@ pub struct SettlementConfig {
     pub position_refresh_interval: Duration,
 }
 
+impl SettlementConfig {
+    /// Audit B2 + B3 — env-var overrides:
+    /// - `PREDIGY_SETTLEMENT_SIZE` (u32)
+    /// - `PREDIGY_SETTLEMENT_COOLDOWN_MS` (u64)
+    /// - `PREDIGY_SETTLEMENT_MIN_PRICE_CENTS` (u8)
+    /// - `PREDIGY_SETTLEMENT_MAX_PRICE_CENTS` (u8)
+    /// - `PREDIGY_SETTLEMENT_BID_TO_ASK_RATIO` (u32)
+    /// - `PREDIGY_SETTLEMENT_PROFIT_LOCK_THRESHOLD_CENTS` (i32) — A6
+    /// - `PREDIGY_SETTLEMENT_PROFIT_LOCK_MIN_SECS_TO_CLOSE` (i64) — A6
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_SIZE") {
+            if let Ok(n) = v.parse() {
+                c.size = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_COOLDOWN_MS") {
+            if let Ok(n) = v.parse::<u64>() {
+                c.cooldown = Duration::from_millis(n);
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_MIN_PRICE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.min_price_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_MAX_PRICE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.max_price_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_BID_TO_ASK_RATIO") {
+            if let Ok(n) = v.parse() {
+                c.bid_to_ask_ratio = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_PROFIT_LOCK_THRESHOLD_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.profit_lock_threshold_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_PROFIT_LOCK_MIN_SECS_TO_CLOSE") {
+            if let Ok(n) = v.parse() {
+                c.profit_lock_min_secs_to_close = n;
+            }
+        }
+        c
+    }
+}
+
 impl Default for SettlementConfig {
     fn default() -> Self {
         Self {

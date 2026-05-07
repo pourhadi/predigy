@@ -85,6 +85,79 @@ pub struct StatConfig {
     pub trailing_distance_cents: i32,
 }
 
+impl StatConfig {
+    /// **Audit B2 + B3 — env-var overrides.** Read operator
+    /// tunables from the environment, falling back to
+    /// `Default::default()` for unset vars.
+    ///
+    /// Recognised vars (all parse as the obvious type):
+    /// - `PREDIGY_STAT_BANKROLL_CENTS` (u64)
+    /// - `PREDIGY_STAT_KELLY_FACTOR` (f64) — B2: half-Kelly is 0.5
+    /// - `PREDIGY_STAT_MAX_SIZE` (u32)
+    /// - `PREDIGY_STAT_COOLDOWN_MS` (u64) — B3: per-strategy cooldown
+    /// - `PREDIGY_STAT_TAKE_PROFIT_CENTS` (i32)
+    /// - `PREDIGY_STAT_STOP_LOSS_CENTS` (i32)
+    /// - `PREDIGY_STAT_MIN_RESIDUAL_EDGE_CENTS` (i32) — A1
+    /// - `PREDIGY_STAT_TP_DECAY_PER_HOUR_CENTS` (i32) — A4
+    /// - `PREDIGY_STAT_TRAILING_TRIGGER_CENTS` (i32) — A3
+    /// - `PREDIGY_STAT_TRAILING_DISTANCE_CENTS` (i32) — A3
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut c = Self::default();
+        if let Ok(v) = std::env::var("PREDIGY_STAT_BANKROLL_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.bankroll_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_KELLY_FACTOR") {
+            if let Ok(n) = v.parse() {
+                c.kelly_factor = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_MAX_SIZE") {
+            if let Ok(n) = v.parse() {
+                c.max_size = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_COOLDOWN_MS") {
+            if let Ok(n) = v.parse::<u64>() {
+                c.cooldown = Duration::from_millis(n);
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_TAKE_PROFIT_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.take_profit_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_STOP_LOSS_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.stop_loss_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_MIN_RESIDUAL_EDGE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.min_residual_edge_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_TP_DECAY_PER_HOUR_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.tp_decay_per_hour_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_TRAILING_TRIGGER_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.trailing_trigger_cents = n;
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_TRAILING_DISTANCE_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.trailing_distance_cents = n;
+            }
+        }
+        c
+    }
+}
+
 impl Default for StatConfig {
     fn default() -> Self {
         Self {
