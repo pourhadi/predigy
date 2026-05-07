@@ -1,128 +1,121 @@
 # predigy
 
-Automated trading system for Kalshi prediction markets. Greenfield Rust
-build aiming at every available edge — cross-venue arb, intra-venue static
-arb, statistical / model alpha, news-data latency, and (later) market
-making with rebate capture.
+Automated trading system for Kalshi prediction markets. Single-binary
+Rust engine, four strategies running concurrently, Postgres-backed
+state, mobile dashboard.
 
-## Status
+## Status (2026-05-07)
 
-**Live in production.** The weather strategy (`bin/latency-trader`)
-runs 24/7 under macOS launchd, submitting real orders against
-Kalshi capped at $5 account-wide. A daily Claude-powered curator
-(`bin/wx-curator`) refreshes its rules at 06:30; a mobile-friendly
-dashboard (`bin/dashboard`) on port 8080 surfaces cash, positions,
-fires, and daemon health.
+**LIVE.** The consolidated `predigy-engine` binary executed its
+production cutover at 07:45 UTC today. Four strategies run inside it:
+`stat`, `settlement`, `latency`, `cross-arb`. The four legacy
+per-strategy daemons (`stat-trader`, `settlement-trader`,
+`latency-trader`, `cross-arb-trader`) have been booted out of launchd.
 
-| Phase | Description | Status |
-|---|---|---|
-| 0 | Workspace + `core` types + Kalshi fee formula | ✅ |
-| 1 | Read-only stack (REST + WS + book + recorder) | ✅ live-shaken |
-| 2 | OMS + risk + REST exec + persistent state | ✅ live-shaken (FIX flavour deferred to MM) |
-| 3 | Backtester / sim | ✅ logic; queue-model integration pending |
-| 4 | Market making (≥$25k) | ⬜ deferred |
-| 5 | Cross-venue signal arb | ✅ logic (`bin/cross-arb-trader`); live shake-down pending |
-| 6 | News/data latency | ✅ **live in production** (`latency-trader` + `wx-curator` + Claude rule curation) |
-| 7 | Statistical / model alpha | ✅ logic (`bin/stat-trader`); no live rules curated yet |
-| 8 | Hardening & scaling | 🟡 macOS launchd deploy + dashboard done; Linux/systemd + VPS pending |
+| Component | Status |
+|---|---|
+| `predigy-engine` (consolidated trader) | **live** in `EngineMode::Live` |
+| Per-strategy curators (`wx-curate`, `stat-curate`, `cross-arb-curate`, `wx-stat-curate`) | live (cron) |
+| `predigy-import` (legacy JSON → Postgres mirror) | live (cron) |
+| `predigy-dashboard` (port 8080) | live |
+| Phase 4b — FIX as primary order path | blocked on Kalshi institutional access (email pending) |
 
-Capital: **$50** funded today (target: $5k). Infra: laptop today,
-us-east-1 VPS planned for the latency push.
+Capital cap: $5/strategy · $15 global · $2/day-loss · ~$50 funded.
+Kill-switch flag at `~/.config/predigy/kill-switch.flag` arms both
+the engine and dashboard.
 
-**For new operators or new Claude Code sessions:** start with
-[`docs/SESSIONS.md`](./docs/SESSIONS.md) — orientation on what's
-running, where the money is, and what to touch carefully.
+Architectural overview: [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+For new operators or new Claude Code sessions: start with
+[`docs/SESSIONS.md`](./docs/SESSIONS.md).
 
-## Documentation
-
-- **[`docs/SESSIONS.md`](./docs/SESSIONS.md)** — handoff orientation
-  for any new Claude Code session: what's deployed, what's running,
-  where the money is, what's next. Read first.
-- **[`docs/RUNBOOK.md`](./docs/RUNBOOK.md)** — operational procedures:
-  health checks, common interventions, debugging recipes, kill switch.
-- **[`docs/STATUS.md`](./docs/STATUS.md)** — living snapshot of what's
-  implemented, test counts, confirmed API contracts, file tree.
-- **[`docs/PLAN.md`](./docs/PLAN.md)** — full architectural / strategy /
-  infrastructure plan. Source of truth for design decisions.
-- **[`deploy/README.md`](./deploy/README.md)** — install + ops layout
-  for the macOS launchd deployment.
-
-## Layout
+## Repo layout
 
 ```
 crates/
-  core/         Price (cents 1..=99), Qty, Side, Action, Intent, Order,
-                Fill, Position, fees
-  book/         L2 order book: snapshot/delta apply, sequence-gap detection
-  kalshi-rest/  RSA-PSS auth + REST client (markets, orderbook, positions)
-  kalshi-md/    Kalshi WS: orderbook/ticker/trade decode, auto-reconnect
-                with sub replay, integration tests against a loopback server
-  poly-md/      Polymarket WS reference: book/price_change/last_trade_price/
-                tick_size_change decode, no auth, batched-frame handling
-  risk/         Pre-trade limits + breakers (per-market position/notional,
-                account gross notional, daily-loss breaker, order-rate
-                window, kill switch). Synchronous; first breach wins.
-  oms/          Order management state machine. Single tokio task owns
-                AccountState + per-order ledger; routes Intent through
-                risk; allocates deterministic cids; submits via Executor
-                trait; consumes ExecutionReports and updates VWAP +
-                realised P&L. Kill switch + reconcile.
-  kalshi-exec/  REST flavour of the OMS Executor over Kalshi V2.
-                Maps Yes/No intents to bid/ask-at-complement, posts
-                /portfolio/events/orders, deletes for cancels, polls
-                /portfolio/fills into PartiallyFilled/Filled reports.
-  sim/          Backtester runtime. BookStore + IOC SimExecutor
-                (Executor impl that matches against the touch and
-                consumes liquidity via synthetic deltas) + Replay
-                (md-recorder NDJSON → BookStore → strategy callback).
-                Strategies run unchanged in sim and live.
+  core/                 Price (cents 1..=99), Side, Action, fee formula
+  book/                 L2 order book: snapshot/delta apply, gap detection
+  kalshi-rest/          RSA-PSS auth + REST client (V2 endpoints, 429 retry)
+  kalshi-md/            Kalshi WS: orderbook + authed fill / market_positions
+  poly-md/              Polymarket WS reference (read-only)
+  ext-feeds/            NWS active alerts feed (used by latency strategy)
+  signals/              Kelly fraction + edge math
+  engine-core/          Strategy trait + Event/Intent types + cross-strategy bus
+                        contracts. Every strategy crate depends on this.
+  strategies/
+    stat/               Statistical-probability — model_p vs ask, after-fee Kelly sizing
+    settlement/         Sports settlement-time tape-reading; discovery-driven
+    latency/            NWS-alert lift on weather markets; rule-file driven
+    cross-arb/          Polymarket-vs-Kalshi stat-arb on paired tokens
+  oms/                  Legacy in-process OMS (used by retired daemons; superseded by engine)
+  kalshi-exec/          Legacy REST executor (superseded by engine's venue_rest)
+  kalshi-fix/           FIX 4.4 implementation (Phase 4b — blocked on Kalshi access)
+  sim/                  Backtester runtime
 bin/
-  md-recorder/  Long-running NDJSON recorder. Subscribes to a configured
-                market list, writes one event per line, on Gap fetches a
-                fresh REST snapshot via predigy-kalshi-rest and emits a
-                synthetic RestResync line so replay reconstructs identical
-                book state.
-  arb-trader/   First live strategy: static intra-venue arb. When
-                yes_ask + no_ask < $1 minus taker fees, lifts both legs
-                via IOC orders. Per-market cooldown + size-cap-at-touch;
-                full risk-engine + OMS path; --dry-run for shake-downs.
+  predigy-engine/       Consolidated trader. OMS, risk, market-data router,
+                        REST submitter, WS exec-data consumer, discovery service,
+                        external-feeds dispatcher, pair-file service,
+                        cross-strategy bus, supervisor.
+  predigy-import/       Mirrors legacy oms-state-*.json into Postgres.
+                        Compat layer for the migration window.
+  predigy-dashboard/    HTTP/HTML mobile dashboard. DB-derived state
+                        with JSON fallback. Engine positions + recent exits
+                        live since Phase 6.
+  cross-arb-curator/    Anthropic-driven Kalshi×Polymarket pair finder.
+  stat-curator/         Anthropic-driven model_p curator for stat strategy.
+  wx-curator/           NWS-state-aware weather rule curator (latency strategy).
+  wx-stat-curator/      NBM-quantile probabilistic weather rule fitter (stat strategy).
+  md-recorder/          NDJSON recorder (replay archive).
+  arb-trader/, sim-runner/  Tooling.
+
+  # Retired / disabled (legacy daemons, kept around as fallback for one cycle):
+  latency-trader/, settlement-trader/, stat-trader/, cross-arb-trader/
 ```
 
-Crates that will be added in subsequent phases: `ext-feeds`,
-`strategy`, `signals`, `sim`, `store`, `ops`, plus binaries
-`mm-trader`, `latency-trader`, `stat-trader`, and a FIX flavour of
-`kalshi-exec`.
-
-## Build
+## Build + test
 
 ```bash
 cargo build --workspace
-cargo test  --workspace
+cargo test  --workspace          # ~340 tests; integration tests need predigy_test DB
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+
+cargo build --release -p predigy-engine
 ```
 
-Live read-only smoke test (needs a network with public CA roots):
+CI is GitHub Actions: `fmt --check` + `clippy -D warnings` +
+`cargo test --workspace --locked` against a Postgres 16 service
+container. See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
 
-```bash
-cargo run -p predigy-kalshi-rest --example smoke
-```
+## Documentation
 
-## CI
+- **[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)** — engine
+  refactor design (Phases 0–7), database schema rationale, crate
+  graph, OMS contract, supervisor model.
+- **[`docs/SESSIONS.md`](./docs/SESSIONS.md)** — operational
+  handoff snapshot. What's deployed, what's running, what's next.
+  Read first for any new session.
+- **[`docs/RUNBOOK.md`](./docs/RUNBOOK.md)** — operational
+  procedures. Health checks, kill-switch, debugging, redeploy.
+- **[`docs/STATUS.md`](./docs/STATUS.md)** — living phase-status.
+- **[`docs/CUTOVER.md`](./docs/CUTOVER.md)** — playbook for the
+  shadow → live cutover; relevant historically + as a rollback
+  reference.
+- **[`docs/DATABASE.md`](./docs/DATABASE.md)** — Postgres setup,
+  schema, peer-auth convention.
+- **[`docs/AUDIT.md`](./docs/AUDIT.md)** — system audit (2026-05-07):
+  profit-take, scale-up paths, strategy arsenal expansion.
+- **[`docs/KALSHI_FIX_REQUEST.md`](./docs/KALSHI_FIX_REQUEST.md)** —
+  draft email for FIX gateway access (Phase 4b).
+- **[`docs/PLAN.md`](./docs/PLAN.md)** — original architectural
+  plan (largely superseded by ARCHITECTURE.md).
 
-GitHub Actions runs `fmt --check`, `clippy -D warnings`, and
-`test --locked` on every push to `main` / `claude/**` and every PR against
-`main`. Workflow lives at [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
-
-## Confirmed Kalshi fee schedule (Feb 2026)
+## Confirmed Kalshi fee schedule
 
 ```
 taker = ceil(0.07   * C * P * (1-P))   // dollars; ceil to nearest cent
 maker = ceil(0.0175 * C * P * (1-P))   // 75% cheaper
 ```
 
-Implemented in [`crates/core/src/fees.rs`](./crates/core/src/fees.rs).
-At p=$0.50 the round-trip taker fee is ~7%, maker round-trip ~1.75% — the
-gating constraint on every strategy threshold. See
-[`docs/PLAN.md`](./docs/PLAN.md#confirmed-kalshi-fee-schedule-feb-2026)
-for the full table and EV implications.
+In [`crates/core/src/fees.rs`](./crates/core/src/fees.rs). At p=$0.50
+the round-trip taker fee is ~7%, maker round-trip ~1.75% — the gating
+constraint on every strategy threshold.

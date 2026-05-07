@@ -7,66 +7,72 @@ before doing real work.
 ## Read first, in order
 
 1. **[`docs/SESSIONS.md`](./docs/SESSIONS.md)** — what's deployed,
-   what's running, where the money is, what's next. The most
-   important doc; updated end-of-session.
-2. **[`docs/RUNBOOK.md`](./docs/RUNBOOK.md)** — health checks,
-   common interventions, debugging recipes, kill switch.
-3. **[`docs/STATUS.md`](./docs/STATUS.md)** — phase-by-phase build
-   status, file tree, test counts, API contracts.
-4. **[`docs/PLAN.md`](./docs/PLAN.md)** — full architectural plan
-   (long; reference only when designing).
+   what's running, where the money is, what's next.
+2. **[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md)** — engine
+   refactor design (Phases 0–7); the load-bearing system doc.
+3. **[`docs/RUNBOOK.md`](./docs/RUNBOOK.md)** — health checks,
+   kill switch, debugging recipes.
+4. **[`docs/AUDIT.md`](./docs/AUDIT.md)** — current strategy /
+   scale-up / arsenal-expansion analysis. Use when planning.
 
-## Current operational reality (snapshot)
+## Current operational reality (2026-05-07)
 
-- **macOS laptop deployment** via launchd. Three jobs live: trader,
-  daily curator (06:30), dashboard (port 8080).
-- **Weather strategy is LIVE** with real submission, $5 account cap.
-- Kalshi balance ~$49.85 funded. Account is the user's; treat as
-  production.
-- Persistent state in `~/.config/predigy/`. Logs in
-  `~/Library/Logs/predigy/`.
+**Live in production via consolidated `predigy-engine` binary.**
 
-Verify what's actually running with:
+- Engine cutover happened 07:45 UTC today. Four strategy modules
+  run in one process: `stat`, `settlement`, `latency`, `cross-arb`.
+- Legacy per-strategy daemons (`*-trader`) booted out of launchd.
+- Engine in `EngineMode::Live` — submits real orders to Kalshi V2
+  REST.
+- Kalshi WS: one connection for orderbook deltas, one separate for
+  authed `fill` + `market_positions` channels.
+- Postgres `predigy` is the source of truth for intents, fills,
+  positions, rules, kill switches.
+- Kill-switch flag at `~/.config/predigy/kill-switch.flag` —
+  non-empty contents arms; truncated disarms. Both engine and
+  dashboard observe it.
+- Capital cap: $5/strategy, $15 global, $2 daily-loss; ~$50 funded.
+
+Curators stay external by design (cron-driven Anthropic agents):
+`wx-curate`, `stat-curate`, `cross-arb-curate`, `wx-stat-curate`,
+plus `predigy-import` (legacy state-file mirror).
+
+Verify what's actually running:
 
 ```sh
-for n in com.predigy.{latency-trader,wx-curate,dashboard}; do
-    state=$(launchctl print "gui/$(id -u)/$n" 2>/dev/null \
-        | grep -E '^\s*state\s*=' | head -1 | awk -F= '{print $2}' | xargs)
-    echo "$n: ${state:-NOT LOADED}"
-done
+launchctl list 2>/dev/null | grep predigy
+psql -d predigy -c "SELECT status, COUNT(*) FROM intents GROUP BY status;"
+tail -n 50 ~/Library/Logs/predigy/engine.stderr.log
 ```
 
 ## Working norms in this repo
 
-From the user's profile + memory:
-
-- **Single rolling branch per chunk, single PR.** Don't slice work
-  into multiple PRs unnecessarily — user is the only reviewer.
 - **No fallbacks, no temporary workarounds, no "simplifying" things
-  to bypass a problem.** Find the root cause and fix it. (See the
-  user's global `~/.claude/CLAUDE.md`.)
+  to bypass a problem.** Find the root cause and fix it. (See
+  `~/.claude/CLAUDE.md`.)
+- **Single rolling branch per chunk, single PR.** User is the only
+  reviewer.
 - **Always commit at end of each round of code updates** with a
   detailed message explaining what + why.
-- **Build for production, not demos.** "Don't ever create dummy
-  code; always do the full implementation."
-- **Live-test, don't just unit-test.** The shake-down ladder caught
-  10 prod-only bugs that unit tests missed. When something fails in
-  prod, suspect Kalshi V2 wire-shape drift first.
-- **Money + rotating keys**: the Kalshi private key has been pasted
-  into conversation history. Remind the user to rotate after major
-  iteration cycles.
+- **Live-test, don't just unit-test.** When something fails in
+  prod, suspect Kalshi V2 wire-shape drift first. The 2026-05-07
+  cutover surfaced one example: Kalshi V2 rejects cids containing
+  `.`, fixed via `engine_core::cid_safe_ticker` — the engine ports
+  had to learn what the legacy `CidAllocator` already knew.
+- **Build for production, not demos.** Don't create dummy code;
+  always do the full implementation.
 
 ## When the user asks "what's next"
 
-Default to forward motion on the highest-leverage open work in
-`docs/SESSIONS.md` § "Open work / next session priorities". The
-top three at this moment:
+Default to forward motion on:
 
-1. Validate live weather strategy (passive — watch logs).
-2. Cross-arb-trader live shake-down (built, not yet live).
-3. Settlement-time sports strategy (not yet built).
-
-Then latency push (us-east-1 VPS + FIX exec).
+1. **Watch live trading** — the engine just cut over today; first
+   24h is the critical window.
+2. **Phase 4b (FIX)** — blocked on Kalshi institutional onboarding;
+   the email draft is in `docs/KALSHI_FIX_REQUEST.md`. Operator
+   action required.
+3. **Audit follow-throughs** — scale-up + arsenal-expansion items
+   listed in `docs/AUDIT.md`. Pick the highest-ROI item.
 
 Ask only when the user's goal is genuinely unclear; otherwise pick
 and execute.
@@ -74,17 +80,18 @@ and execute.
 ## Cross-platform context
 
 This project is one of two automated-trading platforms the operator
-runs.  The other is `~/code/tradegy` — a Python-based platform for
+runs. The other is `~/code/tradegy` — a Python-based platform for
 equity-index options + futures, with a live IBKR paper-trading daemon
-running a 0DTE iron condor on MES futures options as of 2026-05-06.
-tradegy harvests the variance risk premium (selling vol on equity
-indices) — a categorically different return source than predigy's
-prediction-market arbitrage / latency / statistical alpha lanes.
+running a 0DTE iron condor on MES futures options. tradegy harvests
+the variance risk premium (selling vol on equity indices) — a
+categorically different return source than predigy's prediction-
+market arbitrage / latency / statistical alpha lanes.
 
-The two platforms harvest **uncorrelated** return streams.  Running
+The two platforms harvest **uncorrelated** return streams. Running
 both is real diversification of mechanism, not just instrument.
 
 The joint strategic plan — capital projections at each tier, what's
-reusable between the platforms, and the priority sequence for extending
-each — lives at `~/code/MOONSHOT_PLAN.md`.  Read that doc when planning
-cross-platform work or evaluating where to allocate operator time.
+reusable between the platforms, and the priority sequence for
+extending each — lives at `~/code/MOONSHOT_PLAN.md`. Read that doc
+when planning cross-platform work or evaluating where to allocate
+operator time.

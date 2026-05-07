@@ -1,477 +1,156 @@
 # Session Handoff Notes
 
-> **Read this first.** A short, durable orientation for any new Claude
-> Code session picking up this codebase. The other docs (`PLAN.md`,
-> `STATUS.md`) describe the design and phase status; this doc says
-> *what is currently true* operationally — what's deployed, what's
-> running, where the money is, what to touch carefully.
->
-> Keep this doc current. End-of-session, update the `What's running`
-> and `Open work` sections.
+> **Read this first.** Operational orientation for any new Claude
+> Code session picking up this codebase. Captures *what is currently
+> true* — not what's planned. Update at end of session.
 
-## What is the user trying to do
+## What the user is doing
 
-Build a small automated trading system that profits on Kalshi
-prediction markets, starting with a $50 funded account and growing
-through compounding edge. The user has:
+Building an automated trading system on Kalshi prediction markets.
+Started with $50, scaling up through demonstrated edge. The user
+wants:
 
-- Deep coding skills, "just keep going / full speed ahead" workflow.
-- Limited tolerance for over-asking — make decisions and move forward.
-- "Money first, optimize later" preference — deployable strategies
-  beat unbuilt theory.
-- A laptop, no VPS yet (planned for the latency push).
+- Forward motion. Decide and execute; don't over-ask.
+- Money first, optimization later. Deployable strategies beat
+  unbuilt theory.
+- No fallbacks. Find the root cause; fix it.
+- Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (laptop, macOS)
-
-Three launchd jobs under the user's account (UID 501):
-
-| Label | Purpose | State |
-|---|---|---|
-| `com.predigy.latency-trader` | NWS-driven weather strategy. **LIVE** (real submission, $5 account cap). | running |
-| `com.predigy.wx-curate` | Daily 06:30 cron — re-curates rules via Claude API. | scheduled |
-| `com.predigy.dashboard` | HTTP server :8080 — mobile-friendly read-only dashboard. | running |
-
-Verify with `launchctl print gui/$(id -u)/com.predigy.<label>`.
-Logs live in `~/Library/Logs/predigy/*.log`.
-
-### Where money lives
-
-- **Kalshi production account**: ~$49.85 cash as of last check.
-- **Account cap in the daemon**: `PREDIGY_MAX_ACCOUNT_NOTIONAL=500` cents
-  ($5). Override in `~/.zprofile` if needed.
-- **Daily-loss breaker**: `PREDIGY_MAX_DAILY_LOSS=200` cents ($2).
-- **Per-side notional cap**: `PREDIGY_MAX_NOTIONAL_PER_SIDE=200` cents.
-
-### Where credentials live
-
-- `~/.config/predigy/kalshi.pem` — RSA private key, mode 0600.
-- `~/.zprofile` — `KALSHI_KEY_ID`, `ANTHROPIC_API_KEY`, `NWS_USER_AGENT`,
-  `PREDIGY_LIVE=1`. The launchd plists run `zsh -lc` so these are
-  visible at process start.
-- The Kalshi key is `a381c833-6172-4b19-a27e-a0b2345f86c7`.
-  **Rotate after the user is done iterating** — it's been pasted
-  into Claude conversation history.
-
-### Persistent state on disk
-
-`~/.config/predigy/`:
-
-| File | Purpose |
-|---|---|
-| `kalshi.pem` | Kalshi RSA private key (operator-managed). |
-| `wx-rules.json` | Latency-trader rule set, written by wx-curator. |
-| `oms-cids` | Cid sequence + chunk pre-allocation. |
-| `oms-state.json` | OMS positions, daily P&L, kill-switch, in-flight orders. |
-| `wx-seen.json` | NWS alert ids already processed (prevents re-fire on restart). |
-
-A restart of `latency-trader` resumes cleanly from these. Don't
-delete them mid-trading.
-
-## Architecture quick map
-
-**Single tokio task per binary.** All state mutation goes through
-mpsc channels into the OMS task; no shared mutable state, no locks.
-
-**Layered crates:**
-
-- `crates/core` — domain types (Price, Qty, Order, Fill, Side, etc.)
-- `crates/book` — order book (snapshot + delta + gap detection)
-- `crates/risk` — pre-trade risk engine (limits + breakers)
-- `crates/oms` — order management state machine, cid allocator,
-  state persistence (`StateBacking::Persistent`)
-- `crates/kalshi-rest` — Kalshi REST client (auth-optional)
-- `crates/kalshi-md` — Kalshi WebSocket client (public + authed channels)
-- `crates/kalshi-exec` — `oms::Executor` impl over Kalshi REST + WS fills
-- `crates/kalshi-fix` — FIX 4.4 framing + messages (production wiring NOT done)
-- `crates/poly-md` — Polymarket WS reference client
-- `crates/ext-feeds` — NWS active alerts poller (with seen-set persistence)
-- `crates/signals` — Bayes/Elo/Kelly helpers (used by stat-trader)
-- `crates/sim` — backtester runtime + replay
-
-**Strategy binaries:**
-
-- `bin/arb-trader` — single-market YES+NO parity arb. Live-shaken,
-  confirmed not profitable on efficient markets (NBA series).
-  Keep as regression test only.
-- `bin/cross-arb-trader` — Kalshi-vs-Polymarket convergence. Built,
-  NEVER live-shaken. Pair list now produced by `cross-arb-curator`
-  (was previously operator-supplied).
-- `bin/latency-trader` — NWS alerts → Kalshi weather markets. **Currently live.**
-- `bin/stat-trader` — operator-supplied model probabilities. Built,
-  no rules curated for it yet.
-- `bin/md-recorder` — NDJSON market data recorder.
-- `bin/sim-runner` — offline backtester driver.
-
-**Operational binaries:**
-
-- `bin/wx-curator` — Claude-powered rule curator for the weather
-  strategy. Hits Anthropic Messages API.
-- `bin/cross-arb-curator` — Claude-powered Kalshi/Polymarket pair
-  curator for `cross-arb-trader`. Conservative settlement-alignment
-  prompt; drops ambiguous pairs. Hits gamma-api.polymarket.com +
-  Kalshi REST + Anthropic Messages API.
-- `bin/dashboard` — read-only HTTP dashboard, port 8080, mobile-first.
-
-**Deploy artifacts** (`deploy/`):
-
-- `macos/com.predigy.{latency-trader,wx-curate,dashboard}.plist` — launchd jobs
-- `scripts/install-launchd.sh` — preflight + idempotent install
-- `scripts/wx-curate.sh` — daily curator wrapper
-- `scripts/latency-trader-run.sh` — trader launcher with persistence
-- `README.md` — operational doc
-
-## Verified live (each cost real money — small)
-
-| Path | Status | Cost |
-|---|---|---|
-| RSA-PSS auth (REST + WS) | ✅ | $0 |
-| WS market data (Kalshi orderbook_delta + ticker) | ✅ | $0 |
-| WS authed fills + market_position | ✅ (PR #16) | $0 |
-| OMS submit → Acked → Cancelled | ✅ | $0 |
-| OMS submit → Acked → Filled → PositionUpdated | ✅ | $0.06 round-trip |
-| OMS persistence across restart | ✅ | $0 |
-| NWS seen-set persistence across restart | ✅ | $0 |
-| Live weather strategy (dry-run) | ✅ | $0 |
-| Live weather strategy (live submit) | ⚠ just flipped, validating | TBD |
-
-## Bugs found during shakedown (all fixed)
-
-1. `*_dollars` REST fields are quoted decimal strings, not f64.
-2. Orderbook wrapper is `orderbook_fp` with `yes_dollars`/`no_dollars`
-   `[String; 2]` levels.
-3. Recorder REST-resync infinite loop (REST has no seq).
-4. `MarketPosition.position` → `position_fp` (decimal string).
-5. Kalshi V2 fill records have `action: ""` (empty); use the
-   originating order's tracked `(Side, Action)` instead.
-6. NWS area-param needed comma-separated form, not repeated `?area=`.
-7. NWS dedup state was in-memory only; restart re-fired every active alert.
-8. `area_substring` rule filter was unreliable; switched to
-   `required_states` + `geocode.UGC` parsing.
-9. `wx-curate.sh` rule-count grep used wrong field name.
-10. `latency-trader-run.sh` shell-quoting bug on `--nws-states`.
-
-These all live in PR history (#7-#22). When something fails, look
-for similar wire-mismatch issues — Kalshi V2 docs and reality
-diverge.
-
-## Stat-trader lane added 2026-05-06
-
-The stat-curator + stat-trader pair is now built and shipped, mirroring
-the wx-curator + latency-trader pattern but for statistical-alpha
-betting on sports / politics / elections / world / economics markets.
-
-**What's in:**
-
-- `bin/stat-curator/` — Rust binary that scans Kalshi via REST,
-  filters to actionable markets settling within `--max-days-to-settle`
-  (default 14), batches them to Claude with a calibrated-probability
-  prompt, validates each proposed rule (probability range,
-  confidence rating, edge gap, side direction), writes
-  `~/.config/predigy/stat-rules.json`.  Live-shaken 2026-05-06:
-  scanned 25 markets, Claude proposed 2, validated 1 (TSA passenger
-  count, Yes side, model_p=0.28, edge=9¢).
-- `bin/stat-trader/` — was already built; consumes the rule file
-  the curator now produces.
-- `deploy/scripts/stat-curate.sh` + `deploy/scripts/stat-trader-run.sh`
-- `deploy/macos/com.predigy.stat-curate.plist` (every 6h:
-  02/08/14/20 local) + `deploy/macos/com.predigy.stat-trader.plist`
-  (Disabled=true by default)
-- Workspace + install-launchd.sh updated to include both new jobs.
-
-**To activate stat-trader live:**
-
-1. Confirm at least one stat-curate run has produced
-   `~/.config/predigy/stat-rules.json` with non-empty content.
-2. Manually review the rules — each has a `model_p`, `side`, and
-   `min_edge_cents`.  Reject anything that looks miscalibrated.
-3. Edit `<key>Disabled</key><true/>` → `<false/>` in
-   `deploy/macos/com.predigy.stat-trader.plist`.
-4. Re-run `deploy/scripts/install-launchd.sh`.
-5. Watch `~/Library/Logs/predigy/stat-trader.stderr.log` for fires.
-
-**Risk caps default tight for shake-down:** $5 account-wide gross,
-$2 per-side, $2 daily-loss breaker, max 3 contracts per fire,
-60s cooldown between fires per market.  Override via
-`PREDIGY_STAT_*` env vars in `~/.zprofile` after validation.
-
-**Cost shape:** stat-curate Anthropic call is ~3.4K input + ~900
-output tokens per batch = ~$0.02/batch.  Default 4 batches/run, 4
-runs/day = ~$0.32/day = ~$10/month.
-
-## wx-stat lane scaffolded 2026-05-06 (Phase 1 — not yet deployed)
-
-Forecast-driven cousin of stat-curator: same `StatRule[]` output, but
-`model_p` comes from the NWS hourly point forecast instead of an LLM.
-Targets Kalshi daily-temperature markets (`KXHIGH*` / `KXLOW*`).
-
-**What's in (Phase 1):**
-
-- `crates/ext-feeds/src/nws_forecast.rs` — `NwsForecastClient` with
-  `lookup_point(lat, lon) → GridPoint` and `fetch_hourly(GridPoint) →
-  HourlyForecast`. Handles both scalar and gridded NWS response
-  shapes.
-- `bin/wx-stat-curator/` — full curator. Modules: `airports.rs`
-  (30 hand-curated airport→lat/lon), `ticker_parse.rs` (event
-  ticker + Kalshi `floor_strike`/`strike_type`/`occurrence_datetime`
-  → structured spec), `kalshi_scan.rs` (Climate-and-Weather → temp
-  markets only), `forecast_to_p.rs` (forecast aggregate → conviction
-  zone gate → 0.97/0.03 model_p).
-- `crates/kalshi-rest` extended `MarketSummary` with optional
-  `floor_strike` / `cap_strike` / `strike_type` /
-  `occurrence_datetime` fields. Non-breaking via `#[serde(default)]`.
-- `docs/WX_STAT_PLAN.md` — full Phase 1 / 2 / 3 plan, edge thesis,
-  risk register.
-
-**Live shake-down 2026-05-06:** scanned 285 actionable temp markets
-across 13 airports, emitted 21 rules, 263 skipped (most inside the
-5°F conviction zone). Audit log shows forecast values, hours
-considered, model_p, side, and yes_ask side-by-side. One example
-candidate: `KXLOWTOKC-26MAY07-T43` (>43F low) — NWS forecast 53F low
-→ model_p=0.97, market yes_ask=50¢. Real ~47¢ pre-fee apparent edge.
-
-**Deploy: live with Phase 2 NBM as of 2026-05-07.**
-
-- `deploy/scripts/wx-stat-curate.sh` — wrapper. Writes to
-  `~/.config/predigy/wx-stat-rules.json` (separate from
-  stat-rules.json — the wx-stat output is intentionally
-  quarantined for review). Phase 2 NBM is the default;
-  set `PREDIGY_WX_STAT_PHASE=1` in `~/.zprofile` to revert to
-  Phase 1.
-- `deploy/macos/com.predigy.wx-stat-curate.plist` — every 3h:
-  00/03/06/09/12/15/18/21 local. **Disabled=false; running.**
-- Cold first run takes ~10-15 min (decoding 21 quantile fields ×
-  ~40 forecast hours through openjpeg/proj). Cache-hit re-runs
-  are <10 seconds.
-- Per-rule prediction records persist to
-  `data/wx_stat_predictions/<UTC-date>.jsonl` for the calibration
-  fitter (`wx-stat-fit-calibration`) to consume later.
-
-**Rules go straight into live trading.** As of 2026-05-07,
-stat-trader takes `--rule-file` repeatedly and merges all of them
-at startup; the launcher passes both `stat-rules.json` (LLM-
-curated) and `wx-stat-rules.json` (NBM-derived). Duplicate-ticker
-collisions resolve last-file-wins so a fresh forecast-derived
-rule overrides a stale LLM-curated one without manual hand-merge.
-After every wx-stat-curate run, the wrapper kickstarts the
-stat-trader launchd job so live trading picks up fresh rules
-within seconds of the cycle completing.
-
-**To inspect proposed rules without committing them live**: run
-the curator without `--write` and the stderr output includes a
-sorted table of every proposed rule, biggest apparent edge first:
+## What is running RIGHT NOW (2026-05-07, post-cutover)
 
 ```
-inspection (sorted by apparent edge desc):
-   edge  ticker                            airpt  thresh    fcst  model  side    ask  title
-    +92  KXHIGHTOKC-26MAY07-T78            OKC    >78       85.0    97%   YES     5c  Will the maximum temperature be >78° on May 7, 2026?
-    +88  KXLOWTPHIL-26MAY06-T58            PHIL   <58       53.0    97%   YES     9c  Will the minimum temperature be <58° on May 6, 2026?
-    ...
+launchctl list | grep predigy
 ```
 
-`edge` is `(model_p_in_cents − quoted_ask_cents)` for the bet
-side at curator time. Stat-trader re-evaluates against live
-prices at fire time, so edge here is a ranking aid, not a
-guarantee. Investigate the highest-edge candidates before
-promoting — edges over ~50¢ usually indicate either real
-arbitrage, stale market quotes, or a forecast/Kalshi-source
-mismatch the operator can spot.
+| Job | What it does | State |
+|---|---|---|
+| `com.predigy.engine` | Consolidated trader. Owns OMS, market data, exec, all four strategies. | running, mode=Live |
+| `com.predigy.cross-arb-curate` | Anthropic-driven Kalshi×Polymarket pair curator. 10-min cron. | scheduled |
+| `com.predigy.stat-curate` | model_p curator for stat strategy. | scheduled |
+| `com.predigy.wx-curate` | NWS-state-aware weather rule curator (latency strategy). | scheduled |
+| `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. | scheduled |
+| `com.predigy.import` | Legacy JSON-state mirror to Postgres. | scheduled |
+| `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080. | running |
 
-Phase 2 (NBM probabilistic + per-airport calibration) and Phase 3
-(auto-merge into stat-rules.json + bigger-cap deploy) are
-described in `docs/WX_STAT_PLAN.md`.
+Retired (post-cutover): `latency-trader`, `settlement`, `stat-trader`,
+`cross-arb`. The plists are still on disk under
+`deploy/macos/`; keeping them around for one cycle as a rollback
+path before deletion.
 
-**Phase 1 conviction-zone gate**: rules only emit when forecast
-margin to the threshold is ≥ 5°F. This compensates for NWS hourly
-being a point forecast rather than a distribution. Phase 2 replaces
-this with calibrated probabilities from NBM gridded data.
+## The cutover (2026-05-07 07:45 UTC)
 
-## Polymarket WS keepalive flag added 2026-05-06 (opt-in)
+- Stopped the four legacy trader daemons.
+- Set `PREDIGY_ENGINE_MODE=live` + `DATABASE_URL=postgresql:///predigy`
+  in `~/.zprofile`.
+- Bootstrapped `com.predigy.engine.plist`.
+- Engine booted in Live mode, subscribed 68 stat-rule markets via
+  WS, started firing.
+- **Bug surfaced live**: Kalshi V2 rejects `client_order_id`
+  containing `.`. Engine ports embedded raw tickers like
+  `KXBRAZILINF-26APR-T4.30` → 10 intents got `400 invalid_parameters`.
+  Fixed via `engine_core::intent::cid_safe_ticker(...)` (commit
+  `0c05c40`); rebuilt + restarted in ~5 minutes; kill-switch
+  armed during the patch window.
+- Skipped the `docs/CUTOVER.md` shadow-mode dual-write phase per
+  operator direction. Live verification is what the next 24h is for.
 
-`cross-arb.stderr.log` shows the Polymarket CLOB WS connection
-disconnecting on a ~2-minute cadence (69 disconnects in 21h, all
-with "Connection reset without closing handshake"). The trader's
-reconnect path handles them cleanly — each reconnect succeeds in
-under 500ms and re-subscribes — but every disconnect triggers an
-"awaiting fresh book" pause where spreads against Polymarket are
-unavailable until the snapshot replay completes. Estimated
-~0.5%-1% downtime on Polymarket-side data; cross-arb still made
-6 fills today, so degraded but not broken.
+## Where money lives
 
-**Root cause hypothesis**: Polymarket's CLOB WS server requires
-application-level keepalive (text frame `"PING"` → text frame
-`"PONG"`). tokio-tungstenite handles protocol-level Pings
-automatically, but Polymarket appears to ignore those for idle
-detection.
+- **Kalshi production account**: ~$50 funded. `KALSHI_KEY_ID` in
+  `~/.zprofile`; PEM at `~/.config/predigy/kalshi.pem`.
+- **Capital caps in the engine** (RiskCaps shake-down defaults):
+  - `max_notional_cents` per strategy: $5 ($500¢)
+  - `max_global_notional_cents`: $15 ($1500¢) — binds before
+    4×$5=$20 of per-strategy caps could.
+  - `max_daily_loss_cents`: $2
+  - `max_contracts_per_side`: 3
+  - `max_in_flight`: 10
+  - Override per-strategy via env vars in `~/.zprofile`
+    (`PREDIGY_MAX_NOTIONAL_CENTS`, `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS`,
+    etc.).
 
-**Fix shipped opt-in**: `Client::with_text_ping_interval(d)` on
-`predigy-poly-md::Client`. Sends a `"PING"` text frame every `d`;
-`handle_text` recognises `"PONG"` and drops it silently. Default
-behavior (no ping interval) is unchanged — current cross-arb
-deploy keeps running with the existing reconnect cadence.
+## Kill switch (panic button)
 
-**To validate the fix**:
-1. In `bin/cross-arb-trader/src/main.rs`, find the
-   `predigy_poly_md::Client::new()` construction and add
-   `.with_text_ping_interval(Duration::from_secs(10))`.
-2. Rebuild + redeploy: `cargo build --release -p cross-arb-trader`
-   then `launchctl kickstart -k gui/$(id -u)/com.predigy.cross-arb`.
-3. Watch `cross-arb.stderr.log` for the disconnect rate. If the
-   2-min disconnects stop, the fix works. If they don't (or get
-   worse), revert.
+```sh
+echo armed > ~/.config/predigy/kill-switch.flag   # ARM (refuse new entries)
+: > ~/.config/predigy/kill-switch.flag            # DISARM (truncate)
+```
 
-If the validation goes well, make the ping cadence a default in
-`Client::new()` rather than opt-in.
+Engine + dashboard both poll the file every 5 seconds. Engine logs
+"kill-switch: ARMED" when it sees a non-empty flag.
 
-Test coverage: 2 new loopback tests in
-`crates/poly-md/tests/loopback_session.rs` —
-`text_ping_keepalive_sends_ping_on_interval` (verifies a "PING"
-text frame is emitted on the configured cadence) and
-`pong_response_is_silently_dropped` (verifies `"PONG"` doesn't
-surface as a Malformed event).
+## Strategy-by-strategy state
 
-## Engine refactor — checkpoint 2026-05-07
+### `stat` (statistical model probability vs ask)
 
-The architectural pivot from a fragmented multi-binary system to
-the consolidated `predigy-engine` with shared state + Postgres is
-underway. **Phases 0–3.2 done; Phase 3.3+ blocked on Kalshi FIX
-access (in progress with Kalshi institutional team).**
+- 68 active rules in `rules` table (Postgres). Curated by
+  `stat-curate` + `wx-stat-curate`.
+- Phase 6.1 active exits: take-profit 8¢ / stop-loss 5¢, defaults.
+  Closing IOCs use idempotent
+  `stat-exit:{ticker}:{side}:{tp|sl}:{minute_bucket}` cids.
 
-Status by phase (full plan in `docs/ARCHITECTURE.md`):
+### `settlement` (sports tape-reading near close)
 
-| Phase | Status |
-|---|---|
-| 0  Setup | Done — Postgres 16.13, peer auth, predigy DB live |
-| 1  Schema + import | Done — 13 tables, predigy-import idempotent + scheduled hourly |
-| 2  Engine skeleton + DB read path | Done — engine boots, supervises, dashboard reads DB |
-| 3.1  Stat strategy module | Done — logic ported with 9 unit tests |
-| 3.2  Engine wired end-to-end (shadow mode) | Done — 45 shadow intents emitted live in 04:33 UTC test |
-| 3.3  Parity verification | Pending — needs 24-48h shadow-vs-legacy diff window |
-| 3.4  Cutover (engine Live + retire legacy stat-trader) | **Blocked on Phase 4** |
-| 4  FIX as primary order path | **BLOCKED on Kalshi access** — emailing `institutional@kalshi.com` |
-| 5  Port remaining strategies (cross-arb, latency, settlement, wx-stat) | Can run autonomously in shadow mode while waiting |
-| 6  Active position management | Can run autonomously after 5 |
-| 7  Retire scaffolding (legacy daemons + JSON files) | After 5 + parity |
+- Pure discovery-driven; no static ticker list. Engine's discovery
+  service polls Kalshi `/markets?series_ticker=...` for the standard
+  sports basket every 60s, auto-registers new markets with the
+  router, pushes `Event::DiscoveryDelta` to the strategy.
+- No active exits — Kalshi auto-settles binary outcomes at $1/$0.
 
-What's running in production right now (legacy daemons, not
-engine; engine is shadow-mode only): same 9 launchd jobs as
-before plus `com.predigy.import` (every 30 min) keeping the DB
-in sync. Dashboard reads DB-derived state.
+### `latency` (NWS-alert lift on weather markets)
 
-Engine binary built + boot-tested but **not** added to launchd
-yet — the manual smoke test (~6 sec runtime) emitted 45 shadow
-intents and shut down cleanly. Production launchd integration
-waits until parity verification (Phase 3.3) confirms the engine's
-decisions match the legacy daemon's.
+- Rules loaded from `PREDIGY_LATENCY_RULE_FILE` JSON at startup.
+  Set in `~/.zprofile` if you want the strategy to fire — without
+  the env var the engine logs a warning and the strategy is a no-op.
+- Phase 6.2 force-flat: positions held >30 min get a wide-IOC exit
+  at 1¢ (any standing bid takes us). Latency has no book
+  subscription so mark-aware exits aren't possible.
+- Requires `PREDIGY_NWS_USER_AGENT` in env or NWS feed won't spawn.
 
-Kalshi FIX is the gating ask. Once they grant access, Phases
-3.3 → 3.4 → 4 unblock as a single dependent chain.
+### `cross-arb` (Kalshi vs Polymarket convergence)
 
-## Original entry — kept for reference
-
-Source-of-truth docs:
-- `docs/ARCHITECTURE.md` — target architecture, full migration
-  plan (Phases 0-7), decision log
-- `docs/DATABASE.md` — Postgres setup recipe, query examples,
-  ops runbook, live phase tracker
-
-What's done:
-- **Phase 0**: Postgres 16.13 installed via Homebrew (peer auth
-  on UNIX socket, no password), `predigy` DB created, PATH
-  persisted in `~/.zprofile`.
-- **Phase 1**: 13-table schema in `migrations/0001_initial.sql`,
-  applied. `bin/predigy-import` reads existing JSON state files
-  + rule files into the DB, idempotent. First run reported
-  183 markets / 58 intents / 175 rules imported.
-
-The existing daemons keep running and writing JSON state through
-Phases 2-3. Schedule `predigy-import` hourly (TODO) so the DB
-stays in sync with whatever the daemons do until the engine
-takes over the write path.
-
-Next up:
-- Phase 2: `bin/predigy-engine` skeleton (one Kalshi WS client,
-  sqlx pool, strategy-trait scaffolding)
-- Phase 3: stat-trader as first strategy module + dual-write
-  parity verification
+- Pair-driven. Pairs come from `PREDIGY_CROSS_ARB_PAIR_FILE`
+  (default: `~/.config/predigy/cross-arb-pairs.txt`), curated by
+  `cross-arb-curate`. Pair-file service polls mtime; hot reload.
+- Phase 6.2 active exits: take-profit 5¢ / stop-loss 4¢ (tighter
+  than stat because cross-arb scalps smaller convergences).
+- Cross-strategy bus: cross-arb publishes `PolyMidUpdate` for
+  paired markets; stat subscribes (currently log-only — augmenting
+  belief from poly-mid is a future enhancement).
 
 ## Open work / next session priorities
 
-In rough order of leverage:
+1. **Watch live trading for ≥24h.** Initial cutover surfaced one
+   bug (cid period-strip). Day-of-week + hour-of-day variance
+   means we want a full session of overnight + market hours.
+   Dashboard at <http://127.0.0.1:8080> — "engine positions" and
+   "recent exits" sections show what the strategies are doing.
+2. **Phase 4b (FIX)**: blocked on Kalshi institutional access.
+   Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action.
+3. **Audit follow-throughs** in `docs/AUDIT.md`: profit-take
+   improvements, scale-up paths, strategy arsenal expansion.
+4. **Phase 7 — retire legacy daemons** completely (delete
+   `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
+   their plists, their JSON state files). Wait until ≥1 week of
+   stable engine operation.
 
-1. **Validate live weather strategy** by watching for a few days.
-   Check `~/Library/Logs/predigy/latency-trader.stderr.log` for
-   `rule fired` lines and verify those would have been positive-EV
-   trades. If a rule consistently fires on bad correlations
-   (e.g. CO-mountain Winter Storm → Denver airport temp), edit
-   `wx-curator/src/prompt.rs` to discourage it and re-curate.
+## Things to be careful about
 
-2. **Cross-arb-trader live shake-down.** Built but never live-tested.
-   Needs Kalshi/Polymarket pair list. Practical pairs to start:
-   - 2026 election outcomes (Polymarket has many, Kalshi has corresponding)
-   - FOMC rate decisions (both venues list these around meetings)
-   The pairing is `--pair KALSHI_TICKER=POLYMARKET_ASSET_ID`. Run
-   in dry-run for a session, look for divergences > 3¢.
+- **Kalshi private key** has been pasted into conversation history
+  many times. Rotate periodically.
+- **`~/.zprofile`** is the single source of env truth. Engine reads
+  it via `zsh -lc`. Don't put secrets that you don't want in
+  process env there.
+- **Postgres `predigy_test`** is wiped on every integration test
+  run — don't store anything important there.
+- **Dropping the kill-switch flag file** (`rm`) doesn't disarm; the
+  engine treats absent and empty as both = disarmed, but the
+  dashboard's POST /api/kill writes via tmp+rename so it can race
+  with `rm`. Truncate (`: > flag`) is the safe disarm.
 
-3. **Settlement-time sports strategy.** ✅ Built (PR #24).
-   `bin/settlement-trader` watches sports markets near `close_time`,
-   fires when `yes_ask in [88,96]` AND
-   `bid_stack_qty >= 5 × ask_stack_qty` (book-asymmetry tell).
-   12 unit tests covering all gates + cooldown.
-   Deployment scaffold ready (`com.predigy.settlement.plist`,
-   `Disabled=true`). Activate by:
-   1. Author `~/.config/predigy/settlement-markets.txt` —
-      one Kalshi ticker per line, sports preferred.
-   2. `cargo build --release -p settlement-trader`.
-   3. Edit `Disabled` key out of the plist + run install script.
-   **Live shake-down pending** — try a calm Saturday with NBA
-   playoffs in the final minutes. Dry-run a few sessions before
-   flipping to live; settlement-time strategies are loss-tail-heavy
-   and need real-data validation.
+## Cross-platform context
 
-4. **Latency push** — us-east-1 VPS + FIX exec.
-   - VPS (Lightsail / Linode $5-15/mo): drops Kalshi RTT from
-     ~100 ms to ~5-15 ms.
-   - Port `deploy/macos/*.plist` → `deploy/linux/*.service` (systemd).
-   - Wire `predigy-kalshi-fix` to prod: TLS to Kalshi's FIX endpoint,
-     real Logon handshake, heartbeat, sequence-number persistence,
-     `FixExecutor: oms::Executor` impl.
-   - Need to email `[email protected]` for FIX access first.
-
-5. **Dashboard upgrades** (lower priority, polish):
-   - Kill-switch button (currently dashboard is read-only).
-   - Daily-P&L chart (last 7 days bar chart).
-   - Per-rule fire history.
-
-## Conventions when working in this repo
-
-- **Single rolling branch per chunk, single PR.** User said: don't
-  slice work into multiple PRs unnecessarily. They are the only reviewer.
-- **Don't simplify when stuck.** Per `CLAUDE.md`: no fallbacks, no
-  workarounds, no temporary hacks. Find the root cause.
-- **Always commit after each round of code updates.**
-- **Prod-API wire-shape changes are common.** When something fails to
-  decode, suspect Kalshi schema drift first; their V2 docs lag reality.
-- **No "dummy code" or demos.** Operator-grade only.
-- **Test live, not just unit.** The live shake-down ladder caught
-  10 bugs that unit tests missed.
-
-## Stopping the world (kill switch)
-
-If something looks wrong and you need to halt all trading:
-
-```sh
-launchctl bootout gui/$(id -u)/com.predigy.latency-trader
-```
-
-This sends SIGTERM; OMS persists final state. **Resting orders on
-Kalshi are NOT cancelled** — visit kalshi.com/portfolio or run
-`crates/kalshi-rest/examples/close_position.rs` to flatten.
-
-## Doc map
-
-- `README.md` — project overview, build/test commands.
-- `docs/PLAN.md` — full architecture + strategy plan (long, dense).
-- `docs/STATUS.md` — phase-by-phase build status.
-- `docs/RUNBOOK.md` — operational procedures (how to debug, intervene).
-- `docs/SESSIONS.md` — **this file**.
-- `deploy/README.md` — deployment + ops layout.
+The other platform is `~/code/tradegy` (Python, equity-index
+options + MES futures options). Different return mechanism (variance
+risk premium); deliberately uncorrelated with predigy.
+`~/code/MOONSHOT_PLAN.md` is the joint strategic doc.

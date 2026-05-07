@@ -1,218 +1,213 @@
 # Operational runbook
 
-> Day-to-day commands for running, debugging, and intervening with
-> the predigy daemon stack on macOS.
+> Day-to-day commands for running, debugging, and intervening
+> with the predigy stack on macOS.
 
 ## Health checks
 
 ### Is everything running?
 
 ```sh
-for n in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard; do
-    state=$(launchctl print "gui/$(id -u)/$n" 2>/dev/null | grep -E '^\s*state\s*=' | head -1 | awk -F= '{print $2}' | xargs)
-    echo "$n: ${state:-NOT LOADED}"
+launchctl list | grep predigy
+```
+
+Expected (post-cutover):
+
+```
+<pid>  0  com.predigy.engine
+<pid>  0  com.predigy.dashboard
+<pid>  0  com.predigy.cross-arb-curate     # only when cron-firing
+   -   0  com.predigy.{stat,wx,wx-stat}-curate
+   -   0  com.predigy.import
+```
+
+The `<pid>  0` rows are running; the `-  0` rows are scheduled cron
+tasks waiting for next fire. Anything with a non-zero second column
+is in error.
+
+### Engine status
+
+```sh
+# Liveness:
+launchctl print "gui/$(id -u)/com.predigy.engine" | grep -E '^\s*state\s*='
+
+# Mode:
+grep "oms ready" ~/Library/Logs/predigy/engine.stderr.log | tail -1
+
+# Recent activity:
+tail -n 50 ~/Library/Logs/predigy/engine.stderr.log
+```
+
+### Dashboard
+
+```sh
+open http://localhost:8080            # local
+open http://192.168.1.217:8080        # LAN (your phone)
+```
+
+Top-level pill: green = engine fresh, warn = stale, bad = down.
+
+### Postgres
+
+```sh
+psql -d predigy -c "SELECT status, COUNT(*) FROM intents GROUP BY status;"
+psql -d predigy -c "SELECT strategy, COUNT(*) FROM positions WHERE closed_at IS NULL GROUP BY strategy;"
+psql -d predigy -c "SELECT strategy, COUNT(*) FROM rules WHERE enabled = true GROUP BY strategy;"
+```
+
+## Kill switch (panic button)
+
+```sh
+echo armed > ~/.config/predigy/kill-switch.flag   # ARM
+: > ~/.config/predigy/kill-switch.flag            # DISARM (truncate)
+```
+
+Engine + dashboard poll every 5s. Within 5s of arming, the engine
+logs "kill-switch: ARMED" and refuses new submits. Existing
+positions are NOT auto-flattened.
+
+The dashboard's "kill switch" card on the web UI is wired to the
+same flag file via `POST /api/kill`.
+
+## Redeploy
+
+```sh
+cd ~/code/predigy
+cargo build --release -p predigy-engine
+
+# Pick up the new binary (KeepAlive restarts the process):
+launchctl kickstart -k "gui/$(id -u)/com.predigy.engine"
+
+# Tail the new boot:
+tail -f ~/Library/Logs/predigy/engine.stderr.log
+```
+
+If the plist itself changed (`deploy/macos/com.predigy.engine.plist`):
+
+```sh
+cp deploy/macos/com.predigy.engine.plist ~/Library/LaunchAgents/
+launchctl bootout "gui/$(id -u)/com.predigy.engine"
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.engine.plist
+```
+
+## Debugging
+
+### "Engine is up but not firing"
+
+1. Check kill switch: `cat ~/.config/predigy/kill-switch.flag` —
+   non-empty = armed.
+2. Check rules count: stat needs `rules.enabled = true` rows;
+   curators populate them.
+3. Check WS connection: `grep "router: subscribe submitted"
+   ~/Library/Logs/predigy/engine.stderr.log | tail -1`.
+4. Check that markets are open and have books. Overnight markets
+   are commonly paused; logs will show
+   `409 trading_is_paused`.
+
+### "Engine is rejecting every submit at the venue"
+
+Likely a wire-shape drift. Look at the rejection body:
+
+```sh
+grep "rejected by venue" ~/Library/Logs/predigy/engine.stderr.log | tail -5
+```
+
+If `400 invalid_parameters` and the cid contains `.`, the
+period-strip in `engine_core::cid_safe_ticker` regressed. (This was
+the 2026-05-07 cutover bug.)
+
+### "Cross-arb isn't firing"
+
+1. `PREDIGY_CROSS_ARB_PAIR_FILE` set in `~/.zprofile`?
+   Engine logs "PREDIGY_CROSS_ARB_PAIR_FILE not set..." at boot
+   if missing.
+2. Pair file present? `cat ~/.config/predigy/cross-arb-pairs.txt`.
+3. Polymarket WS connected?
+   `grep "Polymarket dispatcher started" ~/Library/Logs/predigy/engine.stderr.log`.
+4. Curator running? `launchctl list | grep cross-arb-curate`.
+
+### "Latency isn't firing"
+
+1. `PREDIGY_LATENCY_RULE_FILE` set? Engine logs "rules loaded" or
+   "rule file unreadable" at boot.
+2. `PREDIGY_NWS_USER_AGENT` set? Without it, engine logs
+   "PREDIGY_NWS_USER_AGENT not set — NWS-dependent strategies
+   won't fire this run".
+
+## Engine modes (Live ↔ Shadow)
+
+```sh
+# Switch to Shadow (engine writes intents at status='shadow', no venue):
+sed -i.bak 's/^export PREDIGY_ENGINE_MODE=.*/export PREDIGY_ENGINE_MODE=shadow/' ~/.zprofile
+launchctl kickstart -k "gui/$(id -u)/com.predigy.engine"
+
+# Back to Live:
+sed -i.bak 's/^export PREDIGY_ENGINE_MODE=.*/export PREDIGY_ENGINE_MODE=live/' ~/.zprofile
+launchctl kickstart -k "gui/$(id -u)/com.predigy.engine"
+```
+
+Shadow mode is the default if the env var is absent. Use Shadow if
+you suspect an engine bug; the strategy keeps recording intents to
+Postgres for forensic analysis without spending real money.
+
+## Manual position management
+
+The engine doesn't manage positions held by the legacy daemons (those
+positions live in the legacy JSON state files, not Postgres).
+If you need to flatten a legacy position manually:
+
+```sh
+# List Kalshi-account-side positions:
+psql -d predigy -c "SELECT * FROM positions WHERE closed_at IS NULL;"
+
+# Or via the dashboard at /api/state — "open_positions" field.
+```
+
+To flatten a position, submit a manual order via the Kalshi web UI
+or write a one-shot script that uses `predigy-kalshi-rest`.
+
+## Rolling back to legacy daemons
+
+The legacy plists are still on disk. To revert (one cycle only):
+
+```sh
+# 1. Stop engine
+launchctl bootout "gui/$(id -u)/com.predigy.engine"
+
+# 2. Re-bootstrap legacy traders
+for n in latency-trader stat-trader settlement cross-arb; do
+    launchctl bootstrap "gui/$(id -u)" \
+        ~/Library/LaunchAgents/com.predigy.$n.plist
 done
 ```
 
-### Dashboard, the easy way
+The legacy daemons still maintain their JSON state files in
+`~/.config/predigy/oms-state-*.json`; they pick up where they left
+off.
+
+## Database
+
+See [`DATABASE.md`](./DATABASE.md) for setup. To run integration
+tests:
 
 ```sh
-open http://localhost:8080            # from this laptop
-open http://192.168.1.217:8080        # from any device on the same wifi
+createdb predigy_test 2>/dev/null || true
+psql -d predigy_test -f migrations/0001_initial.sql
+cargo test -p predigy-engine
 ```
 
-Health pill: green = log <90s old; warn = stale; bad = down.
-
-### Logs
+## Logs
 
 ```sh
-tail -f ~/Library/Logs/predigy/latency-trader.stderr.log
-tail -f ~/Library/Logs/predigy/wx-curate.stderr.log
+tail -f ~/Library/Logs/predigy/engine.stderr.log         # the trader
 tail -f ~/Library/Logs/predigy/dashboard.stderr.log
+tail -f ~/Library/Logs/predigy/cross-arb-curate.stderr.log
+tail -f ~/Library/Logs/predigy/wx-curate.stderr.log
+tail -f ~/Library/Logs/predigy/stat-curate.stderr.log
+tail -f ~/Library/Logs/predigy/wx-stat-curate.stderr.log
+tail -f ~/Library/Logs/predigy/import.stderr.log
 ```
 
-### Account state on the venue
-
-```sh
-KALSHI_KEY_ID="$KALSHI_KEY_ID" KALSHI_PEM="$HOME/.config/predigy/kalshi.pem" \
-  cargo run -p predigy-kalshi-rest --example auth_smoke
-```
-
-Prints positions + P&L per market.
-
-## Common interventions
-
-### Force a wx-curate cycle right now
-
-```sh
-launchctl kickstart -k gui/$(id -u)/com.predigy.wx-curate
-```
-
-### Restart the trader (e.g. to pick up new env vars)
-
-```sh
-launchctl kickstart -k gui/$(id -u)/com.predigy.latency-trader
-```
-
-### Halt all trading immediately
-
-```sh
-launchctl bootout gui/$(id -u)/com.predigy.latency-trader
-```
-
-After halt: Kalshi keeps any resting orders alive. To cancel them
-manually:
-
-```sh
-# Inspect your portfolio in a browser:
-open https://kalshi.com/portfolio
-
-# Or close one specific position via REST:
-KALSHI_KEY_ID="$KALSHI_KEY_ID" KALSHI_PEM="$HOME/.config/predigy/kalshi.pem" \
-  cargo run -p predigy-kalshi-rest --example close_position -- \
-  KXMARKET-TICKER 7 1
-# args: market price-cents qty
-```
-
-### Bring trading back
-
-```sh
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.predigy.latency-trader.plist
-```
-
-### Flip dry-run ↔ live
-
-```sh
-# Go LIVE
-echo 'export PREDIGY_LIVE=1' >> ~/.zprofile
-launchctl kickstart -k gui/$(id -u)/com.predigy.latency-trader
-
-# Go back to DRY-RUN
-sed -i.bak '/^export PREDIGY_LIVE=/d' ~/.zprofile
-launchctl kickstart -k gui/$(id -u)/com.predigy.latency-trader
-```
-
-### Adjust risk caps
-
-Edit `~/.zprofile` and restart the trader:
-
-```sh
-export PREDIGY_MAX_ACCOUNT_NOTIONAL=1000   # cents — $10 cap
-export PREDIGY_MAX_DAILY_LOSS=500          # cents — $5 daily loss breaker
-export PREDIGY_MAX_NOTIONAL_PER_SIDE=500   # cents — $5 per market per side
-export PREDIGY_MAX_CONTRACTS=5             # contracts per side
-launchctl kickstart -k gui/$(id -u)/com.predigy.latency-trader
-```
-
-## Debugging recipes
-
-### "I see a fire in the log but no fill"
-
-In `--dry-run` mode this is expected — fires log but don't submit.
-Verify with:
-
-```sh
-grep -E "PREDIGY_LIVE|dry_run" ~/Library/Logs/predigy/latency-trader.stderr.log | head -5
-```
-
-In live mode, check whether the venue accepted the submit:
-
-```sh
-grep -E "Submitted|Acked|Rejected|Filled" ~/Library/Logs/predigy/latency-trader.stderr.log | tail -20
-```
-
-### "Orphan position — venue says I own contracts but OMS thinks not"
-
-This happened during the live shake-down due to a fill-decoder bug.
-Both halves should reconcile now, but if it recurs:
-
-```sh
-# Inspect venue's view
-cargo run -p predigy-kalshi-rest --example auth_smoke
-
-# Inspect OMS's view (positions block in the JSON)
-cat ~/.config/predigy/oms-state.json | python3 -m json.tool | head -30
-```
-
-If they diverge, the safer move is to flatten via venue and let
-the next OMS run rehydrate from the snapshot.
-
-### "Daemon keeps crash-looping"
-
-`launchctl print gui/$(id -u)/com.predigy.latency-trader` shows
-`last exit code` — anything non-zero indicates the wrapper script
-or binary failed at startup. Check stderr log for the panic /
-context.
-
-Common causes:
-- Missing env var → wrapper script fails preflight.
-- Stale rule file → `wx-rules.json` doesn't exist → trader bails
-  with "rule file is empty". Force a curate cycle.
-- Kalshi auth failure → key rotated, PEM doesn't match. Re-pull
-  the PEM from your Kalshi account.
-
-`ThrottleInterval=30` in the plist means launchd waits 30 s between
-restarts, so a true crash loop takes a minute to surface in logs.
-
-### "Anthropic key error during wx-curate"
-
-```
-ANTHROPIC_API_KEY env var required
-```
-
-`~/.zprofile` has it but launchd's `zsh -lc` should source it.
-If failing, the user might have moved it to `~/.zshrc` (which
-isn't sourced by `-lc`). Move back to `~/.zprofile`.
-
-### "Curator wrote 0 rules"
-
-Either Anthropic returned 0 (rare — usually means prompt is too
-restrictive) or the validator dropped them all. Inspect:
-
-```sh
-~/Library/Logs/predigy/wx-curate.stderr.log
-```
-
-Look for `dropped invalid rule` warnings and `rules proposed`
-lines per batch. If proposed=0, edit `bin/wx-curator/src/prompt.rs`
-and rebuild.
-
-## Mobile access
-
-Default plist binds the dashboard to `0.0.0.0:8080`. Phone access:
-
-- **Same wifi**: visit `http://<laptop-LAN-IP>:8080`. Get the IP
-  via `ipconfig getifaddr en0`.
-- **Off-network**: install [Tailscale](https://tailscale.com) on
-  laptop and phone (free for 3 nodes), then hit the laptop's
-  Tailscale IP.
-
-The dashboard is read-only. There is no kill-switch button — use
-ssh / launchctl from a shell to halt.
-
-## Daily / weekly maintenance
-
-| Cadence | What | How |
-|---|---|---|
-| Daily 06:30 (auto) | wx-curate writes fresh rules + restarts trader | (launchd) |
-| Weekly | Skim `latency-trader.stderr.log` for `rule fired` patterns | `grep "rule fired" log \| awk` |
-| Weekly | Verify Kalshi balance matches OMS realized P&L sum | `auth_smoke` + `oms-state.json` |
-| Monthly | Rotate the Kalshi key (good hygiene) | Kalshi dashboard → API → new key |
-| Monthly | Update Rust toolchain + re-build release binaries | `rustup update` + `cargo build --release` |
-
-## Adding a new daemon
-
-If you build a second strategy and want to run it under launchd:
-
-1. Build release binary: `cargo build --release -p <bin>`.
-2. Create plist at `deploy/macos/com.predigy.<name>.plist` (copy
-   `latency-trader.plist` as template).
-3. Add to `deploy/scripts/install-launchd.sh` preflight + install
-   loop.
-4. Run `./deploy/scripts/install-launchd.sh` to load it.
-
-Each daemon needs its own:
-- `--strategy-id` (cid prefix; must be unique per process)
-- `--cid-store` (separate file)
-- `--oms-state` (separate file)
-- Risk caps (separate `PREDIGY_*` env vars)
+The engine's log is structured `tracing` output; filter with grep
+on field names: `kill-switch:`, `oms:`, `venue_rest:`, `exec_data:`,
+`router:`, `discovery:`, `external_feeds:`, `cross-strategy:`.
