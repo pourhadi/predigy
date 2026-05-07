@@ -215,6 +215,14 @@ struct EnginePositionRow {
     age_secs: i64,
     realized_pnl_cents: i64,
     fees_paid_cents: i64,
+    /// **Audit I4** — current mark in cents. For a long YES,
+    /// the YES bid we'd unwind into; for a long NO, the
+    /// complement of the YES ask. `None` when the dashboard
+    /// hasn't fetched a `MarketDetail` for this ticker.
+    mark_cents: Option<i32>,
+    /// (mark - avg_entry) × |qty|, signed. `None` if mark is
+    /// missing.
+    unrealized_pnl_cents: Option<i64>,
 }
 
 /// Phase 6 — one recent exit fire (TP/SL/force-flat). Pulled
@@ -453,6 +461,13 @@ async fn build_snapshot(
         }
     }
 
+    // Mark map shared between the Kalshi-account positions table
+    // (PositionRow) and the engine-positions table
+    // (EnginePositionRow / I4 enrichment below). Built once,
+    // consulted by both consumers.
+    let mut mark_map: std::collections::HashMap<String, predigy_kalshi_rest::types::MarketDetail> =
+        std::collections::HashMap::new();
+
     match rest.positions().await {
         Ok(positions_resp) => {
             let active: Vec<MarketPosition> = positions_resp
@@ -469,13 +484,11 @@ async fn build_snapshot(
                 (p.ticker.clone(), detail.ok().map(|r| r.market))
             });
             let marks = futures_util::future::join_all(mark_futures).await;
-            let mark_map: std::collections::HashMap<
-                String,
-                predigy_kalshi_rest::types::MarketDetail,
-            > = marks
-                .into_iter()
-                .filter_map(|(t, d)| d.map(|d| (t, d)))
-                .collect();
+            for (t, d) in marks {
+                if let Some(detail) = d {
+                    mark_map.insert(t, detail);
+                }
+            }
             let mut total_unrealized: i64 = 0;
             let mut all_marked = true;
             let rows: Vec<PositionRow> = active
@@ -580,7 +593,50 @@ async fn build_snapshot(
     // than failing the whole snapshot.
     if let Some(pool) = db {
         match db_engine_positions(pool).await {
-            Ok(rows) => snap.engine_positions = rows,
+            Ok(mut rows) => {
+                // I4 — enrich each engine position with mark +
+                // unrealized PnL using the shared mark_map. For
+                // tickers not in the map (engine has a position
+                // but Kalshi-side hasn't been fetched), fetch
+                // their market_detail in parallel and add to
+                // the map.
+                let missing: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.ticker.clone())
+                    .filter(|t| !mark_map.contains_key(t))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                if !missing.is_empty() {
+                    let extras = futures_util::future::join_all(missing.iter().map(|t| async {
+                        let d = rest.market_detail(t).await;
+                        (t.clone(), d.ok().map(|r| r.market))
+                    }))
+                    .await;
+                    for (t, d) in extras {
+                        if let Some(detail) = d {
+                            mark_map.insert(t, detail);
+                        }
+                    }
+                }
+                for r in &mut rows {
+                    if let Some(detail) = mark_map.get(&r.ticker) {
+                        let mark = engine_position_mark(r, detail);
+                        if let Some(m) = mark {
+                            r.mark_cents = Some(m);
+                            // PnL per contract × |qty|; signed.
+                            let pnl_per = if r.current_qty > 0 {
+                                m - r.avg_entry_cents
+                            } else {
+                                r.avg_entry_cents - m
+                            };
+                            let abs_qty = i64::from(r.current_qty.unsigned_abs());
+                            r.unrealized_pnl_cents = Some(i64::from(pnl_per) * abs_qty);
+                        }
+                    }
+                }
+                snap.engine_positions = rows;
+            }
             Err(e) => {
                 warn!(error = %e, "refresh: engine_positions failed");
                 snap.last_refresh_error = Some(format!("engine_positions: {e}"));
@@ -596,6 +652,29 @@ async fn build_snapshot(
     }
 
     snap
+}
+
+/// I4 — compute the unwind mark for a single engine position
+/// from a Kalshi MarketDetail. For long YES we'd sell into the
+/// YES bid; for long NO we'd sell NO ≡ buy YES at ask, so the
+/// unwind price is `100 - yes_ask`. Symmetric on short side.
+fn engine_position_mark(
+    row: &EnginePositionRow,
+    detail: &predigy_kalshi_rest::types::MarketDetail,
+) -> Option<i32> {
+    let is_yes = row.side == "yes";
+    let is_long = row.current_qty > 0;
+    let cents = match (is_yes, is_long) {
+        (true, true) => detail.yes_bid_dollars.map(|v| (v * 100.0).round() as i32),
+        (true, false) => detail
+            .yes_ask_dollars
+            .map(|v| 100i32 - (v * 100.0).round() as i32),
+        (false, true) => detail
+            .yes_ask_dollars
+            .map(|v| 100i32 - (v * 100.0).round() as i32),
+        (false, false) => detail.yes_bid_dollars.map(|v| (v * 100.0).round() as i32),
+    };
+    cents.map(|c| c.clamp(0, 100))
 }
 
 fn has_activity(p: &MarketPosition) -> bool {
@@ -835,6 +914,10 @@ async fn db_engine_positions(pool: &sqlx::PgPool) -> Result<Vec<EnginePositionRo
             age_secs: (now - r.opened_at).num_seconds().max(0),
             realized_pnl_cents: r.realized_pnl_cents,
             fees_paid_cents: r.fees_paid_cents,
+            // I4: filled in by build_snapshot from the
+            // MarketDetail map shared with Kalshi-side positions.
+            mark_cents: None,
+            unrealized_pnl_cents: None,
         })
         .collect())
 }
