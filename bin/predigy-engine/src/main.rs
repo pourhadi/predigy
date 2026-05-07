@@ -49,6 +49,7 @@ use predigy_strategy_cross_arb::{CrossArbConfig, CrossArbStrategy};
 use predigy_strategy_latency::LatencyStrategy;
 use predigy_strategy_settlement::{SettlementConfig, SettlementStrategy};
 use predigy_strategy_stat::{StatConfig, StatStrategy};
+use predigy_strategy_wx_stat::{WxStatConfig, WxStatStrategy, rule_file_from_env as wx_stat_rule_file_from_env};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -452,6 +453,18 @@ async fn register_strategies(registry: &StrategyRegistry) {
             }))
             .await;
     }
+
+    // Wx-stat (S2): consumes the wx-stat-curator JSON output
+    // directly via mtime-poll. Skip if the file path env var is
+    // unset — the strategy has nothing to act on without it.
+    use predigy_strategy_wx_stat::STRATEGY_ID as WX_STAT_ID;
+    if let Some(path) = wx_stat_rule_file_from_env() {
+        registry
+            .register(StrategyHandle::new(WX_STAT_ID, move || {
+                Box::new(WxStatStrategy::new(WxStatConfig::from_env(path.clone()))) as Box<dyn Strategy>
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -463,6 +476,7 @@ fn strategy_factory(
     use predigy_strategy_latency::STRATEGY_ID as LATENCY_ID;
     use predigy_strategy_settlement::STRATEGY_ID as SETTLEMENT_ID;
     use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
+    use predigy_strategy_wx_stat::STRATEGY_ID as WX_STAT_ID;
     if id == STAT_ID {
         Box::new(|| Box::new(StatStrategy::new(StatConfig::from_env())) as Box<dyn Strategy>)
     } else if id == SETTLEMENT_ID {
@@ -476,6 +490,12 @@ fn strategy_factory(
     } else if id == CROSS_ARB_ID {
         Box::new(|| {
             Box::new(CrossArbStrategy::new(CrossArbConfig::from_env())) as Box<dyn Strategy>
+        })
+    } else if id == WX_STAT_ID {
+        let path = wx_stat_rule_file_from_env()
+            .expect("WX_STAT_ID registered without a rule-file path; engine startup invariant");
+        Box::new(move || {
+            Box::new(WxStatStrategy::new(WxStatConfig::from_env(path.clone()))) as Box<dyn Strategy>
         })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))

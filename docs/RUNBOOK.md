@@ -134,6 +134,22 @@ the 2026-05-07 cutover bug.)
    "PREDIGY_NWS_USER_AGENT not set — NWS-dependent strategies
    won't fire this run".
 
+### "Wx-stat isn't firing"
+
+1. `PREDIGY_WX_STAT_RULE_FILE` set in `~/.zprofile`? If unset,
+   the engine skips registering the strategy entirely (no log
+   noise but no fires either). Confirm with
+   `launchctl getenv PREDIGY_WX_STAT_RULE_FILE`.
+2. Curator output present? `ls -la $PREDIGY_WX_STAT_RULE_FILE`
+   and `jq length $PREDIGY_WX_STAT_RULE_FILE`.
+3. Curator running? `launchctl list | grep wx-stat-curate`.
+4. Engine reload happening? `grep "wx-stat: rules reloaded"
+   ~/Library/Logs/predigy/engine.stderr.log` should fire on each
+   curator output update.
+5. Any wx-stat positions opening? `psql -d predigy -c "SELECT
+   ticker, side, current_qty, avg_entry_cents FROM positions
+   WHERE strategy = 'wx-stat' AND current_qty != 0;"`
+
 ## Engine modes (Live ↔ Shadow)
 
 ```sh

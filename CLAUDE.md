@@ -19,8 +19,10 @@ before doing real work.
 
 **Live in production via consolidated `predigy-engine` binary.**
 
-- Engine cutover happened 07:45 UTC today. Four strategy modules
-  run in one process: `stat`, `settlement`, `latency`, `cross-arb`.
+- Engine cutover happened 07:45 UTC today. Five strategy modules
+  run in one process: `stat`, `settlement`, `latency`, `cross-arb`,
+  `wx-stat` (`wx-stat` registers only when
+  `PREDIGY_WX_STAT_RULE_FILE` points to a curator-output JSON).
 - Legacy per-strategy daemons (`*-trader`) booted out of launchd.
 - Engine in `EngineMode::Live` — submits real orders to Kalshi V2
   REST.

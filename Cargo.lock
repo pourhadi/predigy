@@ -1683,6 +1683,7 @@ dependencies = [
  "predigy-strategy-latency",
  "predigy-strategy-settlement",
  "predigy-strategy-stat",
+ "predigy-strategy-wx-stat",
  "serde",
  "serde_json",
  "sqlx",
@@ -1937,6 +1938,23 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-strategy-wx-stat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-book",
+ "predigy-core",
+ "predigy-engine-core",
+ "predigy-signals",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -6,13 +6,12 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, S1 all shipped (see commits 57a28fc
-> through this one). B1, B7 are operator-action items. B4 (FIX) +
-> B5 (maker rebates) + S7 (MM) + I1 (maker exec) gated on Kalshi
-> access or $25K capital. I7 (atomic multi-leg), S2, S3, S4, S5,
-> S6, S8, S9 still pending — each needs new infrastructure
-> (curator integration, new feed, price-history store) or coupled
-> to deferred I7.
+> A6, B2, B3, I2, I3, I4, I5, I6, S1, S2 all shipped (see commits
+> 57a28fc through this one). B1, B7 are operator-action items.
+> B4 (FIX) + B5 (maker rebates) + S7 (MM) + I1 (maker exec) gated
+> on Kalshi access or $25K capital. I7 (atomic multi-leg), S3, S4,
+> S5, S6, S8, S9 still pending — each needs new infrastructure
+> (new feed, price-history store) or coupled to deferred I7.
 
 ---
 
@@ -231,18 +230,40 @@ Settlement reverts (or Kalshi pulls quote): profit.
 Symmetric to current settlement; same discovery service, same
 data inputs. Pure code addition.
 
-### S2 — Pre-settlement weather decay (cost: M)
+### S2 — Pre-settlement weather decay (cost: M) **SHIPPED 2026-05-07**
 
-Weather markets have a known information schedule: NBM ensemble
-forecasts publish at fixed cadence. As the forecast horizon
-collapses, individual market quantile probabilities approach
-deterministic. If NBM at T-2 hours says "98% probability the high
-temp exceeds threshold" but Kalshi quotes 92¢, lift.
+New `predigy-strategy-wx-stat` crate (`STRATEGY_ID = "wx-stat"`)
+consumes `wx-stat-curator`'s `wx-stat-rules.json` directly via
+mtime-poll, bypassing the `rules` table round-trip. Same Kelly
+sizing + after-fee edge math as stat. Half-Kelly default since
+the curator's `model_p` is calibrated against historical NBM
+error (`wx-stat-fit-calibration`) — the calibration confidence
+warrants the larger sizing fraction.
 
-`wx-stat-curator` already produces this signal. Today it flows
-into stat as a rule. A dedicated `wx-stat` strategy module could
-fire faster (no rule-table round-trip; consume the curator output
-directly via cross-strategy bus or a dedicated event channel).
+Self-subscribes to curated markets via the A5 self-subscribe path
+(no static `subscribed_markets`). On every Tick the strategy
+mtime-polls the rule file; if the file changed, it parses and
+diffs and self-subscribes to newly-introduced tickers. The
+curator can rewrite the file at any time and the strategy picks
+up the change within `rule_refresh_interval` (default 30s).
+
+The schema mirrors `stat_trader::StatRule` exactly, so the
+curator's existing JSON output is consumed without modification.
+
+Operational:
+- `PREDIGY_WX_STAT_RULE_FILE` (path, required) — gates registration.
+- `PREDIGY_WX_STAT_BANKROLL_CENTS`, `_KELLY_FACTOR`, `_MAX_SIZE`,
+  `_COOLDOWN_MS`, `_RULE_REFRESH_MS` — tunables.
+- Independent `STRATEGY_ID` means positions, kill-switch, and
+  risk caps are tracked separately from `stat`. Operators can A/B
+  compare wx-stat vs stat alpha cleanly.
+
+7 unit tests cover edge calculation, cooldown, file-change
+diffing, and validation rejection (model_p outside [0.01, 0.99]).
+No active exits in v1 — weather markets resolve at venue
+settlement; the original entry thesis is by definition
+settlement-resolved. Layer in TP/SL only if empirical data later
+justifies it.
 
 ### S3 — Kalshi-internal sum-to-1 arb (cost: M)
 
