@@ -644,10 +644,18 @@ For each remaining strategy:
 - [ ] settlement-trader exits intentionally skipped — Kalshi
       auto-settles binary outcomes at $1/$0, so the strategy
       doesn't need an explicit close.
-- [ ] Cross-strategy data sharing (wx-stat's model_p drift
-      triggers stat-trader re-evaluation; cross-arb's Polymarket
-      view feeds stat-trader's belief). Requires a
-      cross-strategy event bus.
+- [x] **Cross-strategy event bus** (Phase 6.2 final, shipped
+      2026-05-07). `CrossStrategyEvent::{PolyMidUpdate,
+      ModelProbabilityUpdate}` + topic-based fan-out. Producers
+      call `state.publish_cross_strategy(...)` (non-blocking
+      try_send); consumers subscribe via
+      `Strategy::cross_strategy_subscriptions()` and receive
+      `Event::CrossStrategy { source, payload }`. The dispatcher
+      task in `bin/predigy-engine/src/cross_strategy_bus.rs`
+      routes by topic and self-filters (producer doesn't get its
+      own emission). Live wiring: cross-arb publishes poly-mid;
+      stat subscribes and currently log-only — augmenting stat's
+      belief with poly-mid is a future enhancement.
 
 ### Phase 7 — Retire scaffolding
 
