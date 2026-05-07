@@ -62,6 +62,10 @@ use predigy_strategy_book_imbalance::{
     ImbalanceConfig, ImbalanceStrategy,
     config_file_from_env as book_imbalance_config_from_env,
 };
+use predigy_strategy_variance_fade::{
+    VarianceFadeConfig, VarianceFadeStrategy,
+    config_file_from_env as variance_fade_config_from_env,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -515,6 +519,19 @@ async fn register_strategies(registry: &StrategyRegistry) {
             }))
             .await;
     }
+
+    // Variance-fade (S8): rolling-window vol-spike fade. Skip
+    // if the markets-config env var is unset.
+    use predigy_strategy_variance_fade::STRATEGY_ID as VAR_FADE_ID;
+    if let Some(path) = variance_fade_config_from_env() {
+        registry
+            .register(StrategyHandle::new(VAR_FADE_ID, move || {
+                Box::new(VarianceFadeStrategy::new(VarianceFadeConfig::from_env(
+                    path.clone(),
+                ))) as Box<dyn Strategy>
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -571,6 +588,15 @@ fn strategy_factory(
         );
         Box::new(move || {
             Box::new(ImbalanceStrategy::new(ImbalanceConfig::from_env(
+                path.clone(),
+            ))) as Box<dyn Strategy>
+        })
+    } else if id == predigy_strategy_variance_fade::STRATEGY_ID {
+        let path = variance_fade_config_from_env().expect(
+            "variance-fade registered without a config-file path; engine startup invariant",
+        );
+        Box::new(move || {
+            Box::new(VarianceFadeStrategy::new(VarianceFadeConfig::from_env(
                 path.clone(),
             ))) as Box<dyn Strategy>
         })

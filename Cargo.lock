@@ -1713,6 +1713,7 @@ dependencies = [
  "predigy-strategy-latency",
  "predigy-strategy-settlement",
  "predigy-strategy-stat",
+ "predigy-strategy-variance-fade",
  "predigy-strategy-wx-stat",
  "serde",
  "serde_json",
@@ -2018,6 +2019,22 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-strategy-variance-fade"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-book",
+ "predigy-core",
+ "predigy-engine-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

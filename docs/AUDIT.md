@@ -6,11 +6,13 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S4, S9 all
+> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S4, S8, S9 all
 > shipped (see commits 57a28fc through this one). B1, B7 are
 > operator-action items. B4 (FIX) + B5 (maker rebates) +
 > S7 (MM) + I1 (maker exec) gated on Kalshi access or $25K
-> capital. S5, S6, S8 still pending.
+> capital. S5 (news-classifier) and S6 (third-venue cross-arb)
+> remain — both need new external feeds and operator decisions
+> about API providers.
 
 ---
 
@@ -394,14 +396,59 @@ Phase 4 of the original plan. Passive quoting with rebate
 capture. Big infrastructure investment (queue model, order_state
 WS channel wired, dual-side state machine). Deferred until $25K.
 
-### S8 — Volatility / variance trading (cost: L)
+### S8 — Volatility / variance trading (cost: L) **SHIPPED 2026-05-07**
 
-Markets with high recent volatility (price moves >10¢/hour with
-no news) often revert. Strategy: detect rapid moves on stable-
-information markets, fade them.
+New `predigy-strategy-variance-fade`
+(`STRATEGY_ID="variance-fade"`) maintains a rolling window of
+mid-price observations per ticker and fades excessive moves on
+operator-declared "stable-information" markets.
 
-Adjacent but DIFFERENT from order-book mean-reversion — this is
-based on price history, not current book asymmetry.
+Mechanism:
+- Per-ticker `VecDeque<(at, yes_mid_cents)>` window (default
+  10 min); samples older than `window` evict on each tick.
+- Mid = `(yes_bid + (100 − no_bid)) / 2`. Falls back to the
+  single-side price when only one side has a touch.
+- On each `Event::BookUpdate`, compute the latest mid AND the
+  median of the window. When `|current − median| ≥
+  move_threshold_cents` (default 8¢) AND the window has at least
+  `min_observations` samples (default 30), the strategy fires a
+  fade IOC limit at the cheap-side ask:
+  - mid moved UP → YES has gotten expensive → buy NO
+  - mid moved DOWN → buy YES
+- Per-market move-threshold override + per-market cooldown
+  prevent over-firing on either tail.
+
+Distinct from S4 (book-imbalance): S4 uses *current touch
+asymmetry*; S8 uses *price history*. The two signals are
+independent and can run on the same universe simultaneously.
+
+Operational:
+- `PREDIGY_VARIANCE_FADE_CONFIG` (path) — required.
+- `_WINDOW_SECS`, `_MOVE_THRESHOLD_CENTS`, `_MIN_OBSERVATIONS`,
+  `_MIN_TAKE_ASK_CENTS`, `_MAX_TAKE_ASK_CENTS`, `_SIZE`,
+  `_COOLDOWN_MS`, `_REFRESH_MS` — tunables.
+
+Tests (8 unit, all passing):
+- fades upward move → buys NO at correct ask
+- fades downward move → buys YES at correct ask
+- skips small moves (below threshold)
+- skips when window is below min_observations
+- evicts samples older than the window (memory bounded)
+- cooldown blocks repeats within window
+- skips markets not in config
+- per-market threshold override applied at evaluate time
+
+What S8 v1 deliberately doesn't do:
+- **No news-suppression gate.** A real news event drives the
+  move and the strategy will fade incorrectly. The operator's
+  universe choice (information-stable markets) is the only
+  current safeguard. A future integration with the news-
+  classifier (S5) will gate on a "no high-impact news" signal.
+- **No active mark-aware exits.** The OMS's session-flatten +
+  kill-switch handle forced flats. Layered TP/SL is a follow-up.
+- **No book-depth weighting.** Touch-only. Adding bid-stack-vs-
+  ask-stack to the variance signal would be more robust but
+  changes the model materially — defer.
 
 ### S9 — Settlement-time multi-leg arb (cost: M) **SHIPPED 2026-05-07**
 

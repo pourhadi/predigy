@@ -22,6 +22,7 @@ members = [
     "crates/strategies/internal-arb",
     "crates/strategies/implication-arb",
     "crates/strategies/book-imbalance",
+    "crates/strategies/variance-fade",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -139,6 +140,7 @@ predigy-strategy-wx-stat = { path = "crates/strategies/wx-stat" }
 predigy-strategy-internal-arb = { path = "crates/strategies/internal-arb" }
 predigy-strategy-implication-arb = { path = "crates/strategies/implication-arb" }
 predigy-strategy-book-imbalance = { path = "crates/strategies/book-imbalance" }
+predigy-strategy-variance-fade = { path = "crates/strategies/variance-fade" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
 stat-trader = { path = "bin/stat-trader" }
