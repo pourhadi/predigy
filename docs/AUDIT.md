@@ -6,11 +6,11 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3 all shipped (see
-> commits 57a28fc through this one). B1, B7 are operator-action
-> items. B4 (FIX) + B5 (maker rebates) + S7 (MM) + I1 (maker exec)
-> gated on Kalshi access or $25K capital. S4, S5, S6, S8, S9
-> still pending. S3 just shipped and validates the I7 plumbing.
+> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2, S3, S9 all shipped
+> (see commits 57a28fc through this one). B1, B7 are
+> operator-action items. B4 (FIX) + B5 (maker rebates) +
+> S7 (MM) + I1 (maker exec) gated on Kalshi access or $25K
+> capital. S4, S5, S6, S8 still pending.
 
 ---
 
@@ -373,14 +373,57 @@ information markets, fade them.
 Adjacent but DIFFERENT from order-book mean-reversion — this is
 based on price history, not current book asymmetry.
 
-### S9 — Settlement-time multi-leg arb (cost: M)
+### S9 — Settlement-time multi-leg arb (cost: M) **SHIPPED 2026-05-07**
 
-For markets with multiple correlated legs settling simultaneously
-(e.g. "Yankees beat Red Sox" + "Yankees season > 90 wins"),
-the conditional probability constraint can produce arb when leg
-prices drift independently.
+New `predigy-strategy-implication-arb`
+(`STRATEGY_ID="implication-arb"`) handles the strict-implication
+case: when child YES ⊂ parent YES, prices must satisfy
+`P(child) ≤ P(parent)`. When the touch quotes drift such that
+`yes_bid_child − yes_ask_parent ≥ min_edge`, a two-leg trade
+locks in profit:
 
-Requires modeling the correlation structure per market family.
+- **Buy YES_parent at `yes_ask_parent`**
+- **Sell YES_child at `yes_bid_child`** (= **Buy NO_child at
+  `100 − yes_bid_child`**)
+
+Minimum-payoff scenario is "parent YES & child YES":
+parent settles to +$1, the child short pays out $1 → settlement
+nets $0; the cash leg yields `yes_bid_child − yes_ask_parent`
+up front. The child YES & parent NO scenario is impossible by
+the implication premise. Other scenarios add further profit.
+
+Mechanism:
+- JSON config: `[{ "parent": "KX-A", "child": "KX-B" }, ...]`.
+- Strategy subscribes to all referenced tickers; touches are
+  cached on each `Event::BookUpdate`.
+- On each book update, every pair this ticker is part of is
+  re-evaluated. When edge clears, a 2-leg `LegGroup` is queued
+  in `pending_groups`; the supervisor drains and routes through
+  `Oms::submit_group` for atomic persistence + cancellation
+  cascade (Audit I7).
+- Per-pair cooldown prevents re-firing while an open group is
+  still working at the venue.
+
+Operational:
+- `PREDIGY_IMPLICATION_ARB_CONFIG` (path) — required.
+- `PREDIGY_IMPLICATION_ARB_MIN_EDGE_CENTS` / `_SIZE` /
+  `_COOLDOWN_MS` / `_REFRESH_MS` — tunables.
+
+Tests (5 unit, all passing):
+- fires when child bid exceeds parent ask + edge
+- skips when child bid ≤ parent ask
+- skips when a leg has no book mark
+- cooldown blocks repeats
+- degenerate self-pair (parent == child) skipped at config load
+
+What S9 deliberately doesn't do:
+- **No general correlation modeling.** Markets that are merely
+  correlated (not strict-implication) like "Yankees beat Red Sox
+  today" + "Yankees > 90 wins" need a Bayesian constraint solver
+  — a follow-up, separate strategy.
+- **No auto-discovery.** Operator authors the pair list. A
+  future curator could detect implication pairs by parsing
+  Kalshi's event taxonomy.
 
 ---
 

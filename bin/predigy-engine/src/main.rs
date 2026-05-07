@@ -54,6 +54,10 @@ use predigy_strategy_internal_arb::{
     InternalArbConfig, InternalArbStrategy,
     config_file_from_env as internal_arb_config_from_env,
 };
+use predigy_strategy_implication_arb::{
+    ImplicationArbConfig, ImplicationArbStrategy,
+    config_file_from_env as implication_arb_config_from_env,
+};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -481,6 +485,19 @@ async fn register_strategies(registry: &StrategyRegistry) {
             }))
             .await;
     }
+
+    // Implication-arb (S9): two-leg implication-pair arbitrage
+    // (child ⊂ parent). Skip if the pair-config env var is unset.
+    use predigy_strategy_implication_arb::STRATEGY_ID as IMPL_ARB_ID;
+    if let Some(path) = implication_arb_config_from_env() {
+        registry
+            .register(StrategyHandle::new(IMPL_ARB_ID, move || {
+                Box::new(ImplicationArbStrategy::new(
+                    ImplicationArbConfig::from_env(path.clone()),
+                )) as Box<dyn Strategy>
+            }))
+            .await;
+    }
 }
 
 /// Per-strategy factory used by the supervisor for restart-on-
@@ -521,6 +538,15 @@ fn strategy_factory(
             Box::new(InternalArbStrategy::new(InternalArbConfig::from_env(
                 path.clone(),
             ))) as Box<dyn Strategy>
+        })
+    } else if id == predigy_strategy_implication_arb::STRATEGY_ID {
+        let path = implication_arb_config_from_env().expect(
+            "implication-arb registered without a config-file path; engine startup invariant",
+        );
+        Box::new(move || {
+            Box::new(ImplicationArbStrategy::new(
+                ImplicationArbConfig::from_env(path.clone()),
+            )) as Box<dyn Strategy>
         })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
