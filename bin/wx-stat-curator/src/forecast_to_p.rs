@@ -209,7 +209,11 @@ mod tests {
             ("2026-05-07T14:00:00-06:00", 78.0),
             ("2026-05-07T15:00:00-06:00", 76.0),
         ]);
-        let d = derive_model_p(&spec_high_gt(68.0, "2026-05-07"), &f, &ProbabilityConfig::default());
+        let d = derive_model_p(
+            &spec_high_gt(68.0, "2026-05-07"),
+            &f,
+            &ProbabilityConfig::default(),
+        );
         match d {
             ForecastDecision::Decisive {
                 model_p,
@@ -231,7 +235,11 @@ mod tests {
             ("2026-05-07T14:00:00-06:00", 58.0),
             ("2026-05-07T15:00:00-06:00", 60.0),
         ]);
-        let d = derive_model_p(&spec_high_gt(68.0, "2026-05-07"), &f, &ProbabilityConfig::default());
+        let d = derive_model_p(
+            &spec_high_gt(68.0, "2026-05-07"),
+            &f,
+            &ProbabilityConfig::default(),
+        );
         match d {
             ForecastDecision::Decisive { model_p, .. } => {
                 assert!((model_p - (1.0 - CONVICTION_P)).abs() < 1e-9);
@@ -244,7 +252,11 @@ mod tests {
     fn skip_when_inside_conviction_zone() {
         // Forecast 71F vs threshold 68F → margin only 3F. Skip.
         let f = forecast_with(&[("2026-05-07T14:00:00-06:00", 71.0)]);
-        let d = derive_model_p(&spec_high_gt(68.0, "2026-05-07"), &f, &ProbabilityConfig::default());
+        let d = derive_model_p(
+            &spec_high_gt(68.0, "2026-05-07"),
+            &f,
+            &ProbabilityConfig::default(),
+        );
         match d {
             ForecastDecision::Skip {
                 reason: SkipReason::InsideConvictionZone { .. },
@@ -256,7 +268,11 @@ mod tests {
     #[test]
     fn skip_when_no_hours_overlap_settlement_date() {
         let f = forecast_with(&[("2026-05-08T14:00:00-06:00", 90.0)]);
-        let d = derive_model_p(&spec_high_gt(68.0, "2026-05-07"), &f, &ProbabilityConfig::default());
+        let d = derive_model_p(
+            &spec_high_gt(68.0, "2026-05-07"),
+            &f,
+            &ProbabilityConfig::default(),
+        );
         assert_eq!(
             d,
             ForecastDecision::Skip {
@@ -290,7 +306,11 @@ mod tests {
     fn less_than_market_handles_direction_correctly() {
         // YES if observed < 60. Forecast tops out at 50 → favours YES.
         let f = forecast_with(&[("2026-05-07T14:00:00-06:00", 50.0)]);
-        let d = derive_model_p(&spec_high_lt(60.0, "2026-05-07"), &f, &ProbabilityConfig::default());
+        let d = derive_model_p(
+            &spec_high_lt(60.0, "2026-05-07"),
+            &f,
+            &ProbabilityConfig::default(),
+        );
         match d {
             ForecastDecision::Decisive { model_p, .. } => {
                 assert!((model_p - CONVICTION_P).abs() < 1e-9);

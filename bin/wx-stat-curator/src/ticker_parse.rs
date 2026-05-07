@@ -56,11 +56,10 @@ pub enum ParseError {
     UnsupportedStrikeType(String),
     #[error("missing required strike field for strike_type={0:?}")]
     MissingStrike(String),
-    #[error("can't derive settlement date from occurrence_datetime={odt:?} or event_ticker={evt:?}")]
-    NoSettlementDate {
-        odt: Option<String>,
-        evt: String,
-    },
+    #[error(
+        "can't derive settlement date from occurrence_datetime={odt:?} or event_ticker={evt:?}"
+    )]
+    NoSettlementDate { odt: Option<String>, evt: String },
 }
 
 /// Parse a Kalshi temperature market.
@@ -83,7 +82,8 @@ pub fn parse_temp_market(
         strike_type.ok_or_else(|| ParseError::UnsupportedStrikeType(String::new()))?;
     let kind = match strike_type {
         "greater" => {
-            let threshold = floor_strike.ok_or_else(|| ParseError::MissingStrike("greater".into()))?;
+            let threshold =
+                floor_strike.ok_or_else(|| ParseError::MissingStrike("greater".into()))?;
             TempStrikeKind::Greater { threshold }
         }
         "less" => {
@@ -104,12 +104,13 @@ pub fn parse_temp_market(
         other => return Err(ParseError::UnsupportedStrikeType(other.to_string())),
     };
 
-    let settlement_date = derive_settlement_date(occurrence_datetime, event_ticker).ok_or_else(
-        || ParseError::NoSettlementDate {
-            odt: occurrence_datetime.map(str::to_string),
-            evt: event_ticker.to_string(),
-        },
-    )?;
+    let settlement_date =
+        derive_settlement_date(occurrence_datetime, event_ticker).ok_or_else(|| {
+            ParseError::NoSettlementDate {
+                odt: occurrence_datetime.map(str::to_string),
+                evt: event_ticker.to_string(),
+            }
+        })?;
 
     Ok(TempMarketSpec {
         airport_code,
@@ -156,10 +157,7 @@ fn parse_event_ticker(event_ticker: &str) -> Option<(TempMeasurement, String)> {
 ///
 /// Preference order: `occurrence_datetime` (authoritative) →
 /// event-ticker date suffix `26MAY07` → fail.
-fn derive_settlement_date(
-    occurrence_datetime: Option<&str>,
-    event_ticker: &str,
-) -> Option<String> {
+fn derive_settlement_date(occurrence_datetime: Option<&str>, event_ticker: &str) -> Option<String> {
     if let Some(odt) = occurrence_datetime {
         // RFC3339, take the date part. `2026-05-07T14:00:00Z` →
         // `2026-05-07`. Naive — assumes the timezone offset is
@@ -281,14 +279,8 @@ mod tests {
 
     #[test]
     fn falls_back_to_event_ticker_date_when_odt_missing() {
-        let spec = parse_temp_market(
-            "KXHIGHDEN-26MAY07",
-            Some("greater"),
-            Some(68.0),
-            None,
-            None,
-        )
-        .unwrap();
+        let spec = parse_temp_market("KXHIGHDEN-26MAY07", Some("greater"), Some(68.0), None, None)
+            .unwrap();
         assert_eq!(spec.settlement_date, "2026-05-07");
     }
 
@@ -333,14 +325,8 @@ mod tests {
 
     #[test]
     fn rejects_unparseable_ticker_date_when_odt_missing() {
-        let err = parse_temp_market(
-            "KXHIGHDEN-FOOBAR",
-            Some("greater"),
-            Some(68.0),
-            None,
-            None,
-        )
-        .unwrap_err();
+        let err = parse_temp_market("KXHIGHDEN-FOOBAR", Some("greater"), Some(68.0), None, None)
+            .unwrap_err();
         matches!(err, ParseError::NoSettlementDate { .. });
     }
 

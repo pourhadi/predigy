@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- predigy-import: keep the Postgres DB in sync with the
+         legacy JSON state files written by the existing daemons.
+         Runs every 30 minutes during the migration (Phases 1-3).
+         Once each strategy ports to the engine, its DB writes
+         become live and predigy-import becomes a no-op for that
+         strategy. After all strategies port (Phase 5 done), this
+         job retires.
+
+         Idempotent: re-running over already-imported state
+         upserts (positions stay correct, intents bump
+         last_updated_at, rules refresh).
+    -->
+    <key>Label</key>
+    <string>com.predigy.import</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/predigy-import-run.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/predigy-import.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/predigy-import.stderr.log</string>
+</dict>
+</plist>

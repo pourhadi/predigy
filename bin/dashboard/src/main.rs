@@ -82,6 +82,12 @@ struct Args {
     /// use `0.0.0.0:8080` for LAN/Tailscale.
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: String,
+
+    /// Postgres connection string. Dashboard prefers DB-derived
+    /// state when available, falling back to JSON file reads
+    /// during the migration.
+    #[arg(long, env = "DATABASE_URL", default_value = "postgresql:///predigy")]
+    database_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +188,10 @@ struct EventRow {
 struct AppState {
     snapshot: Arc<RwLock<Snapshot>>,
     kill_flag: Arc<PathBuf>,
+    /// Optional Postgres pool. `None` if DB connection failed at
+    /// startup (dashboard still works against JSON-only). Logs
+    /// the degradation at WARN.
+    db: Option<sqlx::PgPool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,24 +236,52 @@ async fn main() -> Result<()> {
     .map_err(|e| anyhow!("rest: {e}"))?;
     let rest = Arc::new(rest);
 
+    // Postgres pool — degraded-mode tolerant. If the DB is down or
+    // the schema isn't migrated, we still serve the dashboard from
+    // JSON state files; the operator gets a WARN at startup and
+    // any DB-only fields render as "—".
+    let db = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(&args.database_url)
+        .await
+    {
+        Ok(p) => {
+            info!(url = %args.database_url, "dashboard: postgres connected");
+            Some(p)
+        }
+        Err(e) => {
+            warn!(error = %e, url = %args.database_url, "dashboard: postgres connect failed; falling back to JSON-only");
+            None
+        }
+    };
+
     let state = AppState {
         snapshot: Arc::new(RwLock::new(Snapshot::default())),
         kill_flag: Arc::new(kill_flag.clone()),
+        db: db.clone(),
     };
 
-    let initial = build_snapshot(&rest, &strategies, &kill_flag).await;
+    let initial = build_snapshot(&rest, &strategies, &kill_flag, db.as_ref()).await;
     *state.snapshot.write().await = initial;
 
     let refresh_state = state.clone();
     let refresh_rest = rest.clone();
     let refresh_strats = strategies.clone();
     let refresh_kill_flag = kill_flag.clone();
+    let refresh_db = db.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REFRESH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let snap = build_snapshot(&refresh_rest, &refresh_strats, &refresh_kill_flag).await;
+            let snap = build_snapshot(
+                &refresh_rest,
+                &refresh_strats,
+                &refresh_kill_flag,
+                refresh_db.as_ref(),
+            )
+            .await;
             *refresh_state.snapshot.write().await = snap;
         }
     });
@@ -282,7 +320,11 @@ async fn serve_kill(
 ) -> impl IntoResponse {
     let path = state.kill_flag.as_ref().clone();
     let body = if req.armed { "armed\n" } else { "" };
-    let result = (|| -> std::io::Result<()> {
+
+    // Write the file FIRST (legacy daemons watch it), then mirror
+    // to the DB scope='global' kill switch (engine watches DB).
+    // Both signals are belt-and-suspenders — either alone arms.
+    let file_result = (|| -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -290,7 +332,27 @@ async fn serve_kill(
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &path)
     })();
-    match result {
+
+    if let Some(pool) = state.db.as_ref() {
+        let db_result = sqlx::query(
+            "INSERT INTO kill_switches (scope, armed, set_at, set_by, reason)
+             VALUES ('global', $1, now(), 'dashboard', $2)
+             ON CONFLICT (scope) DO UPDATE
+             SET armed = EXCLUDED.armed,
+                 set_at = now(),
+                 set_by = 'dashboard',
+                 reason = EXCLUDED.reason",
+        )
+        .bind(req.armed)
+        .bind(if req.armed { "manual: dashboard arm" } else { "manual: dashboard clear" })
+        .execute(pool)
+        .await;
+        if let Err(e) = db_result {
+            warn!(error = %e, "kill switch DB write failed (file write still applied)");
+        }
+    }
+
+    match file_result {
         Ok(()) => {
             info!(armed = req.armed, path = %path.display(), "kill flag updated");
             Json(KillResponse {
@@ -314,6 +376,7 @@ async fn build_snapshot(
     rest: &RestClient,
     strategies: &[StrategySpec],
     kill_flag: &std::path::Path,
+    db: Option<&sqlx::PgPool>,
 ) -> Snapshot {
     let mut snap = Snapshot {
         refreshed_at: now_unix(),
@@ -396,29 +459,48 @@ async fn build_snapshot(
             log_age_secs: log_age_secs(&strat.log_file),
             oms_state_present: false,
         };
-        match read_oms_state(&strat.oms_state) {
-            Ok(Some(oms)) => {
-                row.oms_state_present = true;
-                row.oms_daily_realized_pnl_cents = oms
-                    .get("account")
-                    .and_then(|a| a.get("daily_realized_pnl_cents"))
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                row.oms_kill_switch = oms
-                    .get("account")
-                    .and_then(|a| a.get("kill_switch"))
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                row.oms_in_flight_orders = oms
-                    .get("orders")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, std::vec::Vec::len);
-            }
-            Ok(None) => { /* file not yet written */ }
-            Err(e) => {
-                snap.last_refresh_error = Some(format!("oms-state {}: {e}", strat.name));
+
+        // Phase 2 cutover: prefer DB-derived state. If the DB
+        // returned anything for this strategy at all we treat it
+        // as authoritative. Falls through to JSON on connection
+        // failure or empty result.
+        let mut db_used = false;
+        if let Some(pool) = db
+            && let Ok(state) = db_strategy_state(pool, &strat.name).await
+        {
+            row.oms_state_present = true;
+            row.oms_daily_realized_pnl_cents = state.daily_realized_pnl_cents;
+            row.oms_kill_switch = state.kill_switch_armed;
+            row.oms_in_flight_orders = state.in_flight_orders;
+            db_used = true;
+        }
+
+        if !db_used {
+            match read_oms_state(&strat.oms_state) {
+                Ok(Some(oms)) => {
+                    row.oms_state_present = true;
+                    row.oms_daily_realized_pnl_cents = oms
+                        .get("account")
+                        .and_then(|a| a.get("daily_realized_pnl_cents"))
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    row.oms_kill_switch = oms
+                        .get("account")
+                        .and_then(|a| a.get("kill_switch"))
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    row.oms_in_flight_orders = oms
+                        .get("orders")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, std::vec::Vec::len);
+                }
+                Ok(None) => { /* file not yet written */ }
+                Err(e) => {
+                    snap.last_refresh_error = Some(format!("oms-state {}: {e}", strat.name));
+                }
             }
         }
+
         total_pnl += row.oms_daily_realized_pnl_cents;
         any_kill = any_kill || row.oms_kill_switch;
         all_events.extend(parse_recent_events(&strat.name, &strat.log_file));
@@ -621,6 +703,62 @@ fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+}
+
+/// One-call snapshot of a strategy's live state from Postgres.
+/// Composes three queries (positions PnL, kill switches,
+/// in-flight intents) — all small, all indexed, all should land
+/// in well under 50ms total.
+#[derive(Debug, Default)]
+struct DbStrategyState {
+    daily_realized_pnl_cents: i64,
+    kill_switch_armed: bool,
+    in_flight_orders: usize,
+}
+
+async fn db_strategy_state(
+    pool: &sqlx::PgPool,
+    strategy: &str,
+) -> Result<DbStrategyState, sqlx::Error> {
+    // Today's realised PnL summed across positions that closed
+    // today. Excludes still-open positions (those count as
+    // unrealised).
+    let pnl: (Option<i64>,) = sqlx::query_as(
+        "SELECT SUM(realized_pnl_cents)::BIGINT
+           FROM positions
+          WHERE strategy = $1
+            AND closed_at >= date_trunc('day', now())",
+    )
+    .bind(strategy)
+    .fetch_one(pool)
+    .await?;
+    let daily_realized_pnl_cents = pnl.0.unwrap_or(0);
+
+    // Per-strategy kill switch OR global kill switch.
+    let killed: Option<(bool,)> = sqlx::query_as(
+        "SELECT armed FROM kill_switches
+          WHERE scope IN ('global', $1) AND armed = true LIMIT 1",
+    )
+    .bind(strategy)
+    .fetch_optional(pool)
+    .await?;
+    let kill_switch_armed = killed.is_some();
+
+    // Currently-open intents (any non-terminal status).
+    let in_flight: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM intents
+          WHERE strategy = $1
+            AND status NOT IN ('filled','cancelled','rejected','expired')",
+    )
+    .bind(strategy)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(DbStrategyState {
+        daily_realized_pnl_cents,
+        kill_switch_armed,
+        in_flight_orders: usize::try_from(in_flight.0).unwrap_or(0),
+    })
 }
 
 fn expand_tilde(p: &std::path::Path) -> PathBuf {

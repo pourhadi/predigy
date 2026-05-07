@@ -136,12 +136,7 @@ async fn fetch_index_returns_real_quantile_entries() {
 
     // Cross-check: the prob >299.817K (=80°F) threshold message
     // should also exist alongside the quantiles.
-    let prob80 = locate_threshold_message(
-        &idx,
-        "TMP",
-        "2 m above ground",
-        "prob >299.817",
-    );
+    let prob80 = locate_threshold_message(&idx, "TMP", "2 m above ground", "prob >299.817");
     assert!(
         prob80.is_some(),
         "TMP 2m prob>80F threshold message not found"
@@ -276,7 +271,10 @@ async fn extract_quantiles_for_multiple_airports_round_trip() {
     eprintln!("warm extract (cache hit): {warm_secs:.3}s");
     assert_eq!(qs2.len(), 3);
     // Cache hit should be <1s (just file reads).
-    assert!(warm_secs < 1.0, "warm extract took {warm_secs}s (cache miss?)");
+    assert!(
+        warm_secs < 1.0,
+        "warm extract took {warm_secs}s (cache miss?)"
+    );
 
     // CDF interpolation sanity: the median quantile (50%) should
     // map to ~0.5; a value below the 0% quantile to 0; above 100%

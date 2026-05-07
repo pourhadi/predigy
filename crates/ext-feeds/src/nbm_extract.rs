@@ -143,9 +143,7 @@ pub async fn extract_tmp_quantiles_at_points(
         n_points = points.len(),
         "nbm_extract: cache miss; pulling quantile fields"
     );
-    let idx = client
-        .fetch_index(cycle, fcst_hour, "co", "qmd")
-        .await?;
+    let idx = client.fetch_index(cycle, fcst_hour, "co", "qmd").await?;
     let quantiles = locate_quantile_messages(&idx, "TMP", "2 m above ground");
     if quantiles.len() != 21 {
         return Err(Error::Invalid(format!(
@@ -155,10 +153,7 @@ pub async fn extract_tmp_quantiles_at_points(
     }
 
     // Per-point accumulators of (snap_lat, snap_lon, dist_km, [21 vals]).
-    let mut accum: Vec<PointAccum> = points
-        .iter()
-        .map(|p| PointAccum::new(p.clone()))
-        .collect();
+    let mut accum: Vec<PointAccum> = points.iter().map(|p| PointAccum::new(p.clone())).collect();
 
     for (pct, range) in &quantiles {
         let temps = decode_quantile_for_points(client, cycle, fcst_hour, range, points).await?;
@@ -328,7 +323,12 @@ fn try_read_all(
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::Invalid(format!("cache read {}: {e}", path.display()))),
+            Err(e) => {
+                return Err(Error::Invalid(format!(
+                    "cache read {}: {e}",
+                    path.display()
+                )));
+            }
         }
     }
     Ok(Some(out))

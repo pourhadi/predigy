@@ -45,10 +45,7 @@ impl NbmField {
     ///
     /// Panics if the field is empty.
     pub fn sample_nearest(&self, lat: f64, lon: f64) -> (f32, usize, f64) {
-        assert!(
-            !self.values.is_empty(),
-            "sample_nearest on empty NbmField"
-        );
+        assert!(!self.values.is_empty(), "sample_nearest on empty NbmField");
         let target_lon = normalize_lon(lon);
         let mut best_i = 0usize;
         let mut best_d2 = f64::MAX;
@@ -162,8 +159,7 @@ fn approx_distance_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let phi2 = lat2 * to_rad;
     let dphi = (lat2 - lat1) * to_rad;
     let dl = (lon2 - lon1) * to_rad;
-    let a = (dphi / 2.0).sin().powi(2)
-        + phi1.cos() * phi2.cos() * (dl / 2.0).sin().powi(2);
+    let a = (dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dl / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().asin();
     r_km * c
 }

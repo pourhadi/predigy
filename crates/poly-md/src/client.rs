@@ -289,9 +289,7 @@ where
     // When Some(d), we tick every `d` and push a "PING" text frame.
     // Polymarket's documented response is "PONG", which
     // `handle_text` recognises and drops without parsing.
-    let ping_period = ctx
-        .text_ping_interval
-        .unwrap_or(Duration::from_hours(168));
+    let ping_period = ctx.text_ping_interval.unwrap_or(Duration::from_hours(168));
     let mut ping_tick = tokio::time::interval(ping_period);
     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so we don't double-send a PING

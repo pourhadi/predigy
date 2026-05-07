@@ -211,15 +211,7 @@ mod tests {
 
     #[test]
     fn build_drops_railroaded() {
-        let m = ms(
-            "X",
-            "X",
-            "edge",
-            0.99,
-            0.98,
-            Some(50.0),
-            Some("greater"),
-        );
+        let m = ms("X", "X", "edge", 0.99, 0.98, Some(50.0), Some("greater"));
         let tm = build(m, "X");
         assert!(!tm.is_actionable());
     }
