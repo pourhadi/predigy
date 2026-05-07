@@ -43,7 +43,7 @@ PHASE="${PREDIGY_WX_STAT_PHASE:-2}"
 echo "[$(date -Iseconds)] wx-stat-curate: tick (phase=${PHASE})"
 
 if [[ "$PHASE" == "2" ]]; then
-    exec "./target/release/wx-stat-curator" \
+    "./target/release/wx-stat-curator" \
         --kalshi-key-id      "$KALSHI_KEY_ID" \
         --kalshi-pem         "$KALSHI_PEM" \
         --user-agent         "$NWS_USER_AGENT" \
@@ -53,14 +53,16 @@ if [[ "$PHASE" == "2" ]]; then
         --nbm-cache          "${DATA_DIR}/nbm_cache" \
         --nbm-predictions-dir "${DATA_DIR}/wx_stat_predictions" \
         --nbm-calibration    "${DATA_DIR}/wx_stat_calibration.json" \
-        --write
+        --write \
+        --restart-job        "com.predigy.stat-trader"
 else
-    exec "./target/release/wx-stat-curator" \
+    "./target/release/wx-stat-curator" \
         --kalshi-key-id  "$KALSHI_KEY_ID" \
         --kalshi-pem     "$KALSHI_PEM" \
         --user-agent     "$NWS_USER_AGENT" \
         --output         "${CONFIG_DIR}/wx-stat-rules.json" \
         --min-edge-cents "${PREDIGY_WX_STAT_MIN_EDGE_CENTS:-5}" \
         --min-margin-f   "${PREDIGY_WX_STAT_MIN_MARGIN_F:-5}" \
-        --write
+        --write \
+        --restart-job    "com.predigy.stat-trader"
 fi

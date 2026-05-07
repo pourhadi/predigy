@@ -44,9 +44,14 @@ struct Args {
     #[arg(long)]
     kalshi_ws_endpoint: Option<Url>,
 
-    /// JSON file containing an array of `StatRule`s.
-    #[arg(long)]
-    rule_file: PathBuf,
+    /// JSON file(s) containing arrays of `StatRule`s. Repeat the
+    /// flag to merge multiple sources (e.g. one for LLM-curated
+    /// rules, one for forecast-driven rules). On duplicate market
+    /// tickers, the rule from the later file wins; that lets a
+    /// freshly-fit forecast file override a stale stat-rules.json
+    /// entry without operator hand-merging.
+    #[arg(long, required = true, num_args = 1..)]
+    rule_file: Vec<PathBuf>,
 
     /// Bankroll for Kelly sizing, in cents.
     #[arg(long, default_value_t = 50_000)]
@@ -101,14 +106,41 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("read PEM at {}", args.kalshi_pem.display()))?;
 
-    let rules: Vec<StatRule> = {
-        let raw = tokio::fs::read(&args.rule_file)
-            .await
-            .with_context(|| format!("read rules at {}", args.rule_file.display()))?;
-        serde_json::from_slice(&raw).context("parse rule file")?
-    };
+    // Merge rules from every --rule-file. Later files override
+    // earlier ones on duplicate market ticker. Missing files are
+    // treated as empty (warn + continue) so the trader can keep
+    // running on the rules it has when one of the curators is
+    // mid-write or hasn't run yet.
+    let mut by_ticker: std::collections::HashMap<String, StatRule> =
+        std::collections::HashMap::new();
+    let mut total_loaded = 0usize;
+    for path in &args.rule_file {
+        let raw = match tokio::fs::read(path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %path.display(), "rule file missing; skipping");
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("read rules at {}", path.display()));
+            }
+        };
+        let parsed: Vec<StatRule> = serde_json::from_slice(&raw)
+            .with_context(|| format!("parse rule file {}", path.display()))?;
+        let n = parsed.len();
+        for r in parsed {
+            by_ticker.insert(r.kalshi_market.as_str().to_string(), r);
+        }
+        tracing::info!(path = %path.display(), n, "stat-trader: loaded rule file");
+        total_loaded += n;
+    }
+    let rules: Vec<StatRule> = by_ticker.into_values().collect();
     if rules.is_empty() {
-        return Err(anyhow!("rule file is empty"));
+        return Err(anyhow!(
+            "no rules loaded from any of {:?} (total parsed: {total_loaded})",
+            args.rule_file
+        ));
     }
 
     let mut strategy = StatStrategy::new(

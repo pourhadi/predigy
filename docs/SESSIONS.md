@@ -246,16 +246,19 @@ candidate: `KXLOWTOKC-26MAY07-T43` (>43F low) — NWS forecast 53F low
   `data/wx_stat_predictions/<UTC-date>.jsonl` for the calibration
   fitter (`wx-stat-fit-calibration`) to consume later.
 
-**To promote rules to live trading:** wx-stat-rules.json is NOT
-yet read by stat-trader. To put weight on these rules, copy the
-ones you trust into `~/.config/predigy/stat-rules.json` and let
-stat-trader pick them up on its own poll cadence. The deliberate
-two-file split keeps the LLM-curated stat rules and the
-forecast-derived wx-stat rules from racing.
+**Rules go straight into live trading.** As of 2026-05-07,
+stat-trader takes `--rule-file` repeatedly and merges all of them
+at startup; the launcher passes both `stat-rules.json` (LLM-
+curated) and `wx-stat-rules.json` (NBM-derived). Duplicate-ticker
+collisions resolve last-file-wins so a fresh forecast-derived
+rule overrides a stale LLM-curated one without manual hand-merge.
+After every wx-stat-curate run, the wrapper kickstarts the
+stat-trader launchd job so live trading picks up fresh rules
+within seconds of the cycle completing.
 
-**To inspect proposed rules**: run the curator without `--write`
-and the stderr output now includes a sorted table of every
-proposed rule, biggest apparent edge first:
+**To inspect proposed rules without committing them live**: run
+the curator without `--write` and the stderr output includes a
+sorted table of every proposed rule, biggest apparent edge first:
 
 ```
 inspection (sorted by apparent edge desc):

@@ -26,11 +26,13 @@ export KALSHI_KEY_ID KALSHI_PEM
 
 cd "$PREDIGY_HOME"
 
-# Refuse to start if no rules file exists — running without rules
-# would just busy-loop.  The stat-curator writes this file after
-# its first successful run.
-if [ ! -s "${CONFIG_DIR}/stat-rules.json" ] || [ "$(cat "${CONFIG_DIR}/stat-rules.json")" = "[]" ]; then
-    echo "[$(date -Iseconds)] stat-trader: no rules in ${CONFIG_DIR}/stat-rules.json — exiting"
+# Refuse to start if NO rule files have content — busy-loop guard.
+# We accept rules from any combination of stat-rules.json (LLM-
+# curated) + wx-stat-rules.json (NBM-derived weather rules); the
+# stat-trader merges them at startup.
+if { [ ! -s "${CONFIG_DIR}/stat-rules.json" ]    || [ "$(cat "${CONFIG_DIR}/stat-rules.json" 2>/dev/null)" = "[]" ]; } \
+&& { [ ! -s "${CONFIG_DIR}/wx-stat-rules.json" ] || [ "$(cat "${CONFIG_DIR}/wx-stat-rules.json" 2>/dev/null)" = "[]" ]; }; then
+    echo "[$(date -Iseconds)] stat-trader: no rules in stat-rules.json or wx-stat-rules.json — exiting"
     exit 1
 fi
 
@@ -38,6 +40,7 @@ exec "./target/release/stat-trader" \
     --kalshi-key-id "$KALSHI_KEY_ID" \
     --kalshi-pem    "$KALSHI_PEM" \
     --rule-file     "${CONFIG_DIR}/stat-rules.json" \
+    --rule-file     "${CONFIG_DIR}/wx-stat-rules.json" \
     --strategy-id   "stat" \
     --bankroll-cents "${PREDIGY_STAT_BANKROLL_CENTS:-500}" \
     --kelly-factor  "${PREDIGY_STAT_KELLY_FACTOR:-0.25}" \
