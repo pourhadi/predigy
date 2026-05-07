@@ -83,6 +83,21 @@ pub struct StatConfig {
     /// ratchets up — never down. `0` for either disables.
     pub trailing_trigger_cents: i32,
     pub trailing_distance_cents: i32,
+    /// **Audit I3 — cross-strategy belief augmentation**:
+    /// when cross-arb publishes a `PolyMidUpdate` for a Kalshi
+    /// market that's also in stat's rule set, blend the poly
+    /// mid into the effective probability for the entry edge
+    /// calculation:
+    ///   effective_p = α × rule.model_p + (1 − α) × poly_mid_yes
+    ///
+    /// `1.0` = pure rule (no blend, behavior unchanged from
+    /// pre-I3); `0.0` = pure poly (all weight on cross-venue
+    /// reference); default `0.85` (slight tilt toward poly when
+    /// available; rule still dominates).
+    ///
+    /// When no poly mid is available for a ticker, the rule's
+    /// `model_p` is used unchanged (regardless of α).
+    pub poly_mid_blend_alpha: f64,
 }
 
 impl StatConfig {
@@ -154,6 +169,11 @@ impl StatConfig {
                 c.trailing_distance_cents = n;
             }
         }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_POLY_MID_BLEND_ALPHA") {
+            if let Ok(n) = v.parse::<f64>() {
+                c.poly_mid_blend_alpha = n.clamp(0.0, 1.0);
+            }
+        }
         c
     }
 }
@@ -185,6 +205,10 @@ impl Default for StatConfig {
             // floor.
             trailing_trigger_cents: 4,
             trailing_distance_cents: 3,
+            // I3: 0.85 — moderately tilt toward poly when
+            // available; rule still dominates. Set to 1.0 to
+            // turn the blend off entirely.
+            poly_mid_blend_alpha: 0.85,
         }
     }
 }
@@ -229,6 +253,12 @@ pub struct StatStrategy {
     /// position closes (refresh_positions retains only entries
     /// whose key is in the current cache).
     high_water_pnl: HashMap<String, i32>,
+    /// I3 — latest Polymarket YES mid (cents 1..=99) per Kalshi
+    /// ticker. Populated by Event::CrossStrategy(PolyMidUpdate)
+    /// from cross-arb. Used by the entry edge calculation in
+    /// `evaluate` to blend the poly reference into the rule's
+    /// model_p (per `config.poly_mid_blend_alpha`).
+    poly_mid_cents: HashMap<String, u8>,
     last_rule_refresh: Option<Instant>,
     last_position_refresh: Option<Instant>,
 }
@@ -242,6 +272,7 @@ impl StatStrategy {
             last_fire_at: HashMap::new(),
             last_exit_at: HashMap::new(),
             high_water_pnl: HashMap::new(),
+            poly_mid_cents: HashMap::new(),
             last_rule_refresh: None,
             last_position_refresh: None,
         }
@@ -292,7 +323,31 @@ impl StatStrategy {
             return None;
         }
         let (ask_cents, available_qty) = derive_ask(book, rule.side)?;
-        let intent = build_intent(market, rule, &self.config, ask_cents, available_qty)?;
+        // I3 — blend the poly mid into the rule's model_p when
+        // both are available. The rule remains the primary signal
+        // (alpha defaults 0.85); poly nudges the belief toward
+        // the cross-venue reference. Skip when no poly mid is
+        // cached — the rule alone drives.
+        let blended_rule = match self.poly_mid_cents.get(&key).copied() {
+            Some(poly_yes_cents) if self.config.poly_mid_blend_alpha < 1.0 => {
+                let alpha = self.config.poly_mid_blend_alpha;
+                let poly_p = f64::from(poly_yes_cents) / 100.0;
+                let blended_p = alpha * rule.model_p + (1.0 - alpha) * poly_p;
+                CachedRule {
+                    side: rule.side,
+                    model_p: blended_p.clamp(0.0, 1.0),
+                    min_edge_cents: rule.min_edge_cents,
+                }
+            }
+            _ => rule.clone(),
+        };
+        let intent = build_intent(
+            market,
+            &blended_rule,
+            &self.config,
+            ask_cents,
+            available_qty,
+        )?;
         self.last_fire_at.insert(key, now);
         Some(intent)
     }
@@ -605,20 +660,30 @@ impl Strategy for StatStrategy {
                 Ok(Vec::new())
             }
             Event::CrossStrategy { source, payload } => {
-                // Phase 6 — receive-side hook. No behavior
-                // change yet (just observability); a follow-up
-                // commit will augment belief from poly-mid /
-                // model_p signals.
+                // I3 — receive cross-arb's poly-mid updates and
+                // store them by Kalshi ticker. The entry edge
+                // calculation in `evaluate` blends the cached
+                // mid into the rule's model_p (see
+                // `config.poly_mid_blend_alpha`).
+                //
+                // ModelProbabilityUpdate is logged-only for now;
+                // future curators may publish here, in which
+                // case stat would short-circuit the rule-poll
+                // loop.
                 match payload {
                     CrossStrategyEvent::PolyMidUpdate {
                         kalshi_ticker,
                         poly_mid_cents,
-                    } => debug!(
-                        source = source.0,
-                        ticker = %kalshi_ticker,
-                        poly_mid_cents,
-                        "stat: poly-mid update received"
-                    ),
+                    } => {
+                        debug!(
+                            source = source.0,
+                            ticker = %kalshi_ticker,
+                            poly_mid_cents,
+                            "stat: poly-mid update received"
+                        );
+                        self.poly_mid_cents
+                            .insert(kalshi_ticker.as_str().to_string(), *poly_mid_cents);
+                    }
                     CrossStrategyEvent::ModelProbabilityUpdate {
                         ticker,
                         source: prov,
@@ -776,14 +841,17 @@ mod tests {
             // them deterministically: take 8¢, stop 5¢.
             take_profit_cents: 8,
             stop_loss_cents: 5,
-            // A1 + A4 + A3 disabled by default in tests so
+            // A1 + A4 + A3 + I3 disabled by default in tests so
             // existing tests keep their behavior. Tests that
             // exercise belief-drift / time-decay / trailing-stop
-            // set them explicitly.
+            // / poly-blend set them explicitly.
             min_residual_edge_cents: 0,
             tp_decay_per_hour_cents: 0,
             trailing_trigger_cents: 0,
             trailing_distance_cents: 0,
+            // alpha=1.0 means pure rule (no blend); existing
+            // tests don't exercise the blend.
+            poly_mid_blend_alpha: 1.0,
         }
     }
 
@@ -1337,5 +1405,84 @@ mod tests {
         let next: HashMap<String, CachedPosition> = HashMap::new();
         s.high_water_pnl.retain(|k, _| next.contains_key(k));
         assert!(s.high_water_pnl.is_empty());
+    }
+
+    // ─── I3 cross-strategy belief augmentation tests ─────────
+
+    #[test]
+    fn poly_blend_lifts_belief_when_poly_higher() {
+        // Rule says model_p=0.55. Poly says 95¢. With α=0.3
+        // blended_p = 0.3*0.55 + 0.7*0.95 = 0.83. At ask=70¢,
+        // raw edge = 13¢, after fee ≈ 11¢ — clears min_edge=5.
+        // Without the blend, edge would be only 55-70 = -15 (no
+        // fire).
+        let mut c = cfg();
+        c.poly_mid_blend_alpha = 0.3;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-BLEND-A";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.55, Side::Yes, 5));
+        s.poly_mid_cents.insert(ticker.into(), 95);
+        // YES ask = 100 - 30 = 70. Stack large.
+        let book = book_with_quotes(None, Some(30));
+        let intent = s
+            .evaluate(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("blended fire");
+        assert_eq!(intent.price_cents, Some(70));
+    }
+
+    #[test]
+    fn poly_blend_drops_fire_when_poly_lower_than_rule() {
+        // Rule says model_p=0.85 (would fire). Poly says 50¢.
+        // With α=0.5, blended_p = 0.675. At ask=70¢, edge after
+        // blend is -2.5 — no fire. Without blend: 0.85 vs 0.70 =
+        // would fire.
+        let mut c = cfg();
+        c.poly_mid_blend_alpha = 0.5;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-BLEND-B";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.85, Side::Yes, 5));
+        s.poly_mid_cents.insert(ticker.into(), 50);
+        let book = book_with_quotes(None, Some(30));
+        assert!(
+            s.evaluate(&MarketTicker::new(ticker), &book, Instant::now())
+                .is_none(),
+            "poly disagreement should kill the entry"
+        );
+    }
+
+    #[test]
+    fn poly_blend_falls_through_to_rule_when_no_poly_cached() {
+        // No poly_mid_cents entry → behave as if α=1.0 (pure
+        // rule). High-conviction rule should fire normally.
+        let mut c = cfg();
+        c.poly_mid_blend_alpha = 0.0; // would zero out rule if poly were present
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-BLEND-C";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.85, Side::Yes, 5));
+        let book = book_with_quotes(None, Some(30));
+        let intent = s.evaluate(&MarketTicker::new(ticker), &book, Instant::now());
+        assert!(
+            intent.is_some(),
+            "no poly mid cached → fall through to pure rule"
+        );
+    }
+
+    #[test]
+    fn poly_blend_pure_rule_when_alpha_one() {
+        // α=1.0 → blend is a no-op even if poly mid is cached.
+        let mut c = cfg();
+        c.poly_mid_blend_alpha = 1.0;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-BLEND-D";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.85, Side::Yes, 5));
+        // Poly says ~zero — would normally trash the edge.
+        s.poly_mid_cents.insert(ticker.into(), 5);
+        let book = book_with_quotes(None, Some(30));
+        let intent = s.evaluate(&MarketTicker::new(ticker), &book, Instant::now());
+        assert!(intent.is_some(), "α=1 ignores poly entirely");
     }
 }
