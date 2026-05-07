@@ -1873,6 +1873,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-strategy-stat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "predigy-book",
+ "predigy-core",
+ "predigy-engine-core",
+ "predigy-signals",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

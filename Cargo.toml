@@ -14,6 +14,7 @@ members = [
     "crates/ext-feeds",
     "crates/signals",
     "crates/engine-core",
+    "crates/strategies/stat",
     "bin/md-recorder",
     "bin/arb-trader",
     "bin/sim-runner",
@@ -121,6 +122,7 @@ predigy-ext-feeds = { path = "crates/ext-feeds" }
 predigy-signals = { path = "crates/signals" }
 predigy-kalshi-fix = { path = "crates/kalshi-fix" }
 predigy-engine-core = { path = "crates/engine-core" }
+predigy-strategy-stat = { path = "crates/strategies/stat" }
 md-recorder = { path = "bin/md-recorder" }
 latency-trader = { path = "bin/latency-trader" }
 stat-trader = { path = "bin/stat-trader" }
