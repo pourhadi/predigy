@@ -149,21 +149,27 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 5. **Book-imbalance remains halted.** The 2026-05-07 live audit found it buying
    both YES and NO on `KXVOTEHUBTRUMPUPDOWN-26MAY07`, plus insufficient-balance
    rejects. NO-side WS fills and NO-side mark accounting were fixed in the
-   engine after the audit, but existing book-imbalance behavior still needs a
-   strategy-level same-market churn fix before disarming its DB kill switch.
-6. **Weather stat/wx-stat are intentionally resumed, but keep watching.** The
+   engine after the audit, and the pre-fix NO ledger rows were repaired in
+   Postgres. Corrected mark is about `-30c`, not the pre-repair `-700c`, but
+   the strategy still fee-churned both sides of one market; keep its DB kill
+   switch armed until the same-market churn bug is fixed.
+6. **Implication-arb needs closer observation.** The same NO-accounting repair
+   changed corrected marked PnL from apparently positive to about `-130c` across
+   40 open contracts. It is not halted yet, but don't treat it as proven edge
+   until the open package is reconciled against settlement/marks.
+7. **Weather stat/wx-stat are intentionally resumed, but keep watching.** The
    wx-stat rule file was regenerated through the observed-extreme gate and
    corrected NBM aggregation. `predigy-import` no longer imports
    `wx-stat-rules.json` as `stat`, and the latest DB refresh disabled all
    legacy enabled rows from that source; `KXHIGHTSFO-26MAY07-T62` is disabled.
    `KXHIGHTPHX-26MAY08-T98` was corrected from YES 0.98 to NO 0.066, and the
    bad 14-contract YES exposure was sold at 3c.
-7. **Latency remains halted.** Fix stale NWS alert replay/freshness before
+8. **Latency remains halted.** Fix stale NWS alert replay/freshness before
    disarming its DB kill switch.
-8. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
+9. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
    Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
    do not prioritize FIX above the safety blockers.
-9. **Phase 7 — retire legacy daemons** completely (delete
+10. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.
