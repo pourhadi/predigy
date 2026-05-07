@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use predigy_book::OrderBook;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
+use predigy_engine_core::cross_strategy::{CrossStrategyEvent, topic};
 use predigy_engine_core::events::Event;
 use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
 use predigy_engine_core::state::StrategyState;
@@ -343,6 +344,16 @@ impl Strategy for StatStrategy {
         STRATEGY_ID
     }
 
+    fn cross_strategy_subscriptions(&self) -> Vec<&'static str> {
+        // Phase 6 — receive cross-arb's poly-mid updates for
+        // any Kalshi market in cross-arb's pair set. The signal
+        // doesn't change behavior yet; the receive side just
+        // logs each update at debug. A future commit will
+        // augment stat's belief by blending poly-mid into the
+        // existing model_p.
+        vec![topic::POLY_MID, topic::MODEL_PROBABILITY]
+    }
+
     async fn subscribed_markets(
         &self,
         state: &StrategyState,
@@ -401,10 +412,40 @@ impl Strategy for StatStrategy {
                 // refreshed above. No intents from a bare tick.
                 Ok(Vec::new())
             }
-            Event::External(_)
-            | Event::DiscoveryDelta { .. }
-            | Event::PairUpdate { .. }
-            | Event::CrossStrategy { .. } => Ok(Vec::new()),
+            Event::CrossStrategy { source, payload } => {
+                // Phase 6 — receive-side hook. No behavior
+                // change yet (just observability); a follow-up
+                // commit will augment belief from poly-mid /
+                // model_p signals.
+                match payload {
+                    CrossStrategyEvent::PolyMidUpdate {
+                        kalshi_ticker,
+                        poly_mid_cents,
+                    } => debug!(
+                        source = source.0,
+                        ticker = %kalshi_ticker,
+                        poly_mid_cents,
+                        "stat: poly-mid update received"
+                    ),
+                    CrossStrategyEvent::ModelProbabilityUpdate {
+                        ticker,
+                        source: prov,
+                        raw_p,
+                        model_p,
+                    } => debug!(
+                        source = source.0,
+                        ticker = %ticker,
+                        provenance = %prov,
+                        raw_p,
+                        model_p,
+                        "stat: model_p update received"
+                    ),
+                }
+                Ok(Vec::new())
+            }
+            Event::External(_) | Event::DiscoveryDelta { .. } | Event::PairUpdate { .. } => {
+                Ok(Vec::new())
+            }
         }
     }
 

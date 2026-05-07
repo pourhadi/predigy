@@ -56,6 +56,7 @@ use async_trait::async_trait;
 use predigy_book::OrderBook;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
+use predigy_engine_core::cross_strategy::CrossStrategyEvent;
 use predigy_engine_core::events::{Event, ExternalEvent, KalshiPolyPair};
 use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
 use predigy_engine_core::state::StrategyState;
@@ -463,6 +464,28 @@ impl Strategy for CrossArbStrategy {
                 best_ask,
             }) => {
                 self.update_poly(asset_id, *best_bid, *best_ask);
+                // Phase 6 — fan poly-mid changes to any
+                // subscribed strategy (e.g. stat-trader using
+                // it as a belief signal). One emit per Kalshi
+                // ticker mapped to this asset_id; the bus
+                // routes to subscribers and skips us as the
+                // producer. Skipped if mid is unavailable
+                // (one-sided book during a transient gap) or
+                // outside [1, 99] cents.
+                if let Some(poly_ref) = self.poly_ref.get(asset_id)
+                    && let Some(mid) = poly_ref.mid()
+                    && (0.01..=0.99).contains(&mid)
+                {
+                    let poly_mid_cents = (mid * 100.0).round().clamp(1.0, 99.0) as u8;
+                    for (kalshi, mapped) in &self.market_map {
+                        if mapped == asset_id {
+                            state.publish_cross_strategy(CrossStrategyEvent::PolyMidUpdate {
+                                kalshi_ticker: kalshi.clone(),
+                                poly_mid_cents,
+                            });
+                        }
+                    }
+                }
                 Ok(Vec::new())
             }
             Event::PairUpdate { added, removed } => {
