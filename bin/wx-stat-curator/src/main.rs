@@ -23,13 +23,17 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
+use predigy_ext_feeds::nbm::NbmClient;
 use predigy_ext_feeds::nws_forecast::NwsForecastClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use stat_trader::StatRule;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use wx_stat_curator::nbm_curate::{NbmCurateOutcome, curate_via_nbm};
+use wx_stat_curator::nbm_path::recent_qmd_cycle;
 use wx_stat_curator::{
     Airport, ForecastDecision, ProbabilityConfig, TempMarket, TempStrikeKind, lookup_airport,
     parse_temp_market, scan_temp_markets,
@@ -79,6 +83,21 @@ struct Args {
     /// Restart the named launchd job after a successful write.
     #[arg(long)]
     restart_job: Option<String>,
+
+    /// Use the NBM probabilistic forecast (Phase 2) instead of the
+    /// NWS hourly point forecast (Phase 1). NBM gives a calibrated
+    /// CDF interpolation at the Kalshi threshold rather than the
+    /// blunt 0.97/0.03 conviction-zone label. Default off until
+    /// the user has validated NBM-side results against historical
+    /// market outcomes.
+    #[arg(long, default_value_t = false)]
+    nbm: bool,
+
+    /// Cache root for NBM-extracted per-airport quantile vectors.
+    /// Cache reads make the second invocation within a 6h cycle
+    /// effectively free.
+    #[arg(long, default_value = "data/nbm_cache")]
+    nbm_cache: PathBuf,
 }
 
 #[tokio::main]
@@ -114,46 +133,89 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve airport→GridPoint lazily, caching by airport code.
-    let cfg = ProbabilityConfig {
-        min_margin_f: args.min_margin_f,
-    };
-    let mut grid_cache: HashMap<&'static str, predigy_ext_feeds::nws_forecast::GridPoint> =
-        HashMap::new();
-    let mut forecast_cache: HashMap<
-        (&'static str, String),
-        predigy_ext_feeds::nws_forecast::HourlyForecast,
-    > = HashMap::new();
     let mut rules: Vec<StatRule> = Vec::new();
     let mut inspections: Vec<RuleInspection> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut skip_counts: HashMap<&'static str, u32> = HashMap::new();
 
-    for m in &markets {
-        match curate_one(&nws, m, &cfg, &mut grid_cache, &mut forecast_cache).await {
-            CurateOutcome::Rule {
-                rule,
-                audit,
-                inspection,
-            } => {
-                info!(audit = %audit, "accepted rule");
-                rules.push(rule);
-                inspections.push(inspection);
+    if args.nbm {
+        // ---- Phase 2 NBM probabilistic path ----
+        let nbm_client =
+            NbmClient::new(&args.user_agent).map_err(|e| anyhow!("nbm client: {e}"))?;
+        let cycle = recent_qmd_cycle(now_unix());
+        info!(?cycle, "nbm: using cycle");
+        std::fs::create_dir_all(&args.nbm_cache).ok();
+        let outcomes = curate_via_nbm(&nbm_client, &args.nbm_cache, cycle, &markets).await;
+        for (m, outcome) in markets.iter().zip(outcomes.into_iter()) {
+            match outcome {
+                NbmCurateOutcome::Rule(out) => {
+                    info!(audit = %out.audit, "accepted rule (nbm)");
+                    rules.push(out.rule);
+                    inspections.push(RuleInspection {
+                        ticker: out.ticker,
+                        title: out.title,
+                        airport: out.airport,
+                        threshold: out.threshold,
+                        forecast_value_f: out.forecast_value_f,
+                        model_p: out.model_p,
+                        side: out.side,
+                        quoted_ask_cents: out.quoted_ask_cents,
+                        apparent_edge_cents: out.apparent_edge_cents,
+                    });
+                }
+                NbmCurateOutcome::Skip { reason } => {
+                    debug!(market = %m.ticker, reason = %reason, "skip");
+                    *skip_counts.entry(skip_category(&reason)).or_insert(0) += 1;
+                    skipped.push((m.ticker.clone(), reason));
+                }
+                NbmCurateOutcome::Error { reason } => {
+                    warn!(market = %m.ticker, reason = %reason, "curate failed");
+                    *skip_counts.entry("error").or_insert(0) += 1;
+                    skipped.push((m.ticker.clone(), reason));
+                }
             }
-            CurateOutcome::Skip(reason) => {
-                debug!(market = %m.ticker, reason = %reason, "skip");
-                *skip_counts.entry(skip_category(&reason)).or_insert(0) += 1;
-                skipped.push((m.ticker.clone(), reason));
-            }
-            CurateOutcome::Error(reason) => {
-                warn!(market = %m.ticker, reason = %reason, "curate failed");
-                *skip_counts.entry("error").or_insert(0) += 1;
-                skipped.push((m.ticker.clone(), reason));
+        }
+    } else {
+        // ---- Phase 1 NWS deterministic path ----
+        let cfg = ProbabilityConfig {
+            min_margin_f: args.min_margin_f,
+        };
+        let mut grid_cache: HashMap<&'static str, predigy_ext_feeds::nws_forecast::GridPoint> =
+            HashMap::new();
+        let mut forecast_cache: HashMap<
+            (&'static str, String),
+            predigy_ext_feeds::nws_forecast::HourlyForecast,
+        > = HashMap::new();
+        for m in &markets {
+            match curate_one(&nws, m, &cfg, &mut grid_cache, &mut forecast_cache).await {
+                CurateOutcome::Rule {
+                    rule,
+                    audit,
+                    inspection,
+                } => {
+                    info!(audit = %audit, "accepted rule");
+                    rules.push(rule);
+                    inspections.push(inspection);
+                }
+                CurateOutcome::Skip(reason) => {
+                    debug!(market = %m.ticker, reason = %reason, "skip");
+                    *skip_counts.entry(skip_category(&reason)).or_insert(0) += 1;
+                    skipped.push((m.ticker.clone(), reason));
+                }
+                CurateOutcome::Error(reason) => {
+                    warn!(market = %m.ticker, reason = %reason, "curate failed");
+                    *skip_counts.entry("error").or_insert(0) += 1;
+                    skipped.push((m.ticker.clone(), reason));
+                }
             }
         }
     }
 
-    info!(kept = rules.len(), skipped = skipped.len(), "synthesis done");
+    info!(
+        kept = rules.len(),
+        skipped = skipped.len(),
+        "synthesis done"
+    );
     // Surface skip-category histogram so the operator can see at a
     // glance whether the conviction-zone gate is the dominant reason
     // (expected) or whether something more concerning is happening
@@ -266,7 +328,9 @@ async fn curate_one(
                 grid_cache.insert(airport.code, g.clone());
                 g
             }
-            Err(e) => return CurateOutcome::Error(format!("nws lookup_point({}): {e}", airport.code)),
+            Err(e) => {
+                return CurateOutcome::Error(format!("nws lookup_point({}): {e}", airport.code));
+            }
         },
     };
 
@@ -281,7 +345,9 @@ async fn curate_one(
                 forecast_cache.insert(key, f.clone());
                 f
             }
-            Err(e) => return CurateOutcome::Error(format!("nws fetch_hourly({}): {e}", airport.code)),
+            Err(e) => {
+                return CurateOutcome::Error(format!("nws fetch_hourly({}): {e}", airport.code));
+            }
         },
     };
 
@@ -293,7 +359,14 @@ async fn curate_one(
             model_p,
             forecast_value_f,
             hours_considered,
-        } => emit_rule(m, airport, &spec.kind, model_p, forecast_value_f, hours_considered),
+        } => emit_rule(
+            m,
+            airport,
+            &spec.kind,
+            model_p,
+            forecast_value_f,
+            hours_considered,
+        ),
     }
 }
 
@@ -314,11 +387,7 @@ fn emit_rule(
     // tells us this. Stat-trader's `evaluate()` will additionally
     // check that the market price is far enough off model_p to
     // clear `min_edge_cents`.
-    let side = if model_p > 0.5 {
-        Side::Yes
-    } else {
-        Side::No
-    };
+    let side = if model_p > 0.5 { Side::Yes } else { Side::No };
     let rule = StatRule {
         kalshi_market,
         model_p,
@@ -338,10 +407,7 @@ fn emit_rule(
     // for No we cross at no_ask. Edge is `(model_p_in_cents - ask)`.
     let model_p_cents = (model_p * 100.0).round() as i32;
     let (quoted_ask_cents, apparent_edge_cents) = match side {
-        Side::Yes => (
-            m.yes_ask_cents,
-            model_p_cents - i32::from(m.yes_ask_cents),
-        ),
+        Side::Yes => (m.yes_ask_cents, model_p_cents - i32::from(m.yes_ask_cents)),
         Side::No => (
             m.no_ask_cents,
             // For a No bet the relevant model probability is 1 - model_p.
@@ -472,14 +538,22 @@ fn print_inspection_table(inspections: &[RuleInspection]) {
 /// category name here so the operator-facing histogram surfaces
 /// it.
 fn skip_category(reason: &str) -> &'static str {
+    // Phase 1 (NWS deterministic) reasons:
     if reason.contains("InsideConvictionZone") {
         "inside_conviction_zone"
     } else if reason.contains("NoOverlappingHours") {
         "no_overlapping_forecast_hours"
-    } else if reason.contains("UnsupportedStrikeKind") {
-        "unsupported_strike_kind_between"
     } else if reason.contains("NonFahrenheitForecast") {
         "non_fahrenheit_forecast"
+    // Strike-kind skip (shared between Phase 1 and Phase 2):
+    } else if reason.contains("UnsupportedStrikeKind") || reason.contains("between") {
+        "unsupported_strike_kind_between"
+    // Phase 2 (NBM probabilistic) reasons:
+    } else if reason.contains("no NBM quantiles available") {
+        "nbm_window_unreachable"
+    } else if reason.contains("forecast window unreachable") {
+        "settlement_window_in_past"
+    // Shared reasons:
     } else if reason.starts_with("unmapped airport") {
         "unmapped_airport"
     } else if reason.starts_with("parse:") {
@@ -487,6 +561,14 @@ fn skip_category(reason: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 fn init_tracing() {

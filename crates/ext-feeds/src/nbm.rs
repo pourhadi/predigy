@@ -226,6 +226,12 @@ impl MessageRange {
 /// Find every quantile-level message in `idx` for a given parameter
 /// + level filter (e.g. `("TMP", "2 m above ground")`). Returns
 ///   `(quantile_pct, range)` pairs sorted by quantile.
+///
+/// Filters out cumulative-window products (e.g. `"0-18 hour max
+/// fcst"`, `"0-18 hour StdDev fcst"`) which share the same param +
+/// level but represent something else. Only keeps entries whose
+/// `fcst_label` matches the standard hourly format `"<N> hour fcst"`
+/// — the per-hour quantile we want.
 pub fn locate_quantile_messages(
     idx: &[IdxEntry],
     param: &str,
@@ -236,7 +242,7 @@ pub fn locate_quantile_messages(
         .iter()
         .zip(ranges.iter())
         .filter_map(|(e, r)| {
-            if e.param == param && e.level == level {
+            if e.param == param && e.level == level && is_standard_hourly_fcst(&e.fcst_label) {
                 e.quantile_pct().map(|pct| (pct, r.clone()))
             } else {
                 None
@@ -245,6 +251,17 @@ pub fn locate_quantile_messages(
         .collect();
     out.sort_by_key(|(pct, _)| *pct);
     out
+}
+
+/// True if `label` matches the standard NBM hourly-forecast shape
+/// `"<N> hour fcst"` — N is a single positive integer. Cumulative
+/// windows (`"0-18 hour max fcst"`) and aggregates
+/// (`"0-18 hour StdDev fcst"`) are rejected.
+fn is_standard_hourly_fcst(label: &str) -> bool {
+    let Some(rest) = label.strip_suffix(" hour fcst") else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Find one threshold-probability message: parameter + level +
@@ -311,10 +328,7 @@ pub fn parse_idx(text: &str) -> Result<Vec<IdxEntry>, Error> {
             continue;
         }
         let entry = parse_idx_line(line).ok_or_else(|| {
-            Error::Invalid(format!(
-                "nbm idx line {} malformed: {line:?}",
-                line_no + 1
-            ))
+            Error::Invalid(format!("nbm idx line {} malformed: {line:?}", line_no + 1))
         })?;
         out.push(entry);
     }
@@ -503,6 +517,66 @@ mod tests {
         // Sorted by pct ascending.
         assert_eq!(q[0].0, 5);
         assert_eq!(q[1].0, 80);
+    }
+
+    #[test]
+    fn locate_quantile_messages_skips_cumulative_max_window() {
+        // NBM at f018 has BOTH "0-18 hour max fcst" (cumulative
+        // window) and "18 hour fcst" (standard hourly). Only the
+        // latter is what we want for per-hour CDF interpolation.
+        let entries = vec![
+            // Cumulative max — should be filtered out.
+            IdxEntry {
+                msg_num: 1,
+                offset: 0,
+                cycle_token: "d=...".into(),
+                param: "TMP".into(),
+                level: "2 m above ground".into(),
+                fcst_label: "0-18 hour max fcst".into(),
+                extra: "50% level".into(),
+            },
+            // Cumulative StdDev — also filtered out.
+            IdxEntry {
+                msg_num: 2,
+                offset: 100,
+                cycle_token: "d=...".into(),
+                param: "TMP".into(),
+                level: "2 m above ground".into(),
+                fcst_label: "0-18 hour StdDev fcst".into(),
+                extra: "50% level".into(),
+            },
+            // Standard hourly — kept.
+            IdxEntry {
+                msg_num: 3,
+                offset: 200,
+                cycle_token: "d=...".into(),
+                param: "TMP".into(),
+                level: "2 m above ground".into(),
+                fcst_label: "18 hour fcst".into(),
+                extra: "50% level".into(),
+            },
+        ];
+        let q = locate_quantile_messages(&entries, "TMP", "2 m above ground");
+        assert_eq!(q.len(), 1, "expected only the standard 18 hour fcst entry");
+        assert_eq!(q[0].0, 50);
+        assert_eq!(q[0].1.start, 200);
+    }
+
+    #[test]
+    fn is_standard_hourly_fcst_accepts_canonical_form() {
+        assert!(is_standard_hourly_fcst("1 hour fcst"));
+        assert!(is_standard_hourly_fcst("24 hour fcst"));
+        assert!(is_standard_hourly_fcst("168 hour fcst"));
+    }
+
+    #[test]
+    fn is_standard_hourly_fcst_rejects_cumulative_and_aggregate() {
+        assert!(!is_standard_hourly_fcst("0-18 hour max fcst"));
+        assert!(!is_standard_hourly_fcst("0-18 hour StdDev fcst"));
+        assert!(!is_standard_hourly_fcst("18 hour acc fcst"));
+        assert!(!is_standard_hourly_fcst(""));
+        assert!(!is_standard_hourly_fcst(" hour fcst"));
+        assert!(!is_standard_hourly_fcst("18 hr fcst"));
     }
 
     #[test]

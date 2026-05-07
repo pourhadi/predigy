@@ -15,6 +15,8 @@
 pub mod airports;
 pub mod forecast_to_p;
 pub mod kalshi_scan;
+pub mod nbm_curate;
+pub mod nbm_path;
 pub mod ticker_parse;
 
 pub use airports::{Airport, lookup_airport};
