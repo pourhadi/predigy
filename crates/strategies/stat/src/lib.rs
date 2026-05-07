@@ -62,6 +62,19 @@ pub struct StatConfig {
     /// drops below entry by this amount, emit a closing IOC.
     /// `0` disables.
     pub stop_loss_cents: i32,
+    /// **Phase 6+ A1 belief-drift exit**: minimum residual edge
+    /// (cents) before the strategy holds a position. If the
+    /// curator updates `model_p` such that
+    /// `model_p_cents - mark_cents < min_residual_edge_cents`,
+    /// the original entry thesis is invalidated even before
+    /// price moves. Emit a closing IOC. `0` disables.
+    pub min_residual_edge_cents: i32,
+    /// **Phase 6+ A4 time-decay TP scaling**: how many cents to
+    /// shave off the take-profit threshold per hour held. The
+    /// longer a position runs the more likely the original
+    /// model edge has decayed; tightening TP encourages exits.
+    /// Effective TP is clamped at 1¢ minimum. `0` disables.
+    pub tp_decay_per_hour_cents: i32,
 }
 
 impl Default for StatConfig {
@@ -77,6 +90,13 @@ impl Default for StatConfig {
             // CLI / env-var override surface.
             take_profit_cents: 8,
             stop_loss_cents: 5,
+            // A1: residual-edge floor 2¢. Aligns with typical
+            // entry min_edge_cents (5¢) — by the time edge has
+            // collapsed to <2¢ the thesis is broken.
+            min_residual_edge_cents: 2,
+            // A4: 1¢ shaved off TP per hour held. After 7 hours
+            // TP floors at 1¢ — almost any positive PnL exits.
+            tp_decay_per_hour_cents: 1,
         }
     }
 }
@@ -101,6 +121,9 @@ struct CachedPosition {
     /// Signed: positive = long (buy-side fills), negative = short.
     signed_qty: i32,
     avg_entry_cents: i32,
+    /// When the position was opened. Used by A4 (time-decay TP
+    /// scaling).
+    opened_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug)]
@@ -203,6 +226,7 @@ impl StatStrategy {
                     side,
                     signed_qty: r.current_qty,
                     avg_entry_cents: r.avg_entry_cents,
+                    opened_at: r.opened_at,
                 },
             );
         }
@@ -264,10 +288,53 @@ impl StatStrategy {
                 pos.avg_entry_cents - mark_cents
             };
 
-            let take =
-                self.config.take_profit_cents > 0 && pnl_per >= self.config.take_profit_cents;
+            // A4 — time-decay TP scaling. Shave the configured
+            // TP by `tp_decay_per_hour_cents` per full hour held;
+            // floor at 1¢. After many hours the strategy will
+            // exit on almost any positive move.
+            let hours_held =
+                ((chrono::Utc::now() - pos.opened_at).num_seconds() / 3600).max(0) as i32;
+            let effective_tp = if self.config.take_profit_cents > 0 {
+                let shaved = self.config.take_profit_cents
+                    - hours_held * self.config.tp_decay_per_hour_cents;
+                shaved.max(1)
+            } else {
+                0
+            };
+
+            let take = effective_tp > 0 && pnl_per >= effective_tp;
             let stop = self.config.stop_loss_cents > 0 && pnl_per <= -self.config.stop_loss_cents;
-            if !(take || stop) {
+
+            // A1 — belief-drift exit. Look up the current rule
+            // for this market. If model_p has drifted such that
+            // residual edge over the unwind mark is below
+            // min_residual_edge_cents, the entry thesis is dead.
+            // Effective probability to compare against mark
+            // depends on the position side (we hold YES → bet
+            // is YES; we hold NO → bet is NO at complement).
+            // Note: position cache key is "ticker:side_tag" but
+            // rule cache is keyed by ticker alone.
+            let ticker_str = market.as_str().to_string();
+            let mut belief_drift = false;
+            if self.config.min_residual_edge_cents > 0 {
+                if let Some(rule) = self.rules.get(&ticker_str) {
+                    let bet_p = match pos.side {
+                        Side::Yes => rule.model_p,
+                        Side::No => 1.0 - rule.model_p,
+                    };
+                    let belief_cents = (bet_p * 100.0).round() as i32;
+                    let residual_edge = belief_cents - mark_cents;
+                    if residual_edge < self.config.min_residual_edge_cents {
+                        belief_drift = true;
+                    }
+                } else {
+                    // Curator removed the rule — orphan position.
+                    // Strong exit signal.
+                    belief_drift = true;
+                }
+            }
+
+            if !(take || stop || belief_drift) {
                 continue;
             }
 
@@ -291,7 +358,18 @@ impl StatStrategy {
                 Side::Yes => "Y",
                 Side::No => "N",
             };
-            let reason_tag = if take { "tp" } else { "sl" };
+            // Trigger priority: stop-loss (preserve capital)
+            // wins ties, then belief-drift (thesis dead — exit
+            // before further drift), then take-profit. Each
+            // gets a distinct reason_tag for forensic logs +
+            // dashboard exit-kind classification.
+            let reason_tag = if stop {
+                "sl"
+            } else if belief_drift {
+                "bd"
+            } else {
+                "tp"
+            };
             let client_id = format!(
                 "stat-exit:{ticker}:{side_tag}:{tag}:{minute:08x}",
                 ticker = cid_safe_ticker(market.as_str()),
@@ -309,7 +387,8 @@ impl StatStrategy {
                 order_type: OrderType::Limit,
                 tif: Tif::Ioc,
                 reason: Some(format!(
-                    "stat-exit: {reason_tag} entry={}¢ mark={}¢ pnl={}¢/contract",
+                    "stat-exit: {reason_tag} entry={}¢ mark={}¢ pnl={}¢/contract \
+                     hours_held={hours_held} effective_tp={effective_tp}¢",
                     pos.avg_entry_cents, mark_cents, pnl_per
                 )),
             };
@@ -584,6 +663,11 @@ mod tests {
             // them deterministically: take 8¢, stop 5¢.
             take_profit_cents: 8,
             stop_loss_cents: 5,
+            // A1 + A4 disabled by default in tests so existing
+            // tests keep their behavior. Tests that exercise
+            // belief-drift / time-decay set them explicitly.
+            min_residual_edge_cents: 0,
+            tp_decay_per_hour_cents: 0,
         }
     }
 
@@ -592,6 +676,21 @@ mod tests {
             side,
             signed_qty,
             avg_entry_cents,
+            opened_at: chrono::Utc::now(),
+        }
+    }
+
+    fn cached_position_aged(
+        side: Side,
+        signed_qty: i32,
+        avg_entry_cents: i32,
+        hours_old: i64,
+    ) -> CachedPosition {
+        CachedPosition {
+            side,
+            signed_qty,
+            avg_entry_cents,
+            opened_at: chrono::Utc::now() - chrono::Duration::hours(hours_old),
         }
     }
 
@@ -809,5 +908,174 @@ mod tests {
         // Mark would normally trigger take-profit.
         let book = book_with_quotes(Some(95), Some(2));
         assert!(s.evaluate_exit(&market, &book, Instant::now()).is_none());
+    }
+
+    // ─── A1 belief-drift exit tests ──────────────────────────
+
+    #[test]
+    fn exit_belief_drift_when_residual_edge_collapses() {
+        // Long YES at 50¢. Mark = 53¢ (+3¢, inside TP/SL band).
+        // Rule's model_p drops to 0.54 → belief 54¢ → residual
+        // edge = 54-53 = 1¢ < min_residual_edge_cents(2) → exit.
+        let mut c = cfg();
+        c.min_residual_edge_cents = 2;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-DRIFT-A";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.54, Side::Yes, 5));
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book_with_quotes(Some(53), Some(40));
+        let intent = s
+            .evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("belief-drift fires");
+        assert!(intent.client_id.contains(":bd:"));
+        assert_eq!(intent.action, IntentAction::Sell);
+    }
+
+    #[test]
+    fn no_belief_drift_when_edge_still_holds() {
+        let mut c = cfg();
+        c.min_residual_edge_cents = 2;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-DRIFT-B";
+        // Belief 70¢ vs mark 53¢ → residual edge 17¢ ≥ 2 → no drift.
+        s.rules
+            .insert(ticker.into(), cached_rule(0.70, Side::Yes, 5));
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book_with_quotes(Some(53), Some(40));
+        assert!(
+            s.evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exit_when_rule_disappears_from_curator() {
+        // Curator removed the rule → orphan position. Belief-drift
+        // exit fires regardless of mark.
+        let mut c = cfg();
+        c.min_residual_edge_cents = 2;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-ORPHAN";
+        // No rule inserted.
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book = book_with_quotes(Some(53), Some(40));
+        let intent = s
+            .evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("orphan exit fires");
+        assert!(intent.client_id.contains(":bd:"));
+    }
+
+    #[test]
+    fn belief_drift_no_side_position() {
+        // Long NO at 30¢. Mark (no_bid) = 35¢. Rule says
+        // model_p_yes = 0.62 → bet_p_no = 0.38 → belief 38¢ →
+        // residual = 38-35 = 3¢. With min_residual=4 → drift fires.
+        let mut c = cfg();
+        c.min_residual_edge_cents = 4;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-DRIFT-NO";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.62, Side::No, 5));
+        s.positions.insert(
+            position_key(ticker, Side::No),
+            cached_position(Side::No, 3, 30),
+        );
+        let book = book_with_quotes(Some(60), Some(35));
+        let intent = s
+            .evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("NO belief-drift fires");
+        assert!(intent.client_id.contains(":N:bd:"));
+    }
+
+    #[test]
+    fn stop_loss_priority_over_belief_drift() {
+        // Both conditions trip; sl wins (capital preservation
+        // priority).
+        let mut c = cfg();
+        c.min_residual_edge_cents = 5;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-PRIO";
+        s.rules
+            .insert(ticker.into(), cached_rule(0.50, Side::Yes, 5));
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position(Side::Yes, 4, 60),
+        );
+        let book = book_with_quotes(Some(54), Some(45));
+        let intent = s
+            .evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("exit fires");
+        assert!(
+            intent.client_id.contains(":sl:"),
+            "sl should win priority; got {}",
+            intent.client_id
+        );
+    }
+
+    // ─── A4 time-decay TP scaling tests ──────────────────────
+
+    #[test]
+    fn tp_threshold_decays_with_age() {
+        // Default TP is 8¢, decay 1¢/hr. After 4h, effective TP = 4.
+        // Mark gives +5¢ PnL — wouldn't fire at fresh TP=8 but
+        // does fire at decayed TP=4.
+        let mut c = cfg();
+        c.tp_decay_per_hour_cents = 1;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-DECAY";
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position_aged(Side::Yes, 4, 50, 4),
+        );
+        let book = book_with_quotes(Some(55), Some(40));
+        let intent = s
+            .evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("decayed-TP fires");
+        assert!(intent.client_id.contains(":tp:"));
+    }
+
+    #[test]
+    fn tp_floors_at_one_cent() {
+        // 20-hour-old position at 1¢/hr decay would shave TP
+        // negative, but it floors at 1¢. +1¢ PnL fires.
+        let mut c = cfg();
+        c.tp_decay_per_hour_cents = 1;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-FLOOR";
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position_aged(Side::Yes, 4, 50, 20),
+        );
+        let book = book_with_quotes(Some(51), Some(40));
+        let intent = s
+            .evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+            .expect("floor-TP fires");
+        assert!(intent.client_id.contains(":tp:"));
+    }
+
+    #[test]
+    fn tp_decay_disabled_when_zero() {
+        // tp_decay=0 → fixed TP=8, +5¢ PnL doesn't fire.
+        let mut s = StatStrategy::new(cfg());
+        let ticker = "KX-NO-DECAY";
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position_aged(Side::Yes, 4, 50, 4),
+        );
+        let book = book_with_quotes(Some(55), Some(40));
+        assert!(
+            s.evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
+                .is_none()
+        );
     }
 }
