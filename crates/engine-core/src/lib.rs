@@ -20,6 +20,7 @@
 //! depends on `predigy-engine-core`, the engine depends on
 //! every strategy.
 
+pub mod cross_strategy;
 pub mod db;
 pub mod discovery;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod oms;
 pub mod state;
 pub mod strategy;
 
+pub use cross_strategy::{CrossStrategyDelivery, CrossStrategyEvent, topic};
 pub use db::{DailyPnl, Db, LatestModelP, OpenPosition, RuleRow};
 pub use discovery::{DiscoveredMarket, DiscoverySubscription};
 pub use error::{EngineError, EngineResult};

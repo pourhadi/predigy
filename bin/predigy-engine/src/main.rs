@@ -27,6 +27,7 @@
 use anyhow::{Context as _, Result};
 use predigy_engine::{
     config::EngineConfig,
+    cross_strategy_bus::{self, CrossStrategyBus},
     discovery_service::DiscoveryService,
     exec_data::{ExecDataConfig, ExecDataConsumer},
     external_feeds::{ExternalFeeds, build_subscriber_map, nws_config_from_env},
@@ -181,6 +182,14 @@ async fn main() -> Result<()> {
     //    capture each strategy's declared discovery subscriptions
     //    so the discovery service can be started below.
     let db = Db::connect(&config.database_url).await?;
+
+    // Phase 6 — cross-strategy bus producer/consumer pair.
+    // Channel created BEFORE supervisor spawn so each
+    // StrategyState can be wired with the producer-side tx.
+    // Dispatcher starts AFTER all supervisors are up so the
+    // subscriber map is final.
+    let (xstrat_tx, xstrat_rx) = CrossStrategyBus::channel();
+
     let mut supervisors: Vec<Supervisor> = Vec::new();
     let mut discovery_subs: HashMap<StrategyId, Vec<DiscoverySubscription>> = HashMap::new();
     let mut external_subscribers: Vec<(
@@ -188,10 +197,15 @@ async fn main() -> Result<()> {
         &'static str,
         tokio::sync::mpsc::Sender<predigy_engine_core::events::Event>,
     )> = Vec::new();
+    let mut xstrat_subscribers: Vec<(
+        StrategyId,
+        &'static str,
+        tokio::sync::mpsc::Sender<predigy_engine_core::events::Event>,
+    )> = Vec::new();
     for (id, _) in registry.instantiate_all().await {
         let factory = strategy_factory(id);
         let strategy = factory();
-        let state = StrategyState::new(db.clone(), id.0);
+        let state = StrategyState::new(db.clone(), id.0).with_cross_strategy_tx(xstrat_tx.clone());
         let markets = strategy
             .subscribed_markets(&state)
             .await
@@ -201,6 +215,7 @@ async fn main() -> Result<()> {
             discovery_subs.insert(id, subs);
         }
         let ext_subs = strategy.external_subscriptions();
+        let xstrat_subs = strategy.cross_strategy_subscriptions();
         let supervisor = Supervisor::spawn(
             id,
             Arc::from(factory),
@@ -214,6 +229,9 @@ async fn main() -> Result<()> {
         for feed in ext_subs {
             external_subscribers.push((id, feed, supervisor.event_tx.clone()));
         }
+        for topic in xstrat_subs {
+            xstrat_subscribers.push((id, topic, supervisor.event_tx.clone()));
+        }
         info!(
             strategy = id.0,
             n_markets = markets.len(),
@@ -222,6 +240,17 @@ async fn main() -> Result<()> {
         );
         supervisors.push(supervisor);
     }
+
+    // 8c. Cross-strategy bus dispatcher. Spawns only when at
+    //     least one strategy declared a cross-strategy
+    //     subscription. Drop the engine's local tx clone — every
+    //     supervisor's StrategyState already holds its own clone,
+    //     so the bus's mpsc stays alive as long as any producer
+    //     is alive. When all producers exit, the rx returns
+    //     `None` and the bus task cleanly terminates.
+    drop(xstrat_tx);
+    let by_topic = cross_strategy_bus::build_subscriber_map(xstrat_subscribers);
+    let xstrat_bus = CrossStrategyBus::start_dispatching(xstrat_rx, by_topic);
 
     // 8a. External-feed dispatcher — single NWS connection
     //     fanned out to every supervisor that opted in via
@@ -335,6 +364,9 @@ async fn main() -> Result<()> {
     watcher_handle.abort();
     if let Some(svc) = discovery_service {
         svc.shutdown(config.shutdown_grace).await;
+    }
+    if let Some(bus) = xstrat_bus {
+        bus.shutdown(config.shutdown_grace).await;
     }
     if let Some(svc) = pair_file {
         svc.shutdown(config.shutdown_grace).await;

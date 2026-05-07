@@ -282,7 +282,10 @@ impl Strategy for SettlementStrategy {
                 self.apply_discovery(added, removed);
                 Ok(Vec::new())
             }
-            Event::External(_) | Event::Tick | Event::PairUpdate { .. } => Ok(Vec::new()),
+            Event::External(_)
+            | Event::Tick
+            | Event::PairUpdate { .. }
+            | Event::CrossStrategy { .. } => Ok(Vec::new()),
         }
     }
 }

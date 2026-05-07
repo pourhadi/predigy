@@ -47,6 +47,15 @@ pub trait Strategy: Send + Sync {
         Vec::new()
     }
 
+    /// Phase 6 — cross-strategy topics this strategy wants
+    /// delivered as `Event::CrossStrategy { source, payload }`.
+    /// Topic strings are the constants in [`crate::topic`]. The
+    /// engine's bus task fans events to every supervisor that
+    /// subscribed to the event's topic.
+    fn cross_strategy_subscriptions(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     /// Called for every event the strategy is subscribed to.
     /// Returns intents to submit through the OMS.
     async fn on_event(

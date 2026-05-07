@@ -469,7 +469,10 @@ impl Strategy for CrossArbStrategy {
                 self.apply_pair_update(added, removed);
                 Ok(Vec::new())
             }
-            Event::External(_) | Event::Tick | Event::DiscoveryDelta { .. } => Ok(Vec::new()),
+            Event::External(_)
+            | Event::Tick
+            | Event::DiscoveryDelta { .. }
+            | Event::CrossStrategy { .. } => Ok(Vec::new()),
         }
     }
 

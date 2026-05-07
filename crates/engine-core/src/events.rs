@@ -9,7 +9,9 @@
 //! that consume external feeds opt in via the
 //! `Strategy::external_subscriptions` method.
 
+use crate::cross_strategy::CrossStrategyEvent;
 use crate::discovery::DiscoveredMarket;
+use crate::strategy::StrategyId;
 use predigy_book::OrderBook;
 use predigy_core::market::MarketTicker;
 
@@ -47,6 +49,17 @@ pub enum Event {
     PairUpdate {
         added: Vec<KalshiPolyPair>,
         removed: Vec<MarketTicker>,
+    },
+    /// Phase 6 — cross-strategy bus delivery. The engine routes
+    /// events emitted by one strategy (via
+    /// `StrategyState::publish_cross_strategy`) to every
+    /// supervisor that subscribed to the event's topic in
+    /// [`crate::Strategy::cross_strategy_subscriptions`]. The
+    /// `source` field carries the producer's strategy id so
+    /// consumers can gate behavior on origin.
+    CrossStrategy {
+        source: StrategyId,
+        payload: CrossStrategyEvent,
     },
 }
 
