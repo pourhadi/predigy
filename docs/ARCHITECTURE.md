@@ -512,9 +512,13 @@ Strategy ports (one crate per strategy under `crates/strategies/`):
       and are hot-reloaded via the new pair-file service. Ships
       alongside Polymarket WS support in the external-feed
       dispatcher.
-- [ ] wx-stat / wx-curator / stat-curator / cross-arb-curator
-      (curators run on a different cadence; possibly stay
-      external for now).
+- **Curators stay external by design** (wx-stat, wx-curator,
+  stat-curator, cross-arb-curator). These are scheduled (every
+  10 minutes to 4 hours) Anthropic-driven processes that write
+  rules to Postgres or pair files; the engine just consumes
+  their output. Folding them into the engine binary would couple
+  hot-path latency to their LLM-call latency for no benefit.
+  They keep their own launchd plists.
 
 #### Discovery service (shipped 2026-05-07)
 
