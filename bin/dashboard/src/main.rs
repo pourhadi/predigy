@@ -745,10 +745,13 @@ async fn db_strategy_state(
     let kill_switch_armed = killed.is_some();
 
     // Currently-open intents (any non-terminal status).
+    // 'shadow' means the engine wrote it but never sent to the
+    // venue (Shadow mode during the migration); excluded from
+    // in-flight because there's no real venue exposure.
     let in_flight: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::BIGINT FROM intents
           WHERE strategy = $1
-            AND status NOT IN ('filled','cancelled','rejected','expired')",
+            AND status NOT IN ('filled','cancelled','rejected','expired','shadow')",
     )
     .bind(strategy)
     .fetch_one(pool)

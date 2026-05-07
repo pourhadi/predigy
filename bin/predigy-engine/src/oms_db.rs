@@ -26,21 +26,62 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Engine execution mode. Production-grade systems should boot
+/// in `Shadow` until parity is verified against the legacy
+/// daemon, then operator flips to `Live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineMode {
+    /// Engine writes intents to the DB at status='shadow' and
+    /// does NOT submit to the venue. Use during the migration
+    /// to compare engine decisions against the legacy daemon's
+    /// fills without dual-trading.
+    Shadow,
+    /// Engine writes intents at status='submitted' and the venue
+    /// path (FIX/REST) actually transmits them to Kalshi.
+    Live,
+}
+
+impl EngineMode {
+    fn initial_status(&self) -> &'static str {
+        match self {
+            EngineMode::Shadow => "shadow",
+            EngineMode::Live => "submitted",
+        }
+    }
+}
+
 /// DB-backed OMS. Cheap to clone (`Arc` internals).
 #[derive(Debug, Clone)]
 pub struct DbBackedOms {
     pool: PgPool,
     risk_caps: RiskCaps,
     kill_switch: Arc<KillSwitchView>,
+    mode: EngineMode,
 }
 
 impl DbBackedOms {
+    /// Build a Shadow-mode OMS. Use [`new_with_mode`] for live.
     pub fn new(pool: PgPool, risk_caps: RiskCaps, kill_switch: Arc<KillSwitchView>) -> Self {
+        Self::new_with_mode(pool, risk_caps, kill_switch, EngineMode::Shadow)
+    }
+
+    /// Build with explicit mode.
+    pub fn new_with_mode(
+        pool: PgPool,
+        risk_caps: RiskCaps,
+        kill_switch: Arc<KillSwitchView>,
+        mode: EngineMode,
+    ) -> Self {
         Self {
             pool,
             risk_caps,
             kill_switch,
+            mode,
         }
+    }
+
+    pub fn mode(&self) -> EngineMode {
+        self.mode
     }
 
     /// Fast path before touching the DB: in-memory kill switch +
@@ -103,11 +144,14 @@ impl DbBackedOms {
         .await?;
         let strategy_notional_cents = total.and_then(|t| t.0).unwrap_or(0);
 
-        // In-flight orders (any non-terminal status).
+        // In-flight orders (any non-terminal status). 'shadow'
+        // is a non-venue terminal (engine never sent it); count
+        // it out of in-flight so shadow accumulation doesn't
+        // exhaust the cap.
         let in_flight: (i64,) = sqlx::query_as(
             "SELECT COUNT(*)::BIGINT FROM intents
               WHERE strategy = $1
-                AND status NOT IN ('filled','cancelled','rejected','expired')",
+                AND status NOT IN ('filled','cancelled','rejected','expired','shadow')",
         )
         .bind(strategy)
         .fetch_one(&self.pool)
@@ -207,14 +251,19 @@ impl Oms for DbBackedOms {
             return Ok(SubmitOutcome::Rejected { reason });
         }
 
-        // Persist as `submitted`. Engine venue-router picks it up
-        // off this row and pushes to FIX/REST.
+        // Persist with the mode-appropriate initial status. In
+        // Live mode the engine venue-router picks it up off this
+        // row and pushes to FIX/REST. In Shadow mode the row
+        // stays at 'shadow' forever — used during migration to
+        // compare engine decisions against the legacy daemon's
+        // fills without dual-trading.
+        let initial_status = self.mode.initial_status();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO intents
                 (client_id, strategy, ticker, side, action, price_cents,
                  qty, order_type, tif, status, cumulative_qty, reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'submitted', 0, $10)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11, 0, $10)",
         )
         .bind(&intent.client_id)
         .bind(intent.strategy)
@@ -226,14 +275,16 @@ impl Oms for DbBackedOms {
         .bind(order_type_to_str(intent.order_type))
         .bind(tif_to_str(intent.tif))
         .bind(intent.reason.as_deref())
+        .bind(initial_status)
         .execute(&mut *tx)
         .await?;
 
         sqlx::query(
             "INSERT INTO intent_events (client_id, status, venue_payload)
-             VALUES ($1, 'submitted', NULL)",
+             VALUES ($1, $2, NULL)",
         )
         .bind(&intent.client_id)
+        .bind(initial_status)
         .execute(&mut *tx)
         .await?;
 

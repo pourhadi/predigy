@@ -20,7 +20,7 @@
 
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
-use predigy_engine::oms_db::DbBackedOms;
+use predigy_engine::oms_db::{DbBackedOms, EngineMode};
 use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
 use predigy_engine_core::oms::{
     ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, RejectionReason, RiskCaps, SubmitOutcome,
@@ -130,7 +130,10 @@ async fn submit_persists_intent_and_emits_event() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(row.0, "submitted");
+    // Shadow mode is the default; engine never reaches the venue,
+    // so the intent stays at 'shadow'. Tests that verify the live
+    // venue path use new_with_mode(EngineMode::Live).
+    assert_eq!(row.0, "shadow");
     assert_eq!(row.1, 1);
     assert_eq!(row.2, "KX-INT-A");
 
@@ -159,7 +162,9 @@ async fn duplicate_client_id_returns_idempotent() {
     match second {
         SubmitOutcome::Idempotent { client_id, current_status } => {
             assert_eq!(client_id, "test:B:0001");
-            assert_eq!(current_status, "submitted");
+            // Shadow-mode default; the first submit landed at
+            // status='shadow' so the second sees 'shadow'.
+            assert_eq!(current_status, "shadow");
         }
         other => panic!("expected Idempotent, got {other:?}"),
     }
@@ -428,6 +433,40 @@ async fn partial_fill_then_full_fill_accumulates_position() {
     .await
     .unwrap();
     assert_eq!(n_fills.0, 2);
+}
+
+#[tokio::test]
+async fn live_mode_submits_at_status_submitted() {
+    // Explicit EngineMode::Live writes status='submitted' so the
+    // venue-router worker can pick it up. Shadow mode (default)
+    // writes 'shadow' instead.
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-INT-LIVE").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new_with_mode(pool.clone(), permissive_caps(), ks, EngineMode::Live);
+
+    oms.submit(buy_yes("test:LIVE:0001", "KX-INT-LIVE", 1, 30))
+        .await
+        .unwrap();
+    let row: (String,) = sqlx::query_as(
+        "SELECT status FROM intents WHERE client_id = $1",
+    )
+    .bind("test:LIVE:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "submitted");
+
+    // intent_events also reflects 'submitted'.
+    let ev: (String,) = sqlx::query_as(
+        "SELECT status FROM intent_events WHERE client_id = $1 ORDER BY ts DESC LIMIT 1",
+    )
+    .bind("test:LIVE:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ev.0, "submitted");
 }
 
 #[tokio::test]

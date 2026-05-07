@@ -15,6 +15,7 @@
 //! market-data router, reconciliation loop).
 
 pub mod config;
+pub mod market_data;
 pub mod oms_db;
 pub mod registry;
 pub mod supervisor;

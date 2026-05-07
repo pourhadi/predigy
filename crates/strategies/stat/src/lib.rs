@@ -294,7 +294,7 @@ fn build_intent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use predigy_core::price::{Price, Qty};
+    use predigy_core::price::Price;
 
     fn book_with_quotes(yes_bid: Option<u8>, no_bid: Option<u8>) -> OrderBook {
         let mut b = OrderBook::new("KX-TEST");

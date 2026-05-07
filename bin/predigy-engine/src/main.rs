@@ -25,8 +25,18 @@
 //! in this same phase (separate change).
 
 use anyhow::{Context as _, Result};
-use predigy_engine::{config::EngineConfig, oms_db::DbBackedOms, registry::StrategyRegistry};
+use predigy_engine::{
+    config::EngineConfig,
+    market_data::{MarketDataRouter, RouterConfig},
+    oms_db::DbBackedOms,
+    registry::StrategyRegistry,
+    supervisor::{RestartPolicy, Supervisor},
+};
 use predigy_engine_core::oms::KillSwitchView;
+use predigy_engine_core::state::StrategyState;
+use predigy_engine_core::strategy::Strategy;
+use predigy_engine_core::Db;
+use predigy_strategy_stat::{StatConfig, StatStrategy};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,10 +78,8 @@ async fn main() -> Result<()> {
     // Initial sync from the DB / file fallback.
     sync_kill_switch(&pool, &config.kill_switch_file, &kill_switch).await;
 
-    // 4. Build the OMS. Marked `_oms` until Phase 3 wires the
-    //    first strategy that consumes it; the Arc ensures the
-    //    instance lives for the rest of `main`.
-    let _oms: Arc<dyn predigy_engine_core::oms::Oms> = Arc::new(DbBackedOms::new(
+    // 4. Build the OMS.
+    let oms: Arc<dyn predigy_engine_core::oms::Oms> = Arc::new(DbBackedOms::new(
         pool.clone(),
         config.default_risk_caps.clone(),
         kill_switch.clone(),
@@ -94,27 +102,107 @@ async fn main() -> Result<()> {
         })
     };
 
-    // 6. Strategy registry. Empty for Phase 2 — first registration
-    //    lands in Phase 3 with the stat-trader port.
+    // 6. Strategy registry — Phase 3.2 ships StatStrategy as the
+    //    first registered module. More strategies land in Phase 5.
     let registry = StrategyRegistry::new();
+    register_strategies(&registry).await;
     info!(
         n_strategies = registry.iter_ids().await.len(),
         "predigy-engine: strategy registry built"
     );
 
-    // 7. (Future) market-data router + Kalshi WS subscription.
-    //    Lands when the first strategy registers.
+    // 7. Market-data router. Connects to Kalshi WS, fans out
+    //    book updates to subscribed strategy supervisors.
+    let pem = std::fs::read_to_string(&config.kalshi_pem_path)
+        .with_context(|| format!("read PEM at {}", config.kalshi_pem_path.display()))?;
+    let router_cfg = RouterConfig {
+        kalshi_key_id: config.kalshi_key_id.clone(),
+        kalshi_pem: pem,
+        rest_endpoint: config.kalshi_rest_endpoint.clone(),
+        ws_endpoint: config.kalshi_ws_endpoint.clone(),
+    };
+    let router = MarketDataRouter::connect(router_cfg).await?;
+    info!("predigy-engine: market-data router connected");
 
-    // 8. Wait on shutdown signal.
-    info!("predigy-engine: ready (idle); awaiting shutdown signal");
+    // 8. Spawn one supervisor per strategy. Each supervisor owns
+    //    its strategy instance + its event channel + its
+    //    StrategyState (DB handle). The router pushes
+    //    Event::BookUpdate into the supervisor's queue.
+    let db = Db::connect(&config.database_url).await?;
+    let mut supervisors: Vec<Supervisor> = Vec::new();
+    for (id, _) in registry.instantiate_all().await {
+        // Reconstruct via the registry's factory so each
+        // supervisor owns a fresh strategy instance.
+        // We use a dedicated factory per id rather than the
+        // registry's `instantiate_all` because the supervisor
+        // takes a factory closure that can be called repeatedly
+        // for restarts.
+        let factory = strategy_factory(id);
+        let strategy = factory();
+        let state = StrategyState::new(db.clone(), id.0);
+        let markets = strategy.subscribed_markets(&state).await.unwrap_or_default();
+        let supervisor = Supervisor::spawn(
+            id,
+            Arc::from(factory),
+            oms.clone(),
+            state,
+            RestartPolicy::default(),
+        );
+        router
+            .register_strategy(id, &markets, supervisor.event_tx.clone())
+            .await;
+        info!(
+            strategy = id.0,
+            n_markets = markets.len(),
+            "predigy-engine: strategy supervisor spawned + registered with router"
+        );
+        supervisors.push(supervisor);
+    }
+
+    // 9. Wait on shutdown signal.
+    info!(
+        n_supervisors = supervisors.len(),
+        "predigy-engine: ready (running); awaiting shutdown signal"
+    );
     wait_for_shutdown().await;
 
-    // 9. Drain.
+    // 10. Drain.
     info!("predigy-engine: shutdown initiated; draining");
     watcher_handle.abort();
+    for sup in supervisors {
+        sup.shutdown(config.shutdown_grace).await;
+    }
+    router.shutdown(config.shutdown_grace).await;
     pool.close().await;
     info!("predigy-engine: shutdown complete");
     Ok(())
+}
+
+/// Build the in-process strategy registry. Each strategy lives
+/// in its own crate; this is the single place the engine wires
+/// them in. Adding a new strategy = add it here + add the dep.
+async fn register_strategies(registry: &StrategyRegistry) {
+    use predigy_engine::registry::StrategyHandle;
+    use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
+
+    registry
+        .register(StrategyHandle::new(STAT_ID, || {
+            Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>
+        }))
+        .await;
+}
+
+/// Per-strategy factory used by the supervisor for restart-on-
+/// panic. Mirrors `register_strategies` above.
+fn strategy_factory(
+    id: predigy_engine_core::strategy::StrategyId,
+) -> Box<dyn Fn() -> Box<dyn Strategy> + Send + Sync> {
+    use predigy_strategy_stat::STRATEGY_ID as STAT_ID;
+    if id == STAT_ID {
+        Box::new(|| Box::new(StatStrategy::new(StatConfig::default())) as Box<dyn Strategy>)
+    } else {
+        Box::new(move || panic!("no factory wired for strategy {id:?}"))
+    }
 }
 
 async fn connect_with_retry(url: &str) -> Result<sqlx::PgPool> {

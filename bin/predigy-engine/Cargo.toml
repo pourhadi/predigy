@@ -22,6 +22,7 @@ predigy-book = { workspace = true }
 predigy-engine-core = { workspace = true }
 predigy-kalshi-rest = { workspace = true }
 predigy-kalshi-md = { workspace = true }
+predigy-strategy-stat = { workspace = true }
 
 sqlx = { workspace = true }
 serde = { workspace = true }
