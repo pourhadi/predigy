@@ -102,6 +102,12 @@ pub struct CrossArbConfig {
     /// cents, the convergence thesis has flipped — exit before
     /// further drift. `0` disables.
     pub thesis_inversion_exit_cents: i32,
+    /// **Audit A3 — trailing stop**: ratchet-up trailing stop
+    /// once per-contract PnL has crossed `trailing_trigger_cents`.
+    /// Effective stop = high_water - `trailing_distance_cents`,
+    /// floored by `-stop_loss_cents`. Either `0` disables.
+    pub trailing_trigger_cents: i32,
+    pub trailing_distance_cents: i32,
 }
 
 impl Default for CrossArbConfig {
@@ -125,6 +131,11 @@ impl Default for CrossArbConfig {
             // 3¢ BELOW where Kalshi sits (vs poly being above
             // at entry), the convergence story is dead — exit.
             thesis_inversion_exit_cents: 3,
+            // A3: trailing trigger 3¢, distance 2¢. Cross-arb's
+            // edges are smaller than stat's, so the trailing
+            // band is correspondingly tighter.
+            trailing_trigger_cents: 3,
+            trailing_distance_cents: 2,
         }
     }
 }
@@ -173,6 +184,8 @@ pub struct CrossArbStrategy {
     positions: HashMap<String, CachedPosition>,
     /// Phase 6.2 — per-position exit cooldown.
     last_exit_at: HashMap<String, Instant>,
+    /// A3 — high-water-mark of per-contract PnL per position.
+    high_water_pnl: HashMap<String, i32>,
     last_position_refresh: Option<Instant>,
 }
 
@@ -185,6 +198,7 @@ impl CrossArbStrategy {
             last_submit_at: HashMap::new(),
             positions: HashMap::new(),
             last_exit_at: HashMap::new(),
+            high_water_pnl: HashMap::new(),
             last_position_refresh: None,
         }
     }
@@ -316,6 +330,8 @@ impl CrossArbStrategy {
                 },
             );
         }
+        // A3 — drop high-water entries for closed positions.
+        self.high_water_pnl.retain(|k, _| next.contains_key(k));
         self.positions = next;
         self.last_position_refresh = Some(Instant::now());
         debug!(n_positions = n, "cross-arb: position cache refreshed");
@@ -366,6 +382,17 @@ impl CrossArbStrategy {
                 self.config.take_profit_cents > 0 && pnl_per >= self.config.take_profit_cents;
             let stop = self.config.stop_loss_cents > 0 && pnl_per <= -self.config.stop_loss_cents;
 
+            // A3 — trailing stop. Update high-water-mark and
+            // test against the trailing floor. Active only
+            // after the position crossed `trailing_trigger_cents`.
+            let prev_high = self.high_water_pnl.get(&key).copied().unwrap_or(0);
+            let new_high = prev_high.max(pnl_per);
+            self.high_water_pnl.insert(key.clone(), new_high);
+            let trailing = self.config.trailing_trigger_cents > 0
+                && self.config.trailing_distance_cents > 0
+                && new_high >= self.config.trailing_trigger_cents
+                && pnl_per <= new_high - self.config.trailing_distance_cents;
+
             // A2 — convergence-aware exit. Look up the poly mid
             // for the asset paired to this Kalshi market. The
             // strategy's actual thesis is "poly_mid converges
@@ -411,7 +438,7 @@ impl CrossArbStrategy {
                 }
             }
 
-            if !(take || stop || converged || inverted) {
+            if !(take || stop || trailing || converged || inverted) {
                 continue;
             }
 
@@ -427,11 +454,14 @@ impl CrossArbStrategy {
                 Side::No => "N",
             };
             // Trigger priority: stop-loss (capital first) >
-            // thesis-inverted (story is dead) > convergence
-            // (lock the win) > take-profit. Distinct reason
-            // tags for forensic + dashboard classification.
+            // trailing stop (lock partial gain) > thesis-
+            // inverted (story dead) > convergence (lock the
+            // win) > take-profit. Distinct reason tags for
+            // forensic + dashboard classification.
             let reason_tag = if stop {
                 "sl"
+            } else if trailing {
+                "ts"
             } else if inverted {
                 "inv"
             } else if converged {
@@ -688,12 +718,13 @@ mod tests {
             take_profit_cents: 5,
             stop_loss_cents: 4,
             position_refresh_interval: Duration::from_secs(60),
-            // A2 disabled by default in tests; tests that
-            // exercise convergence/inversion set them
-            // explicitly. Existing TP/SL tests keep their
-            // shape.
+            // A2 + A3 disabled by default in tests; tests that
+            // exercise convergence/inversion/trailing set them
+            // explicitly. Existing TP/SL tests keep their shape.
             convergence_exit_spread_cents: 0,
             thesis_inversion_exit_cents: 0,
+            trailing_trigger_cents: 0,
+            trailing_distance_cents: 0,
         }
     }
 
@@ -786,6 +817,8 @@ mod tests {
             position_refresh_interval: Duration::from_secs(60),
             convergence_exit_spread_cents: 0,
             thesis_inversion_exit_cents: 0,
+            trailing_trigger_cents: 0,
+            trailing_distance_cents: 0,
         });
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
@@ -808,6 +841,8 @@ mod tests {
             position_refresh_interval: Duration::from_secs(60),
             convergence_exit_spread_cents: 0,
             thesis_inversion_exit_cents: 0,
+            trailing_trigger_cents: 0,
+            trailing_distance_cents: 0,
         });
         s.add_pair(MarketTicker::new("X"), "0xabc".into());
         s.update_poly("0xabc", Some(0.78), Some(0.82));
@@ -1074,6 +1109,58 @@ mod tests {
             .evaluate_exit(&market, &book, Instant::now())
             .expect("NO convergence fires");
         assert!(intent.client_id.contains(":N:conv:"));
+    }
+
+    // ─── A3 trailing stop tests ──────────────────────────────
+
+    #[test]
+    fn cross_arb_trailing_fires_after_giveback() {
+        // Long YES at 50¢. Trigger 3¢, distance 2¢.
+        //   tick 1: mark 54 → PnL +4 → high_water 4 (>= trigger).
+        //           pnl 4 > 4-2=2 (trail floor), no fire.
+        //           Also PnL 4 < tp(5) so no TP fire.
+        //   tick 2: mark 51 → PnL +1 ≤ 2 → trailing fires.
+        let mut c = cfg();
+        c.trailing_trigger_cents = 3;
+        c.trailing_distance_cents = 2;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-TRAIL");
+        let key = position_key("KX-TRAIL", Side::Yes);
+        s.positions
+            .insert(key.clone(), cached_position(Side::Yes, 4, 50));
+
+        let book1 = book(&[(54, 100)], &[(40, 100)]);
+        assert!(
+            s.evaluate_exit(&market, &book1, Instant::now()).is_none(),
+            "first tick within trailing band, no exit"
+        );
+        assert_eq!(s.high_water_pnl.get(&key).copied(), Some(4));
+
+        let book2 = book(&[(51, 100)], &[(40, 100)]);
+        let intent = s
+            .evaluate_exit(&market, &book2, Instant::now() + Duration::from_secs(120))
+            .expect("trailing fires");
+        assert!(intent.client_id.contains(":ts:"));
+    }
+
+    #[test]
+    fn cross_arb_trailing_disabled_when_zero() {
+        let mut c = cfg();
+        c.trailing_trigger_cents = 0;
+        c.trailing_distance_cents = 2;
+        let mut s = CrossArbStrategy::new(c);
+        let market = MarketTicker::new("KX-OFF");
+        s.positions.insert(
+            position_key("KX-OFF", Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        let book1 = book(&[(55, 100)], &[(40, 100)]);
+        let _ = s.evaluate_exit(&market, &book1, Instant::now());
+        let book2 = book(&[(52, 100)], &[(40, 100)]);
+        assert!(
+            s.evaluate_exit(&market, &book2, Instant::now() + Duration::from_secs(120))
+                .is_none()
+        );
     }
 
     #[test]

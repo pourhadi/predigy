@@ -436,6 +436,7 @@ function renderExits(rows) {
         const kindClass =
               e.kind === 'tp'   ? 'num-pos'
             : e.kind === 'conv' ? 'num-pos'
+            : e.kind === 'ts'   ? 'num-pos'   // trailing locked profit
             : e.kind === 'sl'   ? 'num-neg'
             : e.kind === 'inv'  ? 'num-neg'
             : e.kind === 'bd'   ? 'num-neg'

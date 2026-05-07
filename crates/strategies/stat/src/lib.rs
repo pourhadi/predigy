@@ -75,6 +75,14 @@ pub struct StatConfig {
     /// model edge has decayed; tightening TP encourages exits.
     /// Effective TP is clamped at 1¢ minimum. `0` disables.
     pub tp_decay_per_hour_cents: i32,
+    /// **Audit A3 — trailing stop**: once the position's
+    /// per-contract PnL has reached `trailing_trigger_cents`,
+    /// the effective stop floats up to
+    /// `high_water_pnl - trailing_distance_cents` (clamped
+    /// below by `-stop_loss_cents`). The trailing stop only
+    /// ratchets up — never down. `0` for either disables.
+    pub trailing_trigger_cents: i32,
+    pub trailing_distance_cents: i32,
 }
 
 impl Default for StatConfig {
@@ -97,6 +105,13 @@ impl Default for StatConfig {
             // A4: 1¢ shaved off TP per hour held. After 7 hours
             // TP floors at 1¢ — almost any positive PnL exits.
             tp_decay_per_hour_cents: 1,
+            // A3: trailing stop kicks in once we've seen ≥4¢
+            // PnL; thereafter we exit if we give back ≥3¢ from
+            // the high water. The clamp at -stop_loss_cents
+            // means the trailing stop never relaxes our hard
+            // floor.
+            trailing_trigger_cents: 4,
+            trailing_distance_cents: 3,
         }
     }
 }
@@ -135,6 +150,12 @@ pub struct StatStrategy {
     positions: HashMap<String, CachedPosition>,
     last_fire_at: HashMap<String, Instant>,
     last_exit_at: HashMap<String, Instant>,
+    /// A3 — high-water-mark of per-contract PnL per position.
+    /// Ratchets up as mark moves favorably; consulted by the
+    /// trailing-stop branch in evaluate_exit. Cleared when the
+    /// position closes (refresh_positions retains only entries
+    /// whose key is in the current cache).
+    high_water_pnl: HashMap<String, i32>,
     last_rule_refresh: Option<Instant>,
     last_position_refresh: Option<Instant>,
 }
@@ -147,6 +168,7 @@ impl StatStrategy {
             positions: HashMap::new(),
             last_fire_at: HashMap::new(),
             last_exit_at: HashMap::new(),
+            high_water_pnl: HashMap::new(),
             last_rule_refresh: None,
             last_position_refresh: None,
         }
@@ -230,6 +252,9 @@ impl StatStrategy {
                 },
             );
         }
+        // A3 — drop high-water entries for positions that have
+        // closed (no longer in `next`). Keeps the map bounded.
+        self.high_water_pnl.retain(|k, _| next.contains_key(k));
         self.positions = next;
         self.last_position_refresh = Some(Instant::now());
         debug!(n_positions = n, "stat: position cache refreshed");
@@ -305,6 +330,19 @@ impl StatStrategy {
             let take = effective_tp > 0 && pnl_per >= effective_tp;
             let stop = self.config.stop_loss_cents > 0 && pnl_per <= -self.config.stop_loss_cents;
 
+            // A3 — trailing stop. Update the high-water mark
+            // (ratchets up only) and check against the trailing
+            // floor. Trailing fires only after the position has
+            // crossed `trailing_trigger_cents`; before that the
+            // hard `stop_loss_cents` is the only floor.
+            let prev_high = self.high_water_pnl.get(&key).copied().unwrap_or(0);
+            let new_high = prev_high.max(pnl_per);
+            self.high_water_pnl.insert(key.clone(), new_high);
+            let trailing = self.config.trailing_trigger_cents > 0
+                && self.config.trailing_distance_cents > 0
+                && new_high >= self.config.trailing_trigger_cents
+                && pnl_per <= new_high - self.config.trailing_distance_cents;
+
             // A1 — belief-drift exit. Look up the current rule
             // for this market. If model_p has drifted such that
             // residual edge over the unwind mark is below
@@ -334,7 +372,7 @@ impl StatStrategy {
                 }
             }
 
-            if !(take || stop || belief_drift) {
+            if !(take || stop || trailing || belief_drift) {
                 continue;
             }
 
@@ -358,13 +396,15 @@ impl StatStrategy {
                 Side::Yes => "Y",
                 Side::No => "N",
             };
-            // Trigger priority: stop-loss (preserve capital)
-            // wins ties, then belief-drift (thesis dead — exit
-            // before further drift), then take-profit. Each
-            // gets a distinct reason_tag for forensic logs +
-            // dashboard exit-kind classification.
+            // Trigger priority: stop-loss (preserve capital) >
+            // trailing stop (lock partial profit) > belief-drift
+            // (thesis dead) > take-profit. Each gets a distinct
+            // reason_tag for forensic logs + dashboard exit-kind
+            // classification.
             let reason_tag = if stop {
                 "sl"
+            } else if trailing {
+                "ts"
             } else if belief_drift {
                 "bd"
             } else {
@@ -663,11 +703,14 @@ mod tests {
             // them deterministically: take 8¢, stop 5¢.
             take_profit_cents: 8,
             stop_loss_cents: 5,
-            // A1 + A4 disabled by default in tests so existing
-            // tests keep their behavior. Tests that exercise
-            // belief-drift / time-decay set them explicitly.
+            // A1 + A4 + A3 disabled by default in tests so
+            // existing tests keep their behavior. Tests that
+            // exercise belief-drift / time-decay / trailing-stop
+            // set them explicitly.
             min_residual_edge_cents: 0,
             tp_decay_per_hour_cents: 0,
+            trailing_trigger_cents: 0,
+            trailing_distance_cents: 0,
         }
     }
 
@@ -1077,5 +1120,149 @@ mod tests {
             s.evaluate_exit(&MarketTicker::new(ticker), &book, Instant::now())
                 .is_none()
         );
+    }
+
+    // ─── A3 trailing stop tests ──────────────────────────────
+
+    #[test]
+    fn trailing_stop_fires_after_giveback() {
+        // Long YES at 50¢. Trigger 4¢, distance 3¢. Walk:
+        //   tick 1: mark 56 → PnL +6 → high_water 6 (≥4 trigger).
+        //           pnl 6 > high-distance (6-3=3), no fire.
+        //   tick 2: mark 52 → PnL +2 → high_water still 6.
+        //           pnl 2 ≤ 3 → trailing fires.
+        let mut c = cfg();
+        c.trailing_trigger_cents = 4;
+        c.trailing_distance_cents = 3;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-TRAIL-A";
+        let key = position_key(ticker, Side::Yes);
+        s.positions
+            .insert(key.clone(), cached_position(Side::Yes, 4, 50));
+
+        // Tick 1: mark 56.
+        let book1 = book_with_quotes(Some(56), Some(40));
+        assert!(
+            s.evaluate_exit(&MarketTicker::new(ticker), &book1, Instant::now())
+                .is_none(),
+            "first tick within trailing band, no exit"
+        );
+        assert_eq!(s.high_water_pnl.get(&key).copied(), Some(6));
+
+        // Tick 2: mark drops back to 52.
+        // last_exit_at not set yet — proceed.
+        let book2 = book_with_quotes(Some(52), Some(40));
+        let intent = s
+            .evaluate_exit(
+                &MarketTicker::new(ticker),
+                &book2,
+                Instant::now() + Duration::from_secs(120),
+            )
+            .expect("trailing fires");
+        assert!(intent.client_id.contains(":ts:"));
+    }
+
+    #[test]
+    fn trailing_stop_doesnt_fire_below_trigger() {
+        // High water never crosses trigger=4 → trailing inactive.
+        let mut c = cfg();
+        c.trailing_trigger_cents = 4;
+        c.trailing_distance_cents = 3;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-TRAIL-B";
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        // Mark 53 → PnL +3, never crosses 4. Then drops to 50 (PnL 0).
+        let book1 = book_with_quotes(Some(53), Some(40));
+        assert!(
+            s.evaluate_exit(&MarketTicker::new(ticker), &book1, Instant::now())
+                .is_none()
+        );
+        let book2 = book_with_quotes(Some(50), Some(40));
+        assert!(
+            s.evaluate_exit(
+                &MarketTicker::new(ticker),
+                &book2,
+                Instant::now() + Duration::from_secs(120)
+            )
+            .is_none(),
+            "trailing inactive — high water under trigger"
+        );
+    }
+
+    #[test]
+    fn trailing_high_water_only_ratchets_up() {
+        // Mark cycles 50 → 56 → 53 → 60. high_water progression
+        // should be 0 → 6 → 6 → 10 (never decreases).
+        let mut c = cfg();
+        c.trailing_trigger_cents = 4;
+        c.trailing_distance_cents = 3;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-RATCHET";
+        let key = position_key(ticker, Side::Yes);
+        s.positions
+            .insert(key.clone(), cached_position(Side::Yes, 4, 50));
+
+        let books = [
+            (Some(50), Some(40)), // 0
+            (Some(56), Some(40)), // 6
+            (Some(53), Some(40)), // 3 — ratchet stays at 6
+            (Some(60), Some(40)), // 10
+        ];
+        let expected = [0, 6, 6, 10];
+        let now = Instant::now();
+        for (i, (yb, nb)) in books.iter().enumerate() {
+            let book = book_with_quotes(*yb, *nb);
+            let _ = s.evaluate_exit(
+                &MarketTicker::new(ticker),
+                &book,
+                now + Duration::from_secs((i as u64) * 120),
+            );
+            assert_eq!(s.high_water_pnl.get(&key).copied(), Some(expected[i]));
+        }
+    }
+
+    #[test]
+    fn trailing_disabled_when_zero() {
+        let mut c = cfg();
+        c.trailing_trigger_cents = 0;
+        c.trailing_distance_cents = 3;
+        let mut s = StatStrategy::new(c);
+        let ticker = "KX-OFF";
+        s.positions.insert(
+            position_key(ticker, Side::Yes),
+            cached_position(Side::Yes, 4, 50),
+        );
+        // Walk through a profitable peak then back. With trigger=0
+        // trailing is OFF, pnl_per=2 doesn't trigger anything else.
+        let book1 = book_with_quotes(Some(56), Some(40));
+        let _ = s.evaluate_exit(&MarketTicker::new(ticker), &book1, Instant::now());
+        let book2 = book_with_quotes(Some(52), Some(40));
+        assert!(
+            s.evaluate_exit(
+                &MarketTicker::new(ticker),
+                &book2,
+                Instant::now() + Duration::from_secs(120)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn trailing_high_water_cleared_on_position_close() {
+        // After refresh_positions removes a key, the high_water
+        // entry for that key gets pruned.
+        let mut s = StatStrategy::new(cfg());
+        let ticker = "KX-CLOSED";
+        let key = position_key(ticker, Side::Yes);
+        s.positions
+            .insert(key.clone(), cached_position(Side::Yes, 4, 50));
+        s.high_water_pnl.insert(key.clone(), 7);
+        // Simulate refresh that finds zero positions.
+        let next: HashMap<String, CachedPosition> = HashMap::new();
+        s.high_water_pnl.retain(|k, _| next.contains_key(k));
+        assert!(s.high_water_pnl.is_empty());
     }
 }

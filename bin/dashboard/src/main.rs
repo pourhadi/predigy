@@ -906,6 +906,7 @@ fn classify_exit_kind(cid: &str) -> String {
         for (needle, tag) in [
             (":tp:", "tp"),
             (":sl:", "sl"),
+            (":ts:", "ts"),
             (":bd:", "bd"),
             (":conv:", "conv"),
             (":inv:", "inv"),
@@ -1047,8 +1048,9 @@ mod tests {
 
     #[test]
     fn classify_exit_kind_recognises_phase_a_tags() {
-        // A1 belief-drift, A2 convergence + inversion.
+        // A1 belief-drift, A2 convergence + inversion, A3 trailing.
         assert_eq!(classify_exit_kind("stat-exit:KX-A:Y:bd:00abcdef"), "bd");
+        assert_eq!(classify_exit_kind("stat-exit:KX-A:Y:ts:00abcdef"), "ts");
         assert_eq!(
             classify_exit_kind("cross-arb-exit:KX-B:Y:conv:53:0004"),
             "conv"
@@ -1057,5 +1059,6 @@ mod tests {
             classify_exit_kind("cross-arb-exit:KX-C:Y:inv:52:0004"),
             "inv"
         );
+        assert_eq!(classify_exit_kind("cross-arb-exit:KX-D:Y:ts:52:0004"), "ts");
     }
 }
