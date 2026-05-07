@@ -329,11 +329,44 @@ text frame is emitted on the configured cadence) and
 `pong_response_is_silently_dropped` (verifies `"PONG"` doesn't
 surface as a Malformed event).
 
-## Engine refactor begun 2026-05-07
+## Engine refactor — checkpoint 2026-05-07
 
-The architectural pivot — fragmented multi-binary system → one
-consolidated `predigy-engine` with shared state and a Postgres
-database — kicked off this session. **Phases 0 and 1 done.**
+The architectural pivot from a fragmented multi-binary system to
+the consolidated `predigy-engine` with shared state + Postgres is
+underway. **Phases 0–3.2 done; Phase 3.3+ blocked on Kalshi FIX
+access (in progress with Kalshi institutional team).**
+
+Status by phase (full plan in `docs/ARCHITECTURE.md`):
+
+| Phase | Status |
+|---|---|
+| 0  Setup | Done — Postgres 16.13, peer auth, predigy DB live |
+| 1  Schema + import | Done — 13 tables, predigy-import idempotent + scheduled hourly |
+| 2  Engine skeleton + DB read path | Done — engine boots, supervises, dashboard reads DB |
+| 3.1  Stat strategy module | Done — logic ported with 9 unit tests |
+| 3.2  Engine wired end-to-end (shadow mode) | Done — 45 shadow intents emitted live in 04:33 UTC test |
+| 3.3  Parity verification | Pending — needs 24-48h shadow-vs-legacy diff window |
+| 3.4  Cutover (engine Live + retire legacy stat-trader) | **Blocked on Phase 4** |
+| 4  FIX as primary order path | **BLOCKED on Kalshi access** — emailing `institutional@kalshi.com` |
+| 5  Port remaining strategies (cross-arb, latency, settlement, wx-stat) | Can run autonomously in shadow mode while waiting |
+| 6  Active position management | Can run autonomously after 5 |
+| 7  Retire scaffolding (legacy daemons + JSON files) | After 5 + parity |
+
+What's running in production right now (legacy daemons, not
+engine; engine is shadow-mode only): same 9 launchd jobs as
+before plus `com.predigy.import` (every 30 min) keeping the DB
+in sync. Dashboard reads DB-derived state.
+
+Engine binary built + boot-tested but **not** added to launchd
+yet — the manual smoke test (~6 sec runtime) emitted 45 shadow
+intents and shut down cleanly. Production launchd integration
+waits until parity verification (Phase 3.3) confirms the engine's
+decisions match the legacy daemon's.
+
+Kalshi FIX is the gating ask. Once they grant access, Phases
+3.3 → 3.4 → 4 unblock as a single dependent chain.
+
+## Original entry — kept for reference
 
 Source-of-truth docs:
 - `docs/ARCHITECTURE.md` — target architecture, full migration

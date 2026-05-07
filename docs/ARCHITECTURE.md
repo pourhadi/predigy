@@ -331,7 +331,7 @@ The migration is strictly additive through Phase 4. The existing
 daemons keep running and making fills. We don't lose volume during
 the work.
 
-### Phase 0 — Setup (this session)
+### Phase 0 — Setup (DONE 2026-05-07)
 
 - [x] Install Postgres 16 via Homebrew
 - [x] Create `predigy` database + role with peer auth
@@ -339,40 +339,60 @@ the work.
 - [x] Verify connection from a test program
 - [x] Document the install + connection in this doc
 
-### Phase 1 — Schema + import tool
+### Phase 1 — Schema + import tool (DONE 2026-05-07)
 
-- [ ] `migrations/0001_initial.sql` with all tables + indexes
+- [x] `migrations/0001_initial.sql` with all tables + indexes
 - [ ] `migrations/0002_views.sql` with materialised views
-- [ ] `bin/predigy-import` reads existing JSON state files and
-      bulk-inserts into the DB. Idempotent — running it twice
-      doesn't double-count.
-- [ ] Run the import once. Verify row counts match the JSON
-      sources (positions, fills if available from logs, rules).
-- [ ] Add a launchd job that runs `predigy-import` hourly so the
-      DB stays in sync until Phase 3 flips the write path over.
+      *(deferred — not blocking; views can be added when query
+      patterns crystallise)*
+- [x] `bin/predigy-import` reads existing JSON state files and
+      bulk-inserts into the DB. Idempotent.
+- [x] Run the import once. First-pass: 183 markets / 62 intents /
+      175 rules.
+- [x] Add a launchd job that runs `predigy-import` every 30 min so
+      the DB stays in sync until Phase 5 flips the write path over.
+      `com.predigy.import` plist + `deploy/scripts/predigy-import-run.sh`.
 
-### Phase 2 — Engine skeleton + Postgres read path
+### Phase 2 — Engine skeleton + Postgres read path (DONE 2026-05-07)
 
-- [ ] New `bin/predigy-engine` crate. Boots one Kalshi WS + REST
-      client. Holds a sqlx pool. No strategies running yet.
-- [ ] Move dashboard to query the DB instead of JSON files.
-      Existing dashboard plist still works; just reads new path.
-- [ ] Engine exposes a Strategy trait + module loader.
+- [x] New `crates/engine-core/` and `bin/predigy-engine/`.
+      Engine boots, runs migrations, owns the OMS, supervises
+      strategy modules. 14 unit + 12 integration tests.
+- [x] Dashboard queries DB-derived state (per-strategy daily PnL,
+      kill-switch, in-flight count) with JSON fallback for
+      degraded-mode operation.
+- [x] Engine exposes the `Strategy` trait + module registry.
 
 ### Phase 3 — First strategy ported (stat-trader)
 
-- [ ] `crates/strategies/stat` implements Strategy.
-- [ ] Engine runs stat module under dual-write: writes positions/
-      intents/fills to BOTH the DB AND the legacy JSON file the
-      dashboard reads.
-- [ ] Run for 24-48 hours. Diff DB vs JSON. Confirm parity.
-- [ ] Flip the dashboard read path to DB-only.
-- [ ] Retire `bin/stat-trader` and its launchd plist.
+- [x] **Phase 3.1**: `crates/strategies/stat/` implements
+      `Strategy`. All legacy logic preserved verbatim. 9 unit tests.
+- [x] **Phase 3.2**: Engine runs stat module in **shadow mode**
+      by default — intents persist with status='shadow' in the DB
+      and never reach Kalshi. Live-verified 2026-05-07: 45 shadow
+      intents emitted from 61 subscribed markets in <1s; legacy
+      stat-trader still trades unaffected.
+- [ ] **Phase 3.3 (BLOCKED on FIX access)**: parity-verification
+      tool — diff engine shadow intents vs legacy stat-trader fills
+      across a 24-48h window. Tool can be built without FIX, but
+      the cutover decision waits.
+- [ ] **Phase 3.4 (BLOCKED on Phase 4)**: flip engine to Live
+      mode + retire legacy stat-trader. Requires the FIX path.
 
-### Phase 4 — FIX wired in
+### Phase 4 — FIX wired in (BLOCKED on Kalshi-side approval)
 
-- [ ] Engine's order path uses FIX as primary. Logon at startup,
-      reconnect on session loss.
+Status as of 2026-05-07: Kalshi FIX requires institutional-grade
+onboarding. Operator emailing `institutional@kalshi.com` with
+the request. See "Kalshi FIX onboarding" section below for the
+process + technical requirements + draft email.
+
+Once approved:
+- [ ] Existing `predigy-kalshi-fix` crate updated to FIXT.1.1 +
+      FIX 5.0 SP2 (currently coded against FIX 4.4 per pre-session
+      docs; Kalshi's live spec is FIX 5.0 SP2). Schema diff is
+      modest — most of the session-layer code transfers.
+- [ ] Engine boots a FIX session at startup. Logon with
+      `ResetSeqNumFlag=true` (mandatory per spec for non-RT gateway).
 - [ ] Hot-path orders route FIX-first; REST fallback if session
       down.
 - [ ] Verify on stat-trader's order flow first (low volume, easy
@@ -520,6 +540,52 @@ future-us doesn't redo them.
 - If the refactor stalls midway, the system stays operational.
 
 ---
+
+## Kalshi FIX onboarding
+
+FIX is gated. Per `docs.kalshi.com/fix/connectivity` + the
+institutional onboarding flow at `institutional.kalshi.com`,
+the process is:
+
+1. **Institutional account.** Apply via
+   `institutional.kalshi.com` (entity application form). Required:
+   entity formation docs, W-9 / W-8, source of funds, beneficial-
+   owner IDs (10%+). All English or certified translation.
+2. **Email `institutional@kalshi.com`** with the FIX-access
+   request. Reference the institutional account, summarise
+   technical sophistication and current REST trading activity,
+   ask for the application path + minimum-activity criteria.
+3. **They send credentials**: a UUID-format FIX API Key (used
+   as `SenderCompID`) plus the certificate to pin on the
+   initiator side.
+4. **Connect**:
+   - Demo: `fix.demo.kalshi.co` (test-driven onboarding before
+     prod credentials)
+   - Prod: `mm.fix.elections.kalshi.com`
+   - 5 gateways:
+     | Port | TargetCompID | Purpose |
+     |---|---|---|
+     | 8228 | `KalshiNR` | Order Entry, no retransmission |
+     | 8230 | `KalshiRT` | Order Entry with retransmission + RFQ (institutional) |
+     | 8229 | `KalshiDC` | Drop Copy (historical execution queries) |
+     | 8231 | `KalshiPT` | Post Trade (settlement streams, institutional) |
+     | 8232 | `KalshiRFQ` | Market Maker quoting |
+   - Wire: **FIXT.1.1 + FIX 5.0 SP2**, TLS 1.2+ mandatory,
+     AWS Network Load Balancer cipher suites.
+   - Logon: `ResetSeqNumFlag=true` for non-retransmission
+     gateways (NR / DC / PT). Each API key is single-connection.
+
+For predigy, the relevant gateway is **Order Entry NR (port
+8228, KalshiNR)** — non-RT is fine for our latency profile;
+ResetSeqNumFlag-on-logon avoids the retransmission state-
+machine complexity.
+
+The existing `crates/kalshi-fix` was coded against FIX 4.4 (per
+older docs). Verify against the current spec on Kalshi's
+sending the credentials — likely needs the FIXT.1.1 session-
+layer header but most application-layer message types
+(NewOrderSingle / OrderCancel / ExecutionReport) are unchanged
+between 4.4 and 5.0 SP2.
 
 ## Glossary
 
