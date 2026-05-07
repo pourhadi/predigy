@@ -6,12 +6,12 @@
 > operator-action requirement (A / —).
 >
 > **Status update 2026-05-07 (post-shipping):** A1, A2, A3, A4, A5,
-> A6, B2, B3, I2, I3, I4, I5, I6, S1, S2 all shipped (see commits
-> 57a28fc through this one). B1, B7 are operator-action items.
-> B4 (FIX) + B5 (maker rebates) + S7 (MM) + I1 (maker exec) gated
-> on Kalshi access or $25K capital. I7 (atomic multi-leg), S3, S4,
-> S5, S6, S8, S9 still pending — each needs new infrastructure
-> (new feed, price-history store) or coupled to deferred I7.
+> A6, B2, B3, I2, I3, I4, I5, I6, I7, S1, S2 all shipped (see
+> commits 57a28fc through this one). B1, B7 are operator-action
+> items. B4 (FIX) + B5 (maker rebates) + S7 (MM) + I1 (maker exec)
+> gated on Kalshi access or $25K capital. S3, S4, S5, S6, S8, S9
+> still pending — S3 and S9 now unblocked since I7 (their
+> infrastructure dependency) shipped.
 
 ---
 
@@ -404,16 +404,57 @@ Add a 5-second grace window after WS connect during which
 strategies skip evaluation. Logged as G1 in `STATUS.md` open
 issues.
 
-### I7 — Multi-leg / atomic submit (cost: M)
+### I7 — Multi-leg / atomic submit (cost: M) **SHIPPED 2026-05-07**
 
-For S3 (sum-to-1 arb) and S9 (multi-leg), we need to submit
-multiple intents atomically: "all legs fire OR none fire". The
-OMS today is single-leg.
+Foundation for S3 (sum-to-1 arb) and S9 (multi-leg arb).
 
-Add a `LegGroup` abstraction: a set of intents that share an
-all-or-none constraint. The OMS pre-checks risk caps for the
-combined notional, then submits all legs; if any fails, cancels
-the others.
+- `LegGroup { group_id: Uuid, intents: Vec<Intent> }` lives in
+  `engine_core::intent`. `LegGroup::new()` allocates a fresh UUID;
+  `LegGroup::with_id()` reattaches a known UUID for replay.
+- `Oms::submit_group(LegGroup) -> SubmitGroupOutcome` — new trait
+  method.
+- `SubmitGroupOutcome` variants: `Submitted` (all legs persisted
+  with shared `group_id`), `Idempotent` (every leg already exists
+  under the same group), `Rejected` (returns first failing
+  leg + reason — no rows inserted), `PartialCollision` (some
+  legs already exist under a different/no group; refuses to graft).
+- DbBackedOms impl performs:
+  1. Per-leg pre-check (kill switch + shape).
+  2. Idempotency probe across all legs simultaneously.
+  3. Combined-notional cap check (sum of all leg projected
+     notional vs strategy + global caps), plus per-leg
+     contract-side cap.
+  4. Atomic insert: every leg's `intents` row + `intent_events`
+     row inside one Postgres transaction. All-or-none.
+- **Cancellation cascade**: when `apply_execution` records a
+  `Rejected` or `Expired` status for a leg with a non-NULL
+  `leg_group_id`, the OMS marks every still-active sibling leg
+  `cancel_requested` in the same transaction and emits a cascade
+  event with `cascade_source` + `leg_group_id` provenance. The
+  venue router then sends cancels for those siblings just like
+  any other operator-triggered cancel.
+
+DB:
+- Migration `0002_leg_group.sql` adds `leg_group_id UUID NULL`
+  to `intents` plus a partial index on the non-NULL subset.
+  Single-leg submits leave the column NULL — fully backwards
+  compatible.
+
+Tests (6 new integration, all passing against `predigy_test`):
+- 2-leg submit persists both legs with the same group_id; both
+  intent_events fire.
+- Kill-switch arms → group rejects, no rows inserted.
+- Combined notional cap rejects whole group even when each leg
+  alone would pass.
+- Idempotent replay returns Idempotent + leaves count at 2.
+- Same client_id reused across distinct group constructions
+  returns PartialCollision (operator must resolve).
+- Venue rejection on leg 1 cascade-cancels leg 2; cascade event
+  carries the source client_id and leg_group_id for forensics.
+
+What this enables: S3 (Kalshi-internal sum-to-1 arb) and S9
+(settlement-time multi-leg arb) can now construct LegGroups and
+get DB-side atomicity + venue-side cascade cancellation for free.
 
 ---
 

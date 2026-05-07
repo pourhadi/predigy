@@ -26,8 +26,47 @@
 //!   on.
 
 use crate::error::{EngineError, EngineResult};
-use crate::intent::Intent;
+use crate::intent::{Intent, LegGroup};
 use serde::{Deserialize, Serialize};
+
+/// **Audit I7** — outcome of submitting a `LegGroup` (atomic
+/// multi-leg). Either every leg lands in the DB tagged with the
+/// shared `group_id`, or none do.
+#[derive(Debug, Clone)]
+pub enum SubmitGroupOutcome {
+    /// All legs persisted with the shared `group_id` and queued
+    /// for venue submission. `client_ids` is the order they were
+    /// inserted (matches `LegGroup.intents`).
+    Submitted {
+        group_id: uuid::Uuid,
+        client_ids: Vec<String>,
+        venue: VenueChoice,
+    },
+    /// Every leg already exists in the DB under the same
+    /// `group_id` — replay collapses to a no-op. Returned when
+    /// the strategy retries with the same group construction.
+    Idempotent {
+        group_id: uuid::Uuid,
+        client_ids: Vec<String>,
+    },
+    /// One or more legs failed pre-check or risk caps. The whole
+    /// group rejects — no rows inserted.
+    Rejected {
+        reason: RejectionReason,
+        /// Which leg's client_id caused the rejection. The
+        /// remaining legs are not re-checked.
+        failing_client_id: String,
+    },
+    /// Mixed-state collision: some of the supplied client_ids
+    /// already exist in the DB under a DIFFERENT group_id (or
+    /// with no group_id at all). The OMS refuses to retroactively
+    /// graft a group; the operator must resolve manually. This
+    /// is structurally a strategy bug — same client_id reused
+    /// across distinct group constructions.
+    PartialCollision {
+        existing: Vec<(String, Option<uuid::Uuid>)>,
+    },
+}
 
 /// Outcome of submitting an intent to the OMS.
 #[derive(Debug, Clone)]
@@ -191,6 +230,14 @@ impl RiskCaps {
 #[async_trait::async_trait]
 pub trait Oms: Send + Sync {
     async fn submit(&self, intent: Intent) -> EngineResult<SubmitOutcome>;
+
+    /// **Audit I7** — atomic multi-leg submit. Pre-checks every
+    /// leg AND the combined notional against caps; if any leg
+    /// fails, the whole group rejects without persisting any
+    /// rows. On success every member intent is inserted with the
+    /// same `leg_group_id` inside one DB transaction, and the
+    /// venue router picks them up just like single-leg intents.
+    async fn submit_group(&self, group: LegGroup) -> EngineResult<SubmitGroupOutcome>;
 
     async fn cancel(&self, client_id: &str) -> EngineResult<()>;
 

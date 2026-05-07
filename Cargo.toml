@@ -162,6 +162,7 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 # for rationale + connection convention.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [profile.release]
 opt-level = 3

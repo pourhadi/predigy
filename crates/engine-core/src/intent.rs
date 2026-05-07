@@ -59,3 +59,58 @@ pub enum Tif {
     Gtc,
     Fok,
 }
+
+/// **Audit I7** — atomic multi-leg submit. A `LegGroup` carries a
+/// set of intents that share an all-or-none persistence
+/// constraint at the OMS layer. The OMS pre-checks every leg AND
+/// the combined notional against caps; if any leg or the
+/// aggregate fails, the whole group rejects without touching the
+/// `intents` table. On success every leg gets the same
+/// `group_id`, persisted in one DB transaction.
+///
+/// Venue-side atomicity is not promised — Kalshi has no native
+/// multi-leg orders. The guarantees we DO make:
+///
+/// 1. All legs persist together or none do (DB transaction).
+/// 2. Pre-check fails the group on the first failing leg's
+///    reason (no half-checked state).
+/// 3. The shared `group_id` lets `apply_execution` cascade a
+///    venue-side cancel/reject across siblings — when one leg's
+///    venue submit fails, the OMS cancels the others by their
+///    group membership.
+///
+/// Single-leg constructors stay on `Oms::submit`; only S3 / S9
+/// style multi-leg arb strategies need `submit_group`. Existing
+/// strategies are unaffected.
+#[derive(Debug, Clone)]
+pub struct LegGroup {
+    pub group_id: uuid::Uuid,
+    pub intents: Vec<Intent>,
+}
+
+impl LegGroup {
+    /// Construct a new group with a fresh UUID. Returns `None` if
+    /// the input is empty — a zero-leg group is meaningless and
+    /// catching it here saves an OMS round trip.
+    #[must_use]
+    pub fn new(intents: Vec<Intent>) -> Option<Self> {
+        if intents.is_empty() {
+            return None;
+        }
+        Some(Self {
+            group_id: uuid::Uuid::new_v4(),
+            intents,
+        })
+    }
+
+    /// Reconstruct a group with a known UUID. Used by tests and
+    /// by recovery paths that re-attach pre-existing rows to a
+    /// known group id.
+    #[must_use]
+    pub fn with_id(group_id: uuid::Uuid, intents: Vec<Intent>) -> Option<Self> {
+        if intents.is_empty() {
+            return None;
+        }
+        Some(Self { group_id, intents })
+    }
+}

@@ -21,9 +21,10 @@
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
 use predigy_engine::oms_db::{DbBackedOms, EngineMode};
-use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::intent::{Intent, IntentAction, LegGroup, OrderType, Tif};
 use predigy_engine_core::oms::{
-    ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, RejectionReason, RiskCaps, SubmitOutcome,
+    ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, RejectionReason, RiskCaps,
+    SubmitGroupOutcome, SubmitOutcome,
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -740,4 +741,265 @@ async fn global_notional_cap_disabled_when_zero() {
         matches!(outcome, SubmitOutcome::Submitted { .. }),
         "global cap disabled should permit; got {outcome:?}"
     );
+}
+
+// ─── I7 — atomic multi-leg submit ──────────────────────────
+
+fn buy_no(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent {
+    Intent {
+        client_id: client_id.into(),
+        strategy: "test",
+        market: MarketTicker::new(ticker),
+        side: Side::No,
+        action: IntentAction::Buy,
+        price_cents: Some(price_cents),
+        qty,
+        order_type: OrderType::Limit,
+        tif: Tif::Ioc,
+        reason: Some("integration test (no leg)".into()),
+    }
+}
+
+#[tokio::test]
+async fn submit_group_persists_all_legs_with_shared_id() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-LG-A").await;
+    ensure_market(&pool, "KX-LG-B").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    let group = LegGroup::new(vec![
+        buy_yes("test:LGA:0001", "KX-LG-A", 1, 30),
+        buy_no("test:LGB:0001", "KX-LG-B", 1, 40),
+    ])
+    .unwrap();
+    let group_id = group.group_id;
+
+    let outcome = oms.submit_group(group).await.unwrap();
+    match outcome {
+        SubmitGroupOutcome::Submitted {
+            group_id: gid,
+            client_ids,
+            ..
+        } => {
+            assert_eq!(gid, group_id);
+            assert_eq!(client_ids.len(), 2);
+        }
+        other => panic!("expected Submitted; got {other:?}"),
+    }
+
+    let rows: Vec<(String, Option<uuid::Uuid>)> =
+        sqlx::query_as("SELECT client_id, leg_group_id FROM intents ORDER BY client_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (_cid, gid) in &rows {
+        assert_eq!(*gid, Some(group_id));
+    }
+
+    // Two intent_events rows, one per leg.
+    let n_events: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM intent_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n_events.0, 2);
+}
+
+#[tokio::test]
+async fn submit_group_rejects_whole_group_on_kill_switch() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-LG-K1").await;
+    ensure_market(&pool, "KX-LG-K2").await;
+    let ks = Arc::new(KillSwitchView::new());
+    ks.arm();
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    let group = LegGroup::new(vec![
+        buy_yes("test:K1:0001", "KX-LG-K1", 1, 30),
+        buy_no("test:K2:0001", "KX-LG-K2", 1, 40),
+    ])
+    .unwrap();
+
+    let outcome = oms.submit_group(group).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::KillSwitchArmed { .. },
+                ..
+            }
+        ),
+        "expected KillSwitchArmed rejection, got {outcome:?}"
+    );
+
+    // No rows should have been inserted.
+    let n: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM intents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n.0, 0, "rejected group must not persist");
+}
+
+#[tokio::test]
+async fn submit_group_rejects_on_combined_notional_cap() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-LG-N1").await;
+    ensure_market(&pool, "KX-LG-N2").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let mut caps = permissive_caps();
+    // 2 legs × 50 × 5¢ = 500¢ projected. Cap at 400 forces a
+    // group-level reject even though each leg alone (250¢) would
+    // pass.
+    caps.max_notional_cents = 400;
+    let oms = DbBackedOms::new(pool.clone(), caps, ks);
+
+    let group = LegGroup::new(vec![
+        buy_yes("test:N1:0001", "KX-LG-N1", 50, 5),
+        buy_no("test:N2:0001", "KX-LG-N2", 50, 5),
+    ])
+    .unwrap();
+    let outcome = oms.submit_group(group).await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::NotionalExceeded { .. },
+                ..
+            }
+        ),
+        "expected combined-notional rejection; got {outcome:?}"
+    );
+    let n: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM intents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n.0, 0);
+}
+
+#[tokio::test]
+async fn submit_group_idempotent_on_replay() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-LG-I1").await;
+    ensure_market(&pool, "KX-LG-I2").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    let group_id = uuid::Uuid::new_v4();
+    let intents = vec![
+        buy_yes("test:I1:0001", "KX-LG-I1", 1, 30),
+        buy_no("test:I2:0001", "KX-LG-I2", 1, 40),
+    ];
+    let group = LegGroup::with_id(group_id, intents.clone()).unwrap();
+    let _ = oms.submit_group(group).await.unwrap();
+
+    // Replay with the same group_id and same client_ids.
+    let group2 = LegGroup::with_id(group_id, intents).unwrap();
+    let outcome = oms.submit_group(group2).await.unwrap();
+    match outcome {
+        SubmitGroupOutcome::Idempotent { group_id: gid, .. } => assert_eq!(gid, group_id),
+        other => panic!("expected Idempotent, got {other:?}"),
+    }
+
+    // Still exactly 2 intents in DB.
+    let n: (i64,) = sqlx::query_as("SELECT COUNT(*)::BIGINT FROM intents")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n.0, 2);
+}
+
+#[tokio::test]
+async fn submit_group_partial_collision_when_cid_reused_under_different_group() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-LG-P1").await;
+    ensure_market(&pool, "KX-LG-P2").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new(pool.clone(), permissive_caps(), ks);
+
+    // First: a single-leg submit (no group). Same client_id.
+    let lone = buy_yes("test:P1:0001", "KX-LG-P1", 1, 30);
+    let _ = oms.submit(lone).await.unwrap();
+
+    // Second: a group that includes that same client_id.
+    let group = LegGroup::new(vec![
+        buy_yes("test:P1:0001", "KX-LG-P1", 1, 30),
+        buy_no("test:P2:0001", "KX-LG-P2", 1, 40),
+    ])
+    .unwrap();
+    let outcome = oms.submit_group(group).await.unwrap();
+    match outcome {
+        SubmitGroupOutcome::PartialCollision { existing } => {
+            assert_eq!(existing.len(), 1);
+            assert_eq!(existing[0].0, "test:P1:0001");
+            assert_eq!(existing[0].1, None);
+        }
+        other => panic!("expected PartialCollision, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejection_cascades_cancel_request_to_sibling_legs() {
+    let _g = test_lock().await;
+    let pool = fresh_pool().await;
+    ensure_market(&pool, "KX-LG-C1").await;
+    ensure_market(&pool, "KX-LG-C2").await;
+    let ks = Arc::new(KillSwitchView::new());
+    let oms = DbBackedOms::new_with_mode(
+        pool.clone(),
+        permissive_caps(),
+        ks,
+        EngineMode::Live,
+    );
+
+    let group = LegGroup::new(vec![
+        buy_yes("test:C1:0001", "KX-LG-C1", 1, 30),
+        buy_no("test:C2:0001", "KX-LG-C2", 1, 40),
+    ])
+    .unwrap();
+    let _ = oms.submit_group(group).await.unwrap();
+
+    // Simulate venue-side rejection of leg 1.
+    oms.apply_execution(ExecutionUpdate {
+        client_id: "test:C1:0001".into(),
+        venue_order_id: None,
+        venue_fill_id: None,
+        status: ExecutionStatus::Rejected,
+        cumulative_qty: 0,
+        avg_fill_price_cents: None,
+        last_fill_qty: None,
+        last_fill_price_cents: None,
+        last_fill_fee_cents: None,
+        venue_payload: serde_json::json!({"reason": "venue rejected"}),
+    })
+    .await
+    .unwrap();
+
+    // Sibling leg (C2) must be marked cancel_requested by the
+    // cascade.
+    let row: (String,) = sqlx::query_as("SELECT status FROM intents WHERE client_id = $1")
+        .bind("test:C2:0001")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.0, "cancel_requested",
+        "sibling leg should be cascade-cancelled"
+    );
+
+    // The cascade event is recorded in intent_events.
+    let cascade_evs: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*)::BIGINT FROM intent_events
+          WHERE client_id = $1 AND status = 'cancel_requested'",
+    )
+    .bind("test:C2:0001")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cascade_evs.0, 1);
 }

@@ -17,10 +17,10 @@
 
 use async_trait::async_trait;
 use predigy_engine_core::error::{EngineError, EngineResult};
-use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif};
+use predigy_engine_core::intent::{Intent, IntentAction, LegGroup, OrderType, Tif};
 use predigy_engine_core::oms::{
     ExecutionStatus, ExecutionUpdate, KillSwitchView, Oms, ReconciliationDiff, RejectionReason,
-    RiskCaps, SubmitOutcome, VenueChoice,
+    RiskCaps, SubmitGroupOutcome, SubmitOutcome, VenueChoice,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -327,6 +327,222 @@ impl Oms for DbBackedOms {
         })
     }
 
+    async fn submit_group(&self, group: LegGroup) -> EngineResult<SubmitGroupOutcome> {
+        // **Audit I7** — atomic multi-leg submit.
+        //
+        // Flow:
+        //   1. Pre-check every leg in isolation (kill switch +
+        //      shape). First failure rejects the whole group.
+        //   2. Idempotency probe: load every existing
+        //      (client_id, leg_group_id) for the legs. If ALL legs
+        //      already exist under THIS group_id, return
+        //      Idempotent. If any legs exist under a different
+        //      group (or with NULL leg_group_id), return
+        //      PartialCollision.
+        //   3. Compute combined exposure (sum of all leg
+        //      notionals) and check per-strategy + global caps.
+        //      Each leg also checks its own contract-side and
+        //      in-flight caps.
+        //   4. Open a single Postgres transaction; insert every
+        //      leg's `intents` row with the shared
+        //      `leg_group_id`, plus its `intent_events` initial
+        //      transition. Commit atomically.
+        //
+        // Kalshi has no native multi-leg orders; venue-side
+        // atomicity is best-effort (the WS rejection cascade is
+        // implemented in `apply_execution`). What this function
+        // guarantees is *DB-side* atomicity.
+
+        // 1. Per-leg pre-check.
+        for intent in &group.intents {
+            if let Err(reason) = self.pre_check(intent) {
+                return Ok(SubmitGroupOutcome::Rejected {
+                    reason,
+                    failing_client_id: intent.client_id.clone(),
+                });
+            }
+        }
+
+        // 2. Idempotency / collision probe.
+        let client_ids: Vec<String> =
+            group.intents.iter().map(|i| i.client_id.clone()).collect();
+        let existing: Vec<(String, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT client_id, leg_group_id FROM intents WHERE client_id = ANY($1)",
+        )
+        .bind(&client_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        if !existing.is_empty() {
+            // Are ALL members of `group` accounted for, AND under
+            // the same group_id?
+            let all_present = existing.len() == group.intents.len();
+            let same_group = existing
+                .iter()
+                .all(|(_, gid)| gid.as_ref() == Some(&group.group_id));
+            if all_present && same_group {
+                debug!(
+                    group_id = %group.group_id,
+                    n_legs = group.intents.len(),
+                    "oms: idempotent leg-group re-submit"
+                );
+                return Ok(SubmitGroupOutcome::Idempotent {
+                    group_id: group.group_id,
+                    client_ids,
+                });
+            }
+            // Partial overlap — dangerous. Refuse and let the
+            // operator resolve.
+            warn!(
+                group_id = %group.group_id,
+                n_existing = existing.len(),
+                n_legs = group.intents.len(),
+                "oms: leg-group submit collides with existing rows under different (or no) group"
+            );
+            return Ok(SubmitGroupOutcome::PartialCollision { existing });
+        }
+
+        // 3. Combined exposure check. We compute the strategy's
+        //    AND global notional ONCE and add the combined
+        //    leg-projected notional. Per-leg side / in-flight
+        //    caps still apply individually.
+        let caps = &self.risk_caps;
+        if group.intents.is_empty() {
+            // Defensive — `LegGroup::new` already rejects empty.
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::InvalidIntent {
+                    reason: "empty leg group".into(),
+                },
+                failing_client_id: String::new(),
+            });
+        }
+
+        // Combined notional first, ~one snapshot of strategy +
+        // global state. `current_exposure` is keyed on the leg's
+        // ticker for the contract-side check; for combined
+        // notional we re-use the snapshot from the first leg.
+        let first = &group.intents[0];
+        let baseline = self.current_exposure(first).await?;
+        let combined_added: i64 = group
+            .intents
+            .iter()
+            .map(|i| i64::from(i.price_cents.unwrap_or(50)) * i64::from(i.qty))
+            .sum();
+
+        if baseline.daily_realized_pnl_cents < -caps.max_daily_loss_cents {
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::DailyLossExceeded {
+                    strategy: first.strategy,
+                },
+                failing_client_id: first.client_id.clone(),
+            });
+        }
+        if baseline.in_flight + i32::try_from(group.intents.len()).unwrap_or(i32::MAX)
+            > caps.max_in_flight
+        {
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::TooManyInFlight {
+                    strategy: first.strategy,
+                    in_flight: baseline.in_flight,
+                    limit: caps.max_in_flight,
+                },
+                failing_client_id: first.client_id.clone(),
+            });
+        }
+        if baseline.strategy_notional_cents + combined_added > caps.max_notional_cents {
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::NotionalExceeded {
+                    scope: format!("strategy:{}", first.strategy),
+                    current_cents: baseline.strategy_notional_cents,
+                    limit_cents: caps.max_notional_cents,
+                },
+                failing_client_id: first.client_id.clone(),
+            });
+        }
+        if caps.max_global_notional_cents > 0
+            && baseline.global_notional_cents + combined_added > caps.max_global_notional_cents
+        {
+            return Ok(SubmitGroupOutcome::Rejected {
+                reason: RejectionReason::NotionalExceeded {
+                    scope: "global".into(),
+                    current_cents: baseline.global_notional_cents,
+                    limit_cents: caps.max_global_notional_cents,
+                },
+                failing_client_id: first.client_id.clone(),
+            });
+        }
+
+        // Per-leg contract-side cap. Each leg's check is
+        // independent of others (different ticker → different
+        // `(strategy, ticker, side)` row in `positions`).
+        for intent in &group.intents {
+            let exposure = self.current_exposure(intent).await?;
+            let projected = exposure.current_contracts + intent.qty;
+            if projected > caps.max_contracts_per_side {
+                return Ok(SubmitGroupOutcome::Rejected {
+                    reason: RejectionReason::ContractCapExceeded {
+                        ticker: intent.market.as_str().to_string(),
+                        side: side_to_str(intent).to_string(),
+                        current: projected,
+                        limit: caps.max_contracts_per_side,
+                    },
+                    failing_client_id: intent.client_id.clone(),
+                });
+            }
+        }
+
+        // 4. Atomic insert. All-or-none — if any insert fails the
+        //    whole transaction rolls back and we return the DB
+        //    error.
+        let initial_status = self.mode.initial_status();
+        let mut tx = self.pool.begin().await?;
+        for intent in &group.intents {
+            sqlx::query(
+                "INSERT INTO intents
+                    (client_id, strategy, ticker, side, action, price_cents,
+                     qty, order_type, tif, status, cumulative_qty, reason,
+                     leg_group_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11, 0, $10, $12)",
+            )
+            .bind(&intent.client_id)
+            .bind(intent.strategy)
+            .bind(intent.market.as_str())
+            .bind(side_to_str(intent))
+            .bind(action_to_str(intent.action))
+            .bind(intent.price_cents)
+            .bind(intent.qty)
+            .bind(order_type_to_str(intent.order_type))
+            .bind(tif_to_str(intent.tif))
+            .bind(intent.reason.as_deref())
+            .bind(initial_status)
+            .bind(group.group_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO intent_events (client_id, status, venue_payload)
+                 VALUES ($1, $2, NULL)",
+            )
+            .bind(&intent.client_id)
+            .bind(initial_status)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        info!(
+            group_id = %group.group_id,
+            n_legs = group.intents.len(),
+            combined_notional_cents = combined_added,
+            "oms: leg group persisted atomically"
+        );
+
+        Ok(SubmitGroupOutcome::Submitted {
+            group_id: group.group_id,
+            client_ids,
+            venue: VenueChoice::Rest,
+        })
+    }
+
     async fn cancel(&self, client_id: &str) -> EngineResult<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -380,6 +596,64 @@ impl Oms for DbBackedOms {
         .bind(&ev.venue_payload)
         .execute(&mut *tx)
         .await?;
+
+        // 2b. **Audit I7** — leg-group cancellation cascade.
+        //
+        // When any leg of a group is venue-rejected, the
+        // remaining still-active siblings (status NOT IN terminal
+        // set) are marked `cancel_requested` so the venue router
+        // sends cancels for them. Skip cascading on Filled —
+        // partial fills are handled by the strategy, not this
+        // path. Done inside the same transaction as the leg's
+        // own status update so we can't observe a partial
+        // cascade on crash.
+        if matches!(
+            ev.status,
+            ExecutionStatus::Rejected | ExecutionStatus::Expired
+        ) {
+            let group_id: Option<(Option<uuid::Uuid>,)> =
+                sqlx::query_as("SELECT leg_group_id FROM intents WHERE client_id = $1")
+                    .bind(&ev.client_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some((Some(gid),)) = group_id {
+                let cascaded: Vec<(String,)> = sqlx::query_as(
+                    "UPDATE intents
+                        SET status = 'cancel_requested',
+                            last_updated_at = now()
+                      WHERE leg_group_id = $1
+                        AND client_id != $2
+                        AND status NOT IN ('filled','cancelled','rejected','expired','cancel_requested')
+                      RETURNING client_id",
+                )
+                .bind(gid)
+                .bind(&ev.client_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                for (sibling_id,) in &cascaded {
+                    sqlx::query(
+                        "INSERT INTO intent_events (client_id, status, venue_payload)
+                         VALUES ($1, 'cancel_requested', $2)",
+                    )
+                    .bind(sibling_id)
+                    .bind(serde_json::json!({
+                        "cascade_source": ev.client_id,
+                        "cascade_reason": execution_status_str(ev.status),
+                        "leg_group_id": gid,
+                    }))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                if !cascaded.is_empty() {
+                    info!(
+                        leg_group_id = %gid,
+                        triggered_by = %ev.client_id,
+                        n_cascaded = cascaded.len(),
+                        "oms: leg-group cancellation cascade fired"
+                    );
+                }
+            }
+        }
 
         // 3. Fill row + position update on Filled / PartialFill.
         //
