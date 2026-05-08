@@ -98,14 +98,25 @@ Calibration evidence:
 # Compute/store reliability report.
 ./target/release/predigy-calibration report --strategy stat --window-days 90
 ./target/release/predigy-calibration report --strategy wx-stat --window-days 90
+
+# One-time/idempotent wx-stat prediction sidecar backfill.
+./target/release/wx-stat-curator \
+  --kalshi-key-id "$KALSHI_KEY_ID" --kalshi-pem "$KALSHI_PEM" \
+  --user-agent "$NWS_USER_AGENT" --shadow-db \
+  --nbm-predictions-dir data/wx_stat_predictions \
+  --backfill-predictions-only
 ```
 
 `stat-curate.sh` runs `stat-curator --shadow-db`; it upserts disabled
-`stat` rules and appends `model_p_snapshots`. It must not enable live
-`stat` rules. Verify after any curator/deploy change:
+`stat` rules and appends `model_p_snapshots`. `wx-stat-curate.sh` also runs
+`wx-stat-curator --shadow-db`; live `wx-stat` still consumes the JSON rule
+file directly, while Postgres gets disabled shadow rules plus
+`model_p_snapshots` for calibration reporting. Neither curator should enable
+DB rules. Verify after any curator/deploy change:
 
 ```sh
-psql -d predigy -c "SELECT enabled, COUNT(*) FROM rules WHERE strategy='stat' GROUP BY enabled;"
+psql -d predigy -c "SELECT strategy, enabled, COUNT(*) FROM rules WHERE strategy IN ('stat','wx-stat') GROUP BY strategy, enabled ORDER BY strategy, enabled;"
+psql -d predigy -c "SELECT strategy, COUNT(*) FROM model_p_snapshots WHERE ts > now() - interval '24 hours' GROUP BY strategy ORDER BY strategy;"
 ```
 
 ## Kill switch (panic button)

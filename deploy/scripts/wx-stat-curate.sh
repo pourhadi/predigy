@@ -17,7 +17,9 @@
 # consolidated engine's wx-stat strategy when PREDIGY_WX_STAT_RULE_FILE
 # points at it. Same-day/past temperature markets are gated through ASOS
 # observed extremes before forecast/NBM scoring. Each run also writes a
-# coverage/skip report for scanner/calibration surfacing.
+# coverage/skip report for scanner/calibration surfacing. Accepted rules are
+# also shadow-written to Postgres as disabled wx-stat rules plus model_p
+# snapshots; the engine still consumes only the JSON rule file for live wx-stat.
 #
 # Driven by launchd's StartCalendarInterval (com.predigy.wx-stat-curate).
 # Required env from ~/.zprofile:
@@ -44,6 +46,7 @@ echo "[$(date -Iseconds)] wx-stat-curate: tick (phase=${PHASE})"
 
 if [[ "$PHASE" == "2" ]]; then
     "./target/release/wx-stat-curator" \
+        --database-url       "${DATABASE_URL:-postgresql:///predigy}" \
         --kalshi-key-id      "$KALSHI_KEY_ID" \
         --kalshi-pem         "$KALSHI_PEM" \
         --user-agent         "$NWS_USER_AGENT" \
@@ -55,9 +58,11 @@ if [[ "$PHASE" == "2" ]]; then
         --nbm-predictions-dir "${DATA_DIR}/wx_stat_predictions" \
         --nbm-calibration    "${DATA_DIR}/wx_stat_calibration.json" \
         --coverage-report-out "${DATA_DIR}/wx_stat_coverage_latest.json" \
+        --shadow-db \
         --write
 else
     "./target/release/wx-stat-curator" \
+        --database-url   "${DATABASE_URL:-postgresql:///predigy}" \
         --kalshi-key-id  "$KALSHI_KEY_ID" \
         --kalshi-pem     "$KALSHI_PEM" \
         --user-agent     "$NWS_USER_AGENT" \
@@ -66,5 +71,6 @@ else
         --min-margin-f   "${PREDIGY_WX_STAT_MIN_MARGIN_F:-5}" \
         --observations-cache "${DATA_DIR}/wx_stat_observations" \
         --coverage-report-out "${DATA_DIR}/wx_stat_coverage_latest.json" \
+        --shadow-db \
         --write
 fi

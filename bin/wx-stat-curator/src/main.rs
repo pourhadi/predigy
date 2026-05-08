@@ -23,10 +23,11 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
-use predigy_ext_feeds::nbm::NbmClient;
+use predigy_ext_feeds::nbm::{NbmClient, NbmCycle};
 use predigy_ext_feeds::nws_forecast::NwsForecastClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
 use serde::Serialize;
+use serde_json::json;
 use stat_trader::StatRule;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -41,11 +42,14 @@ use wx_stat_curator::observations::AsosClient;
 use wx_stat_curator::observed_gate::{
     ObservedGateDecision, ObservedMap, decide_from_observed, observations_required, observed_key,
 };
+mod shadow_db;
+
 use wx_stat_curator::{
     Airport, ForecastDecision, ProbabilityConfig, TempMarket, TempStrikeKind, lookup_airport,
     parse_temp_market, scan_temp_markets,
 };
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser)]
 #[command(
     name = "wx-stat-curator",
@@ -69,6 +73,10 @@ struct Args {
     #[arg(long, default_value = "wx-stat-rules.json")]
     output: PathBuf,
 
+    /// Postgres DSN for `--shadow-db` / prediction backfill.
+    #[arg(long, env = "DATABASE_URL", default_value = "postgresql:///predigy")]
+    database_url: String,
+
     /// Minimum after-fee per-contract edge (cents) for an emitted
     /// StatRule. Stat-trader fires when the market quote diverges
     /// from `model_p` by at least this much.
@@ -86,6 +94,23 @@ struct Args {
     /// to stdout (dry-run).
     #[arg(long, default_value_t = false)]
     write: bool,
+
+    /// Shadow-write accepted wx-stat rules to Postgres as disabled
+    /// rules plus model_p snapshots. This is calibration evidence
+    /// only; it never enables DB rules or submits orders.
+    #[arg(long, default_value_t = false)]
+    shadow_db: bool,
+
+    /// One-time/idempotent backfill: read existing prediction JSONL
+    /// records from `--nbm-predictions-dir` and insert missing
+    /// wx-stat model_p_snapshots.
+    #[arg(long, default_value_t = false)]
+    backfill_predictions: bool,
+
+    /// Run only the prediction JSONL backfill, then exit. Requires
+    /// `--shadow-db` so accidental local runs remain read-only.
+    #[arg(long, default_value_t = false)]
+    backfill_predictions_only: bool,
 
     /// Restart the named launchd job after a successful write.
     #[arg(long)]
@@ -154,6 +179,17 @@ async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
 
+    if args.backfill_predictions_only {
+        if !args.shadow_db {
+            return Err(anyhow!(
+                "--backfill-predictions-only requires --shadow-db so DB writes are explicit"
+            ));
+        }
+        let n = backfill_predictions_to_db(&args.database_url, &args.nbm_predictions_dir).await?;
+        println!("backfilled {n} wx-stat prediction snapshots");
+        return Ok(());
+    }
+
     let pem = tokio::fs::read_to_string(&args.kalshi_pem)
         .await
         .with_context(|| format!("read PEM at {}", args.kalshi_pem.display()))?;
@@ -196,6 +232,7 @@ async fn main() -> Result<()> {
     .await?;
 
     let mut rules: Vec<StatRule> = Vec::new();
+    let mut shadow_records: Vec<shadow_db::ShadowRuleRecord> = Vec::new();
     let mut inspections: Vec<RuleInspection> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut skip_counts: HashMap<&'static str, u32> = HashMap::new();
@@ -249,8 +286,15 @@ async fn main() -> Result<()> {
             match outcome {
                 NbmCurateOutcome::Rule(out) => {
                     info!(audit = %out.audit, "accepted rule (nbm)");
-                    rules.push(out.rule);
-                    if let Some(prediction) = out.prediction {
+                    shadow_records.push(shadow_record_from_nbm(
+                        m,
+                        &out,
+                        cycle,
+                        calibration.as_ref(),
+                        &args.nbm_calibration,
+                    ));
+                    rules.push(out.rule.clone());
+                    if let Some(prediction) = out.prediction.clone() {
                         predictions.push(prediction);
                     }
                     inspections.push(RuleInspection {
@@ -326,6 +370,7 @@ async fn main() -> Result<()> {
                     inspection,
                 } => {
                     info!(audit = %audit, "accepted rule");
+                    shadow_records.push(shadow_record_from_nws(m, &rule, &audit, &inspection));
                     rules.push(rule);
                     inspections.push(inspection);
                 }
@@ -371,6 +416,19 @@ async fn main() -> Result<()> {
             &skip_counts,
         );
         write_coverage_report(path, &report).await?;
+    }
+
+    if args.backfill_predictions && !args.shadow_db {
+        return Err(anyhow!("--backfill-predictions requires --shadow-db"));
+    }
+    if args.shadow_db {
+        let n = shadow_db::write_shadow_records(&args.database_url, &shadow_records).await?;
+        info!(n, "wx-stat shadow model_p snapshots written to DB");
+        if args.backfill_predictions {
+            let n =
+                backfill_predictions_to_db(&args.database_url, &args.nbm_predictions_dir).await?;
+            info!(n, "wx-stat prediction JSONL records backfilled to DB");
+        }
     }
 
     if args.write {
@@ -660,6 +718,188 @@ fn emit_rule(
         audit,
         inspection,
     }
+}
+
+fn shadow_record_from_nbm(
+    market: &TempMarket,
+    out: &wx_stat_curator::nbm_curate::NbmRuleOut,
+    cycle: NbmCycle,
+    calibration: Option<&Calibration>,
+    calibration_path: &std::path::Path,
+) -> shadow_db::ShadowRuleRecord {
+    let prediction = out.prediction.as_ref();
+    let raw_p = prediction.map_or(out.model_p, |p| p.raw_p);
+    let source = if prediction.is_some() {
+        "wx-stat-curator-nbm"
+    } else {
+        "wx-stat-curator-observed-gate"
+    };
+    let generated_at = out
+        .rule
+        .generated_at_utc
+        .clone()
+        .unwrap_or_else(|| format_unix_utc_iso(now_unix()));
+    let settlement_date = out.rule.settlement_date.clone();
+    let detail = json!({
+        "source": source,
+        "run_ts_utc": generated_at,
+        "ticker": out.ticker,
+        "title": out.title,
+        "event_ticker": market.event_ticker,
+        "series_ticker": market.series_ticker,
+        "airport": out.airport,
+        "threshold": out.threshold,
+        "side": side_label(out.side),
+        "settlement_date": settlement_date,
+        "raw_p": raw_p,
+        "model_p": out.model_p,
+        "quoted_ask_cents": out.quoted_ask_cents,
+        "apparent_edge_cents": out.apparent_edge_cents,
+        "forecast_50pct_f": out.forecast_value_f,
+        "prediction_record": prediction,
+        "nbm_cycle": {
+            "year": cycle.year,
+            "month": cycle.month,
+            "day": cycle.day,
+            "hour": cycle.hour,
+            "prefix": cycle.prefix(),
+        },
+        "market_snapshot": market_detail_json(market),
+        "calibration": calibration_detail(calibration, calibration_path, prediction, settlement_date.as_deref(), &out.airport),
+        "calibration_sample_eligible": prediction.is_some(),
+    });
+    shadow_db::ShadowRuleRecord {
+        ticker: out.ticker.clone(),
+        title: out.title.clone(),
+        event_ticker: market.event_ticker.clone(),
+        series_ticker: market.series_ticker.clone(),
+        close_time: market.close_time.clone(),
+        side: out.side,
+        raw_p,
+        model_p: out.model_p,
+        min_edge_cents: out.rule.min_edge_cents,
+        settlement_date,
+        generated_at_utc: generated_at,
+        source: source.to_string(),
+        detail,
+    }
+}
+
+fn shadow_record_from_nws(
+    market: &TempMarket,
+    rule: &StatRule,
+    audit: &str,
+    inspection: &RuleInspection,
+) -> shadow_db::ShadowRuleRecord {
+    let generated_at = rule
+        .generated_at_utc
+        .clone()
+        .unwrap_or_else(|| format_unix_utc_iso(now_unix()));
+    let detail = json!({
+        "source": "wx-stat-curator-nws",
+        "run_ts_utc": generated_at,
+        "ticker": inspection.ticker,
+        "title": inspection.title,
+        "event_ticker": market.event_ticker,
+        "series_ticker": market.series_ticker,
+        "airport": inspection.airport,
+        "threshold": inspection.threshold,
+        "side": side_label(inspection.side),
+        "settlement_date": rule.settlement_date,
+        "raw_p": rule.model_p,
+        "model_p": rule.model_p,
+        "quoted_ask_cents": inspection.quoted_ask_cents,
+        "apparent_edge_cents": inspection.apparent_edge_cents,
+        "forecast_value_f": inspection.forecast_value_f,
+        "audit": audit,
+        "market_snapshot": market_detail_json(market),
+        "calibration_sample_eligible": true,
+    });
+    shadow_db::ShadowRuleRecord {
+        ticker: rule.kalshi_market.as_str().to_string(),
+        title: inspection.title.clone(),
+        event_ticker: market.event_ticker.clone(),
+        series_ticker: market.series_ticker.clone(),
+        close_time: market.close_time.clone(),
+        side: rule.side,
+        raw_p: rule.model_p,
+        model_p: rule.model_p,
+        min_edge_cents: rule.min_edge_cents,
+        settlement_date: rule.settlement_date.clone(),
+        generated_at_utc: generated_at,
+        source: "wx-stat-curator-nws".to_string(),
+        detail,
+    }
+}
+
+fn market_detail_json(market: &TempMarket) -> serde_json::Value {
+    json!({
+        "ticker": market.ticker,
+        "event_ticker": market.event_ticker,
+        "series_ticker": market.series_ticker,
+        "title": market.title,
+        "close_time": market.close_time,
+        "yes_ask_cents": market.yes_ask_cents,
+        "no_ask_cents": market.no_ask_cents,
+        "strike_type": market.strike_type,
+        "floor_strike": market.floor_strike,
+        "cap_strike": market.cap_strike,
+        "occurrence_datetime": market.occurrence_datetime,
+    })
+}
+
+fn calibration_detail(
+    calibration: Option<&Calibration>,
+    calibration_path: &std::path::Path,
+    prediction: Option<&wx_stat_curator::predictions::PredictionRecord>,
+    settlement_date: Option<&str>,
+    airport: &str,
+) -> serde_json::Value {
+    let Some(cal) = calibration else {
+        return json!({
+            "file": calibration_path.display().to_string(),
+            "loaded": false,
+            "bucket": bucket_key_for(airport, settlement_date),
+        });
+    };
+    let bucket = prediction
+        .map(|p| bucket_key_for(&p.airport, Some(&p.settlement_date)))
+        .unwrap_or_else(|| bucket_key_for(airport, settlement_date));
+    let entry = bucket.as_deref().and_then(|key| cal.buckets.get(key));
+    json!({
+        "file": calibration_path.display().to_string(),
+        "loaded": true,
+        "fitted_at_iso": cal.fitted_at_iso,
+        "source": cal.source,
+        "bucket": bucket,
+        "bucket_present": entry.is_some(),
+        "bucket_entry": entry,
+    })
+}
+
+fn bucket_key_for(airport: &str, settlement_date: Option<&str>) -> Option<String> {
+    let month = settlement_date
+        .and_then(|date| date.get(5..7))?
+        .parse::<u8>()
+        .ok()?;
+    if (1..=12).contains(&month) {
+        Some(format!("{airport}:{month:02}"))
+    } else {
+        None
+    }
+}
+
+fn side_label(side: Side) -> &'static str {
+    match side {
+        Side::Yes => "yes",
+        Side::No => "no",
+    }
+}
+
+async fn backfill_predictions_to_db(database_url: &str, dir: &std::path::Path) -> Result<usize> {
+    let records = wx_stat_curator::predictions::read_dir_records(dir)
+        .with_context(|| format!("read prediction JSONL records under {}", dir.display()))?;
+    shadow_db::backfill_prediction_records(database_url, &records).await
 }
 
 async fn load_observed_extremes(
