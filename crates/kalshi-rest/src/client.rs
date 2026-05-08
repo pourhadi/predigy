@@ -4,8 +4,9 @@ use crate::auth::Signer;
 use crate::error::Error;
 use crate::types::{
     BalanceResponse, BatchCancelOrdersRequest, BatchCancelOrdersResponse, CancelOrderResponse,
-    CreateOrderRequest, CreateOrderResponse, FillsResponse, MarketDetailResponse, MarketsResponse,
-    OrderResponse, OrderbookResponse, OrdersResponse, PositionsResponse, SeriesListResponse,
+    CreateOrderRequest, CreateOrderResponse, EventsResponse, FillsResponse, MarketDetailResponse,
+    MarketsResponse, OrderResponse, OrderbookResponse, OrdersResponse,
+    PortfolioSettlementsResponse, PositionsResponse, SeriesListResponse,
 };
 use predigy_book::Snapshot;
 use predigy_core::price::Price;
@@ -226,6 +227,16 @@ impl Client {
         self.get_json("/markets", &q).await
     }
 
+    /// Generic `GET /markets` with caller-supplied filters. Use
+    /// this for newer venue filters that are not yet promoted to a
+    /// typed helper.
+    pub async fn list_markets_filtered(
+        &self,
+        filters: &[(&str, String)],
+    ) -> Result<MarketsResponse, Error> {
+        self.get_json("/markets", filters).await
+    }
+
     /// `GET /markets?series_ticker=...` — Kalshi supports both
     /// `event_ticker` and `series_ticker` as filters; the latter
     /// matches every event in a series. Used by the weather-market
@@ -248,6 +259,34 @@ impl Client {
             q.push(("cursor", c.to_string()));
         }
         self.get_json("/markets", &q).await
+    }
+
+    /// `GET /events` with optional nested markets and pagination.
+    pub async fn list_events(
+        &self,
+        status: Option<&str>,
+        series_ticker: Option<&str>,
+        with_nested_markets: bool,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<EventsResponse, Error> {
+        let mut q = Vec::new();
+        if let Some(s) = status {
+            q.push(("status", s.to_string()));
+        }
+        if let Some(s) = series_ticker {
+            q.push(("series_ticker", s.to_string()));
+        }
+        if with_nested_markets {
+            q.push(("with_nested_markets", "true".to_string()));
+        }
+        if let Some(l) = limit {
+            q.push(("limit", l.to_string()));
+        }
+        if let Some(c) = cursor {
+            q.push(("cursor", c.to_string()));
+        }
+        self.get_json("/events", &q).await
     }
 
     /// `GET /series` filtered by category. Kalshi's category names
@@ -327,6 +366,51 @@ impl Client {
                 return Err(Error::Api {
                     status: 500,
                     body: format!("positions cursor repeated: {next_cursor}"),
+                });
+            }
+            cursor = Some(next_cursor);
+        }
+        out.cursor = cursor;
+        Ok(out)
+    }
+
+    /// `GET /portfolio/settlements` (auth required), exhausting
+    /// cursor pages. Used for traded P&L/fee reconciliation in
+    /// calibration reports.
+    pub async fn portfolio_settlements(
+        &self,
+        min_ts: Option<i64>,
+    ) -> Result<PortfolioSettlementsResponse, Error> {
+        if self.signer.is_none() {
+            return Err(Error::Auth(
+                "portfolio_settlements requires a signer".into(),
+            ));
+        }
+        let mut out = PortfolioSettlementsResponse {
+            settlements: Vec::new(),
+            cursor: None,
+        };
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        loop {
+            let mut q = vec![("limit", "100".to_string())];
+            if let Some(t) = min_ts {
+                q.push(("min_ts", t.to_string()));
+            }
+            if let Some(c) = cursor.as_deref() {
+                q.push(("cursor", c.to_string()));
+            }
+            let page: PortfolioSettlementsResponse =
+                self.get_json("/portfolio/settlements", &q).await?;
+            out.settlements.extend(page.settlements);
+            let next = page.cursor.filter(|c| !c.is_empty());
+            let Some(next_cursor) = next else {
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(Error::Api {
+                    status: 500,
+                    body: format!("portfolio settlements cursor repeated: {next_cursor}"),
                 });
             }
             cursor = Some(next_cursor);

@@ -79,6 +79,34 @@ pub struct EventFamily {
     /// override / safety pad.
     #[serde(default)]
     pub extra_fee_padding_cents: u32,
+    /// Whether the configured family is known to be exhaustive
+    /// (exactly one YES settles). `mutually_exclusive=true` from
+    /// Kalshi is necessary but not sufficient for scanner
+    /// promotion; candidate configs must include proof here.
+    #[serde(default)]
+    pub exhaustive: bool,
+    /// Human/auditable provenance for the exhaustiveness claim.
+    /// Existing manually curated live configs may omit this; the
+    /// candidate writer added by the scanner must not.
+    #[serde(default)]
+    pub proof: Option<String>,
+    /// Enabled arb directions. The live strategy currently
+    /// executes only the proven YES-basket path; the NO-basket
+    /// mirror is represented for scanner/payoff tests and future
+    /// explicit promotion.
+    #[serde(default = "default_directions")]
+    pub directions: Vec<InternalArbDirection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalArbDirection {
+    YesBasket,
+    NoBasket,
+}
+
+fn default_directions() -> Vec<InternalArbDirection> {
+    vec![InternalArbDirection::YesBasket]
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -155,6 +183,96 @@ struct CachedFamily {
     family_id: String,
     tickers: Vec<String>,
     extra_fee_padding_cents: u32,
+    exhaustive: bool,
+    proof: Option<String>,
+    directions: Vec<InternalArbDirection>,
+}
+
+/// Pure evaluator input for one family leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternalArbLegTouch {
+    pub yes_ask_cents: u8,
+    pub yes_ask_qty: u32,
+}
+
+/// Pure evaluation result for buying one YES on every leg of an
+/// exactly-one-YES family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalArbOpportunity {
+    pub n_legs: usize,
+    pub total_ask_cents: i32,
+    pub per_unit_taker_fee_cents: i32,
+    pub per_unit_padding_cents: i32,
+    pub per_unit_cost_cents: i32,
+    pub edge_cents: i32,
+    pub max_touch_qty: u32,
+}
+
+impl InternalArbOpportunity {
+    /// If exactly one YES settles to $1, package profit is
+    /// `100¢ - cost`.
+    #[must_use]
+    pub fn yes_basket_settlement_profit_cents(&self) -> i32 {
+        100 - self.per_unit_cost_cents
+    }
+}
+
+/// Pure internal-arb YES-basket evaluator shared by the live
+/// strategy and the read-only scanner. This assumes the caller has
+/// already established that the legs are exhaustive; candidates
+/// without that proof must remain scanner-only.
+#[must_use]
+pub fn evaluate_internal_yes_basket(
+    legs: &[InternalArbLegTouch],
+    size: u32,
+    extra_fee_padding_cents: u32,
+    min_edge_cents: i32,
+) -> Option<InternalArbOpportunity> {
+    if legs.len() < 2 || size == 0 {
+        return None;
+    }
+
+    let mut total_ask = 0_i32;
+    let mut total_fee = 0_i32;
+    let mut max_touch_qty = u32::MAX;
+    for leg in legs {
+        if leg.yes_ask_cents == 0 || leg.yes_ask_qty == 0 {
+            return None;
+        }
+        total_ask += i32::from(leg.yes_ask_cents);
+        total_fee += per_unit_taker_fee_cents(leg.yes_ask_cents, size)?;
+        max_touch_qty = max_touch_qty.min(leg.yes_ask_qty);
+    }
+
+    let per_unit_padding = i32::try_from(extra_fee_padding_cents)
+        .ok()?
+        .saturating_mul(i32::try_from(legs.len()).ok()?);
+    let per_unit_cost = total_ask + total_fee + per_unit_padding;
+    let edge_cents = 100 - per_unit_cost;
+    if edge_cents < min_edge_cents {
+        return None;
+    }
+
+    Some(InternalArbOpportunity {
+        n_legs: legs.len(),
+        total_ask_cents: total_ask,
+        per_unit_taker_fee_cents: total_fee,
+        per_unit_padding_cents: per_unit_padding,
+        per_unit_cost_cents: per_unit_cost,
+        edge_cents,
+        max_touch_qty,
+    })
+}
+
+fn per_unit_taker_fee_cents(price_cents: u8, size: u32) -> Option<i32> {
+    let qty = predigy_core::price::Qty::new(size).ok()?;
+    let price = predigy_core::price::Price::from_cents(price_cents).ok()?;
+    let total_fee = i32::try_from(predigy_core::fees::taker_fee(price, qty)).ok()?;
+    let size_i32 = i32::try_from(size).ok()?;
+    if size_i32 == 0 {
+        return None;
+    }
+    Some((total_fee + size_i32 - 1) / size_i32)
 }
 
 #[derive(Debug)]
@@ -232,7 +350,7 @@ impl InternalArbStrategy {
         };
         let mut families = Vec::with_capacity(parsed.families.len());
         let mut idx = HashMap::new();
-        for (i, f) in parsed.families.into_iter().enumerate() {
+        for f in parsed.families {
             if f.tickers.len() < 2 {
                 warn!(
                     family = f.family_id,
@@ -241,13 +359,19 @@ impl InternalArbStrategy {
                 );
                 continue;
             }
+            let family_idx = families.len();
             for t in &f.tickers {
-                idx.entry(t.clone()).or_insert_with(Vec::new).push(i);
+                idx.entry(t.clone())
+                    .or_insert_with(Vec::new)
+                    .push(family_idx);
             }
             families.push(CachedFamily {
                 family_id: f.family_id,
                 tickers: f.tickers,
                 extra_fee_padding_cents: f.extra_fee_padding_cents,
+                exhaustive: f.exhaustive,
+                proof: f.proof,
+                directions: f.directions,
             });
         }
         info!(
@@ -286,48 +410,41 @@ impl InternalArbStrategy {
         {
             return None;
         }
+        if !family.directions.contains(&InternalArbDirection::YesBasket) {
+            return None;
+        }
+
         // Need YES-ask quotes for every leg.
-        let mut total_ask: i32 = 0;
-        let mut total_fee_pad: i32 = 0;
-        let mut min_qty: u32 = u32::MAX;
         let mut leg_asks: Vec<(String, u8)> = Vec::with_capacity(family.tickers.len());
+        let mut touches = Vec::with_capacity(family.tickers.len());
         for t in &family.tickers {
             let &ask_cents = self.yes_ask_cents.get(t)?;
             let qty = *self.yes_ask_qty.get(t).unwrap_or(&0);
-            if qty == 0 {
-                return None;
-            }
-            min_qty = min_qty.min(qty);
-            total_ask += i32::from(ask_cents);
-            total_fee_pad += i32::try_from(family.extra_fee_padding_cents).unwrap_or(0);
             leg_asks.push((t.clone(), ask_cents));
+            touches.push(InternalArbLegTouch {
+                yes_ask_cents: ask_cents,
+                yes_ask_qty: qty,
+            });
         }
-        // Per-leg taker fee from the price.
-        let mut total_taker_fee: i32 = 0;
-        for (_, ask_cents) in &leg_asks {
-            let probe = predigy_core::price::Qty::new(self.config.size).ok()?;
-            let p = predigy_core::price::Price::from_cents(*ask_cents).ok()?;
-            total_taker_fee +=
-                i32::try_from(predigy_core::fees::taker_fee(p, probe)).unwrap_or(i32::MAX);
-        }
-        // The arb condition: total_ask + total_fee + min_edge ≤ 100¢ (net of
-        // size — fees are already per-1-contract above).
-        // Per-contract net cost = total_ask + total_fee/size + total_pad/size
-        // For size 1, the inequality simplifies; for size > 1, fees scale
-        // linearly so this still holds:
-        let per_unit_cost = total_ask
-            + (total_taker_fee / self.config.size as i32)
-            + (total_fee_pad / self.config.size as i32);
-        let edge_cents = 100 - per_unit_cost;
-        if edge_cents < self.config.min_edge_cents {
-            debug!(
-                family = family.family_id,
-                total_ask, total_taker_fee, edge_cents, "internal-arb: edge below threshold"
-            );
-            return None;
-        }
+
+        let opp = evaluate_internal_yes_basket(
+            &touches,
+            self.config.size,
+            family.extra_fee_padding_cents,
+            self.config.min_edge_cents,
+        )?;
+        debug!(
+            family = family.family_id,
+            exhaustive = family.exhaustive,
+            proof_present = family.proof.as_ref().is_some_and(|p| !p.trim().is_empty()),
+            total_ask = opp.total_ask_cents,
+            total_taker_fee = opp.per_unit_taker_fee_cents,
+            edge_cents = opp.edge_cents,
+            "internal-arb: yes-basket evaluated"
+        );
+
         // Cap the size by the touch's available qty at every leg.
-        let size = self.config.size.min(min_qty);
+        let size = self.config.size.min(opp.max_touch_qty);
         if size == 0 {
             return None;
         }
@@ -354,15 +471,18 @@ impl InternalArbStrategy {
                 order_type: OrderType::Limit,
                 tif: Tif::Ioc,
                 reason: Some(format!(
-                    "internal-arb {family}: total_ask={total_ask}c fee={total_taker_fee}c edge={edge_cents}c",
+                    "internal-arb {family}: total_ask={total_ask}c fee={fee}c edge={edge}c",
                     family = family.family_id,
+                    total_ask = opp.total_ask_cents,
+                    fee = opp.per_unit_taker_fee_cents,
+                    edge = opp.edge_cents,
                 )),
             });
         }
         info!(
             family = family.family_id,
             n_legs = intents.len(),
-            edge_cents,
+            edge_cents = opp.edge_cents,
             size,
             "internal-arb: arb opportunity — submitting leg group"
         );
@@ -469,6 +589,64 @@ mod tests {
             cooldown: Duration::from_secs(60),
             config_refresh_interval: Duration::from_secs(30),
         }
+    }
+
+    #[test]
+    fn pure_yes_basket_evaluator_has_nonnegative_payoff_for_exhaustive_family() {
+        let legs = [
+            InternalArbLegTouch {
+                yes_ask_cents: 20,
+                yes_ask_qty: 10,
+            },
+            InternalArbLegTouch {
+                yes_ask_cents: 30,
+                yes_ask_qty: 7,
+            },
+            InternalArbLegTouch {
+                yes_ask_cents: 35,
+                yes_ask_qty: 8,
+            },
+        ];
+        let opp = evaluate_internal_yes_basket(&legs, 1, 0, 2).expect("edge clears");
+        assert_eq!(opp.n_legs, 3);
+        assert_eq!(opp.max_touch_qty, 7);
+        assert_eq!(opp.yes_basket_settlement_profit_cents(), opp.edge_cents);
+        assert!(opp.yes_basket_settlement_profit_cents() >= 0);
+    }
+
+    #[test]
+    fn pure_yes_basket_evaluator_rejects_non_edge() {
+        let legs = [
+            InternalArbLegTouch {
+                yes_ask_cents: 50,
+                yes_ask_qty: 10,
+            },
+            InternalArbLegTouch {
+                yes_ask_cents: 50,
+                yes_ask_qty: 10,
+            },
+        ];
+        assert!(evaluate_internal_yes_basket(&legs, 1, 0, 2).is_none());
+    }
+
+    #[test]
+    fn config_accepts_exhaustiveness_proof_and_directions() {
+        let rules: InternalArbRulesFile = serde_json::from_value(serde_json::json!({
+            "families": [{
+                "family_id": "PROVEN",
+                "tickers": ["KX-A", "KX-B"],
+                "exhaustive": true,
+                "proof": "two-outcome game; one winner",
+                "directions": ["yes_basket", "no_basket"]
+            }]
+        }))
+        .unwrap();
+        let fam = &rules.families[0];
+        assert!(fam.exhaustive);
+        assert_eq!(fam.proof.as_deref(), Some("two-outcome game; one winner"));
+        assert_eq!(fam.directions.len(), 2);
+        assert!(fam.directions.contains(&InternalArbDirection::YesBasket));
+        assert!(fam.directions.contains(&InternalArbDirection::NoBasket));
     }
 
     #[test]
@@ -580,6 +758,23 @@ mod tests {
         s.reload_families();
         assert_eq!(s.family_count(), 1);
         assert_eq!(s.families[0].family_id, "VALID");
+    }
+
+    #[test]
+    fn ticker_index_uses_post_skip_family_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("families.json");
+        let rules = serde_json::json!({
+            "families": [
+                { "family_id": "BAD",   "tickers": ["KX-Z"] },
+                { "family_id": "VALID", "tickers": ["KX-A", "KX-B"] }
+            ]
+        });
+        std::fs::write(&path, serde_json::to_string(&rules).unwrap()).unwrap();
+        let mut s = InternalArbStrategy::new(cfg(path));
+        s.reload_families();
+        assert_eq!(s.family_count(), 1);
+        assert_eq!(s.ticker_to_families.get("KX-A"), Some(&vec![0]));
     }
 
     #[test]

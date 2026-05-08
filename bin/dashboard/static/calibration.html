@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Predigy Calibration</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 1.5rem; background: #0b1020; color: #eef2ff; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border-bottom: 1px solid #29324f; padding: .45rem .35rem; text-align: left; }
+    th { color: #aab7ff; }
+    code { color: #b9f6ca; }
+    .muted { color: #93a4c7; }
+  </style>
+</head>
+<body>
+  <h1>Calibration</h1>
+  <p class="muted">Latest reliability reports from <code>calibration_reports</code>. Empty means the calibration job has not produced a report yet.</p>
+  <table>
+    <thead><tr><th>Strategy</th><th>Predictions</th><th>Settled</th><th>Brier</th><th>Log loss</th><th>Window end</th><th>Status</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody>
+  </table>
+<script>
+async function load() {
+  const res = await fetch('/calibration/summary.json');
+  const rows = await res.json();
+  const el = document.getElementById('rows');
+  if (!rows.length) {
+    el.innerHTML = '<tr><td colspan="7" class="muted">No calibration reports yet.</td></tr>';
+    return;
+  }
+  el.innerHTML = rows.map(r => {
+    const status = r.diagnosis && r.diagnosis.status ? r.diagnosis.status : '';
+    const ts = r.window_end ? new Date(r.window_end * 1000).toISOString() : '';
+    const brier = r.brier == null ? '—' : r.brier.toFixed(4);
+    const logLoss = r.log_loss == null ? '—' : r.log_loss.toFixed(4);
+    return `<tr><td>${r.strategy}</td><td>${r.n_predictions}</td><td>${r.n_settled}</td><td>${brier}</td><td>${logLoss}</td><td>${ts}</td><td>${status}</td></tr>`;
+  }).join('');
+}
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

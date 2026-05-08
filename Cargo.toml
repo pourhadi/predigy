@@ -39,6 +39,8 @@ members = [
     "bin/stat-curator",
     "bin/wx-stat-curator",
     "bin/wx-stat-fit-calibration",
+    "bin/opportunity-scanner",
+    "bin/predigy-calibration",
     "bin/predigy-import",
     "bin/predigy-engine",
 ]

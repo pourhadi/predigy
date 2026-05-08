@@ -48,6 +48,7 @@ use predigy_engine_core::intent::{Intent, IntentAction, OrderType, Tif, cid_safe
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
@@ -127,6 +128,8 @@ pub struct SettlementConfig {
 
 impl SettlementConfig {
     /// Audit B2 + B3 — env-var overrides:
+    /// - `PREDIGY_SETTLEMENT_SERIES` (CSV override)
+    /// - `PREDIGY_SETTLEMENT_SERIES_FILE` (newline/CSV append file)
     /// - `PREDIGY_SETTLEMENT_SIZE` (u32)
     /// - `PREDIGY_SETTLEMENT_COOLDOWN_MS` (u64)
     /// - `PREDIGY_SETTLEMENT_MIN_PRICE_CENTS` (u8)
@@ -137,6 +140,17 @@ impl SettlementConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let mut c = Self::default();
+        if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_SERIES") {
+            let series = parse_series_list(&v);
+            if !series.is_empty() {
+                c.series = series;
+            }
+        }
+        if let Ok(path) = std::env::var("PREDIGY_SETTLEMENT_SERIES_FILE") {
+            if let Ok(series) = read_series_file(Path::new(&path)) {
+                append_dedup(&mut c.series, series);
+            }
+        }
         if let Ok(v) = std::env::var("PREDIGY_SETTLEMENT_SIZE") {
             if let Ok(n) = v.parse() {
                 c.size = n;
@@ -197,6 +211,37 @@ impl SettlementConfig {
             }
         }
         c
+    }
+}
+
+#[must_use]
+pub fn parse_series_list(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let without_comment = line.split_once('#').map_or(line, |(prefix, _)| prefix);
+        for token in without_comment
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let series = token.to_ascii_uppercase();
+            if !out.iter().any(|s| s == &series) {
+                out.push(series);
+            }
+        }
+    }
+    out
+}
+
+pub fn read_series_file(path: &Path) -> std::io::Result<Vec<String>> {
+    std::fs::read_to_string(path).map(|raw| parse_series_list(&raw))
+}
+
+fn append_dedup(dst: &mut Vec<String>, src: Vec<String>) {
+    for series in src {
+        if !dst.iter().any(|existing| existing == &series) {
+            dst.push(series);
+        }
     }
 }
 
@@ -905,6 +950,22 @@ mod tests {
         s.apply_discovery(&[], std::slice::from_ref(&m));
         assert!(!s.close_times.contains_key(&m));
         assert!(!s.last_fired.contains_key(&m));
+    }
+
+    #[test]
+    fn parses_series_list_with_comments_and_dedup() {
+        let parsed = parse_series_list("kxfoo, KXBAR\n# comment\nKXFOO KXBAZ # trailing");
+        assert_eq!(parsed, vec!["KXFOO", "KXBAR", "KXBAZ"]);
+    }
+
+    #[test]
+    fn series_file_appends_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("series.txt");
+        std::fs::write(&path, "KXNEW\nKX-TEST-SERIES\n").unwrap();
+        let mut c = cfg();
+        append_dedup(&mut c.series, read_series_file(&path).unwrap());
+        assert_eq!(c.series, vec!["KX-TEST-SERIES", "KXNEW"]);
     }
 
     #[test]

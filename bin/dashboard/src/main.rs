@@ -56,6 +56,7 @@ const MARKET_DETAIL_CACHE_TTL: Duration = Duration::from_secs(60);
 const MARKET_DETAIL_FETCH_SPACING: Duration = Duration::from_millis(75);
 const RECENT_EVENTS_KEEP: usize = 30;
 const HTML: &str = include_str!("../static/index.html");
+const CALIBRATION_HTML: &str = include_str!("../static/calibration.html");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -157,6 +158,10 @@ struct Snapshot {
     /// Aggregated submit-to-fill duration per strategy across
     /// the last hour. `None` if no fills landed in the window.
     fill_latency: Vec<FillLatencyRow>,
+    /// Latest calibration/reliability reports by strategy. Empty
+    /// when the additive calibration_reports table is absent or no
+    /// report has run yet.
+    calibration: Vec<CalibrationSummaryRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,6 +250,18 @@ struct FillLatencyRow {
     p50_ms: i64,
     p95_ms: i64,
     max_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationSummaryRow {
+    strategy: String,
+    window_end: i64,
+    n_predictions: i32,
+    n_settled: i32,
+    brier: Option<f64>,
+    log_loss: Option<f64>,
+    created_at: i64,
+    diagnosis: serde_json::Value,
 }
 
 /// Phase 6 — one recent exit fire (TP/SL/force-flat). Pulled
@@ -395,6 +412,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(serve_html))
         .route("/api/state", get(serve_state))
+        .route("/calibration", get(serve_calibration_html))
+        .route("/calibration/summary.json", get(serve_calibration_summary))
         .route("/api/kill", post(serve_kill))
         .route("/healthz", get(|| async { "ok" }))
         // Audit: strategy evaluation framework JSON endpoints. The
@@ -425,6 +444,18 @@ async fn serve_html() -> impl IntoResponse {
 async fn serve_state(State(state): State<AppState>) -> impl IntoResponse {
     let snap = state.snapshot.read().await.clone();
     Json(snap)
+}
+
+async fn serve_calibration_summary(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.snapshot.read().await;
+    Json(snap.calibration.clone())
+}
+
+async fn serve_calibration_html() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(CALIBRATION_HTML),
+    )
 }
 
 async fn serve_kill(
@@ -759,6 +790,13 @@ async fn build_snapshot(
             Err(e) => {
                 warn!(error = %e, "refresh: fill_latency failed");
                 snap.last_refresh_error = Some(format!("fill_latency: {e}"));
+            }
+        }
+        match db_calibration_summary(pool).await {
+            Ok(rows) => snap.calibration = rows,
+            Err(e) => {
+                warn!(error = %e, "refresh: calibration_summary failed");
+                snap.last_refresh_error = Some(format!("calibration_summary: {e}"));
             }
         }
     }
@@ -1129,6 +1167,53 @@ async fn db_fill_latency(pool: &sqlx::PgPool) -> Result<Vec<FillLatencyRow>, sql
             p50_ms: (r.p50_secs.unwrap_or(0.0) * 1000.0).round() as i64,
             p95_ms: (r.p95_secs.unwrap_or(0.0) * 1000.0).round() as i64,
             max_ms: (r.max_secs.unwrap_or(0.0) * 1000.0).round() as i64,
+        })
+        .collect())
+}
+
+async fn db_calibration_summary(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<CalibrationSummaryRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        strategy: String,
+        window_end: chrono::DateTime<chrono::Utc>,
+        n_predictions: i32,
+        n_settled: i32,
+        brier: Option<f64>,
+        log_loss: Option<f64>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        diagnosis: serde_json::Value,
+    }
+    let rows: Vec<Row> = match sqlx::query_as(
+        "SELECT DISTINCT ON (strategy)
+                strategy, window_end, n_predictions, n_settled,
+                brier, log_loss, created_at, diagnosis
+           FROM calibration_reports
+          ORDER BY strategy, window_end DESC, created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            if e.as_database_error().and_then(|db| db.code()).as_deref() == Some("42P01") {
+                return Ok(Vec::new());
+            }
+            return Err(e);
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| CalibrationSummaryRow {
+            strategy: r.strategy,
+            window_end: r.window_end.timestamp(),
+            n_predictions: r.n_predictions,
+            n_settled: r.n_settled,
+            brier: r.brier,
+            log_loss: r.log_loss,
+            created_at: r.created_at.timestamp(),
+            diagnosis: r.diagnosis,
         })
         .collect())
 }

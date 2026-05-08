@@ -26,8 +26,9 @@ use predigy_core::side::Side;
 use predigy_ext_feeds::nbm::NbmClient;
 use predigy_ext_feeds::nws_forecast::NwsForecastClient;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
+use serde::Serialize;
 use stat_trader::StatRule;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -124,6 +125,28 @@ struct Args {
     /// weather markets before forecast/NBM scoring.
     #[arg(long, default_value = "data/wx_stat_observations")]
     observations_cache: PathBuf,
+
+    /// Optional machine-readable coverage/skip report. This is
+    /// observation-only: it never changes rule-write semantics.
+    #[arg(long)]
+    coverage_report_out: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct CoverageReport {
+    run_ts_utc: String,
+    mode: &'static str,
+    markets_scanned: usize,
+    rules_proposed: usize,
+    skipped: usize,
+    skip_counts: BTreeMap<String, u32>,
+    skipped_examples: Vec<SkippedExample>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkippedExample {
+    ticker: String,
+    reason: String,
 }
 
 #[tokio::main]
@@ -149,8 +172,14 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow!("scan: {e}"))?;
     info!(found = markets.len(), "actionable temp markets discovered");
+    let run_unix = now_unix();
+    let run_ts_utc = format_unix_utc_iso(run_unix);
     if markets.is_empty() {
         warn!("no actionable markets found — writing empty rule file");
+        if let Some(path) = &args.coverage_report_out {
+            let report = build_coverage_report(&run_ts_utc, args.nbm, 0, 0, &[], &HashMap::new());
+            write_coverage_report(path, &report).await?;
+        }
         if args.write {
             write_rules(&[], &args.output).await?;
         } else {
@@ -158,9 +187,6 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-
-    let run_unix = now_unix();
-    let run_ts_utc = format_unix_utc_iso(run_unix);
     let observed = load_observed_extremes(
         &markets,
         &args.user_agent,
@@ -333,6 +359,18 @@ async fn main() -> Result<()> {
         for (cat, n) in categories {
             info!(category = *cat, count = *n, "skip");
         }
+    }
+
+    if let Some(path) = &args.coverage_report_out {
+        let report = build_coverage_report(
+            &run_ts_utc,
+            args.nbm,
+            markets.len(),
+            rules.len(),
+            &skipped,
+            &skip_counts,
+        );
+        write_coverage_report(path, &report).await?;
     }
 
     if args.write {
@@ -707,6 +745,51 @@ async fn load_observed_extremes(
     Ok(out)
 }
 
+fn build_coverage_report(
+    run_ts_utc: &str,
+    nbm: bool,
+    markets_scanned: usize,
+    rules_proposed: usize,
+    skipped: &[(String, String)],
+    skip_counts: &HashMap<&'static str, u32>,
+) -> CoverageReport {
+    let mut counts = BTreeMap::new();
+    for (category, count) in skip_counts {
+        counts.insert((*category).to_string(), *count);
+    }
+    CoverageReport {
+        run_ts_utc: run_ts_utc.to_string(),
+        mode: if nbm { "nbm" } else { "nws" },
+        markets_scanned,
+        rules_proposed,
+        skipped: skipped.len(),
+        skip_counts: counts,
+        skipped_examples: skipped
+            .iter()
+            .take(100)
+            .map(|(ticker, reason)| SkippedExample {
+                ticker: ticker.clone(),
+                reason: reason.clone(),
+            })
+            .collect(),
+    }
+}
+
+async fn write_coverage_report(path: &std::path::Path, report: &CoverageReport) -> Result<()> {
+    let json = serde_json::to_vec_pretty(report)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let tmp = path.with_extension("tmp");
+    tokio::fs::write(&tmp, json)
+        .await
+        .with_context(|| format!("write {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
 async fn write_rules(rules: &[StatRule], output: &std::path::Path) -> Result<()> {
     let json = serde_json::to_string_pretty(rules)?;
     if let Some(parent) = output.parent() {
@@ -892,4 +975,30 @@ fn init_tracing() {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_report_carries_skip_counts_and_examples() {
+        let skipped = vec![
+            ("KX-A".to_string(), "unmapped airport ABC".to_string()),
+            (
+                "KX-B".to_string(),
+                "UnsupportedStrikeKind between".to_string(),
+            ),
+        ];
+        let mut counts = HashMap::new();
+        counts.insert("unmapped_airport", 1);
+        counts.insert("unsupported_strike_kind_between", 1);
+        let report = build_coverage_report("2026-05-08T00:00:00Z", true, 10, 3, &skipped, &counts);
+        assert_eq!(report.mode, "nbm");
+        assert_eq!(report.markets_scanned, 10);
+        assert_eq!(report.rules_proposed, 3);
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.skip_counts["unmapped_airport"], 1);
+        assert_eq!(report.skipped_examples[0].ticker, "KX-A");
+    }
 }

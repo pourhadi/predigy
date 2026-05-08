@@ -183,12 +183,125 @@ struct CachedPair {
     child: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CachedTouch {
-    yes_bid_cents: u8,
-    yes_ask_cents: u8,
-    yes_bid_qty: u32,
-    yes_ask_qty: u32,
+type CachedTouch = ImplicationTouch;
+
+/// Top-of-book touch used by the pure implication-arb evaluator.
+///
+/// Kalshi exposes bid stacks only. `yes_ask_cents` is derived as
+/// `100 - best_no_bid`; `yes_bid_qty` and `yes_ask_qty` are the
+/// available quantities at those touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplicationTouch {
+    pub yes_bid_cents: u8,
+    pub yes_ask_cents: u8,
+    pub yes_bid_qty: u32,
+    pub yes_ask_qty: u32,
+}
+
+/// Pure evaluation result for the package:
+/// buy YES(parent) + buy NO(child).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplicationOpportunity {
+    pub parent_ask_cents: u8,
+    pub child_bid_cents: u8,
+    pub no_child_ask_cents: u8,
+    pub raw_edge_cents: i32,
+    pub per_unit_fee_cents: i32,
+    pub net_edge_cents: i32,
+    pub max_touch_qty: u32,
+}
+
+/// Allowed settlement states under a strict child⇒parent
+/// implication. The disallowed state (child YES, parent NO) is
+/// intentionally absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImplicationSettlementState {
+    ParentYesChildYes,
+    ParentYesChildNo,
+    ParentNoChildNo,
+}
+
+impl ImplicationOpportunity {
+    /// Per-contract package profit in cents for each allowed
+    /// settlement state, net of the fee estimate used to fire.
+    #[must_use]
+    pub fn settlement_profit_cents(self, state: ImplicationSettlementState) -> i32 {
+        let payout_cents = match state {
+            ImplicationSettlementState::ParentYesChildYes => 100,
+            ImplicationSettlementState::ParentYesChildNo => 200,
+            ImplicationSettlementState::ParentNoChildNo => 100,
+        };
+        let package_cost_cents = i32::from(self.parent_ask_cents)
+            + i32::from(self.no_child_ask_cents)
+            + self.per_unit_fee_cents;
+        payout_cents - package_cost_cents
+    }
+
+    #[must_use]
+    pub fn min_allowed_profit_cents(self) -> i32 {
+        [
+            ImplicationSettlementState::ParentYesChildYes,
+            ImplicationSettlementState::ParentYesChildNo,
+            ImplicationSettlementState::ParentNoChildNo,
+        ]
+        .into_iter()
+        .map(|state| self.settlement_profit_cents(state))
+        .min()
+        .unwrap_or(i32::MIN)
+    }
+}
+
+/// Pure implication-arb evaluator shared by the live strategy and
+/// the read-only opportunity scanner. Returns `None` unless the
+/// strict package edge clears `min_edge_cents` after estimated
+/// taker fees.
+#[must_use]
+pub fn evaluate_implication_opportunity(
+    parent_touch: ImplicationTouch,
+    child_touch: ImplicationTouch,
+    size: u32,
+    min_edge_cents: i32,
+) -> Option<ImplicationOpportunity> {
+    let parent_ask = parent_touch.yes_ask_cents;
+    let child_bid = child_touch.yes_bid_cents;
+    let raw_edge_cents = i32::from(child_bid) - i32::from(parent_ask);
+    if raw_edge_cents < min_edge_cents {
+        return None;
+    }
+
+    let no_child_ask = 100u8.checked_sub(child_bid)?;
+    if no_child_ask == 0 {
+        return None;
+    }
+
+    let parent_fee = per_unit_taker_fee_cents(parent_ask, size)?;
+    let child_fee = per_unit_taker_fee_cents(no_child_ask, size)?;
+    let per_unit_fee = parent_fee + child_fee;
+    let net_edge = raw_edge_cents - per_unit_fee;
+    if net_edge < min_edge_cents {
+        return None;
+    }
+
+    Some(ImplicationOpportunity {
+        parent_ask_cents: parent_ask,
+        child_bid_cents: child_bid,
+        no_child_ask_cents: no_child_ask,
+        raw_edge_cents,
+        per_unit_fee_cents: per_unit_fee,
+        net_edge_cents: net_edge,
+        max_touch_qty: parent_touch.yes_ask_qty.min(child_touch.yes_bid_qty),
+    })
+}
+
+fn per_unit_taker_fee_cents(price_cents: u8, size: u32) -> Option<i32> {
+    let qty = predigy_core::price::Qty::new(size).ok()?;
+    let price = predigy_core::price::Price::from_cents(price_cents).ok()?;
+    let total_fee = i32::try_from(predigy_core::fees::taker_fee(price, qty)).ok()?;
+    let size_i32 = i32::try_from(size).ok()?;
+    if size_i32 == 0 {
+        return None;
+    }
+    Some((total_fee + size_i32 - 1) / size_i32)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -400,47 +513,21 @@ impl ImplicationArbStrategy {
         let parent_touch = self.touches.get(&pair.parent).copied()?;
         let child_touch = self.touches.get(&pair.child).copied()?;
 
-        // Arb condition: yes_bid_child − yes_ask_parent ≥
-        // min_edge + per-leg taker fees.
-        let parent_ask = parent_touch.yes_ask_cents;
-        let child_bid = child_touch.yes_bid_cents;
+        // Arb condition: yes_bid_child − yes_ask_parent clears
+        // the configured threshold after per-leg taker fees.
+        let opp = evaluate_implication_opportunity(
+            parent_touch,
+            child_touch,
+            self.config.size,
+            self.config.min_edge_cents,
+        )?;
+        let parent_ask = opp.parent_ask_cents;
+        let child_bid = opp.child_bid_cents;
+        let no_child_ask = opp.no_child_ask_cents;
         let parent_qty = parent_touch.yes_ask_qty;
         let child_qty = child_touch.yes_bid_qty;
-
-        let raw_edge_cents = i32::from(child_bid) - i32::from(parent_ask);
-        if raw_edge_cents < self.config.min_edge_cents {
-            return None;
-        }
-        // Fees: buying YES_parent at parent_ask, selling YES_child
-        // at child_bid (= buying NO_child at 100 − child_bid). The
-        // take fee is paid on each leg's contract price.
-        let probe = predigy_core::price::Qty::new(self.config.size).ok()?;
-        let parent_price = predigy_core::price::Price::from_cents(parent_ask).ok()?;
-        let no_child_ask = 100u8.checked_sub(child_bid)?;
-        if no_child_ask == 0 {
-            return None;
-        }
-        let no_child_price = predigy_core::price::Price::from_cents(no_child_ask).ok()?;
-        let parent_fee =
-            i32::try_from(predigy_core::fees::taker_fee(parent_price, probe)).unwrap_or(i32::MAX);
-        let child_fee =
-            i32::try_from(predigy_core::fees::taker_fee(no_child_price, probe)).unwrap_or(i32::MAX);
-        let size_i32 = i32::try_from(self.config.size).unwrap_or(0);
-        if size_i32 == 0 {
-            return None;
-        }
-        let per_unit_fee = (parent_fee + child_fee) / size_i32;
-        let net_edge = raw_edge_cents - per_unit_fee;
-        if net_edge < self.config.min_edge_cents {
-            debug!(
-                pair = pair.pair_id,
-                raw_edge_cents,
-                per_unit_fee,
-                net_edge,
-                "implication-arb: edge below threshold after fees"
-            );
-            return None;
-        }
+        let per_unit_fee = opp.per_unit_fee_cents;
+        let net_edge = opp.net_edge_cents;
 
         let parent_leg = inventory.leg(&pair.parent, "yes");
         let child_leg = inventory.leg(&pair.child, "no");
@@ -709,6 +796,53 @@ mod tests {
         let mut c = cfg(path);
         c.cooldown = Duration::from_secs(0);
         ImplicationArbStrategy::new(c)
+    }
+
+    #[test]
+    fn pure_evaluator_package_is_nonnegative_for_all_allowed_states() {
+        let parent = ImplicationTouch {
+            yes_bid_cents: 20,
+            yes_ask_cents: 30,
+            yes_bid_qty: 100,
+            yes_ask_qty: 100,
+        };
+        let child = ImplicationTouch {
+            yes_bid_cents: 40,
+            yes_ask_cents: 55,
+            yes_bid_qty: 100,
+            yes_ask_qty: 100,
+        };
+        let opp = evaluate_implication_opportunity(parent, child, 1, 2).expect("edge clears");
+        assert_eq!(opp.parent_ask_cents, 30);
+        assert_eq!(opp.no_child_ask_cents, 60);
+        for state in [
+            ImplicationSettlementState::ParentYesChildYes,
+            ImplicationSettlementState::ParentYesChildNo,
+            ImplicationSettlementState::ParentNoChildNo,
+        ] {
+            assert!(
+                opp.settlement_profit_cents(state) >= 0,
+                "state {state:?} must not lose money"
+            );
+        }
+        assert_eq!(opp.min_allowed_profit_cents(), opp.net_edge_cents);
+    }
+
+    #[test]
+    fn pure_evaluator_rejects_when_fee_adjusted_edge_is_too_small() {
+        let parent = ImplicationTouch {
+            yes_bid_cents: 20,
+            yes_ask_cents: 39,
+            yes_bid_qty: 100,
+            yes_ask_qty: 100,
+        };
+        let child = ImplicationTouch {
+            yes_bid_cents: 40,
+            yes_ask_cents: 55,
+            yes_bid_qty: 100,
+            yes_ask_qty: 100,
+        };
+        assert!(evaluate_implication_opportunity(parent, child, 1, 2).is_none());
     }
 
     #[test]

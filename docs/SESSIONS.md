@@ -29,7 +29,9 @@ launchctl list | grep predigy
 | `com.predigy.stat-curate` | model_p curator for stat strategy. | scheduled |
 | `com.predigy.wx-curate` | NWS-state-aware weather rule curator. (Was for the now-disabled latency strategy; kept running so rules don't go stale if latency is re-enabled later.) | scheduled |
 | `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. Hourly post-Phase-A. | scheduled |
-| `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080. | running |
+| `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080; includes `/calibration`. | running |
+| `com.predigy.opportunity-scanner` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. | scheduled every 15m |
+| `com.predigy.calibration` | Settlement sync + reliability report writer. | scheduled hourly |
 
 `com.predigy.import` is intentionally **disabled**. With legacy traders
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
@@ -92,6 +94,28 @@ echo armed > ~/.config/predigy/kill-switch.flag   # ARM (refuse new entries)
 
 Engine + dashboard both poll the file every 5 seconds. Engine logs
 "kill-switch: ARMED" when it sees a non-empty flag.
+
+## Fill-growth / calibration evidence additions (2026-05-08)
+
+Implemented in the repo for the post-cleanup fill-growth plan:
+
+- `opportunity_observations` and `calibration_reports` additive DB
+  tables (`migrations/0003_*`).
+- `bin/opportunity-scanner`: observation-only. It evaluates the
+  configured `implication-arb` and `internal-arb` books with the same
+  pure evaluators the live strategies use, ingests `wx-stat` coverage
+  reports, records settlement configured-series observations, and writes
+  only `opportunity_observations`.
+- `bin/predigy-calibration`: syncs public Kalshi market outcomes for
+  predicted tickers and writes Brier/log-loss reliability reports.
+- Dashboard `/calibration` and `/calibration/summary.json` read the
+  latest `calibration_reports` rows.
+- `stat-curator --shadow-db` writes disabled `stat` rules plus
+  `model_p_snapshots`; this starts collecting evidence without
+  re-enabling live `stat` trading.
+- `com.predigy.opportunity-scanner` and `com.predigy.calibration` are
+  bootstrapped. Scanner cadence is 15m with paced public orderbook
+  fetches to avoid spending live REST rate budget.
 
 ## Strategy-by-strategy state
 
@@ -230,8 +254,10 @@ is roughly mid-$70s ($100 deposited net minus shake-down losses).
 3. **stat econ rules disabled pending recalibration.** All 9
    active stat rules were econ markets (BRAZILINF, ECONSTATU3,
    PAYROLLS, U3) — the audit said model_p calibration on these
-   is unproven. Re-enable a rule only after at least one print
-   cycle's worth of out-of-sample calibration data.
+   is unproven. `stat-curator --shadow-db` and `predigy-calibration`
+   now provide the evidence path; re-enable a rule only after a saved
+   calibration report shows enough settled out-of-sample samples and
+   positive after-fee expectancy.
 
 4. **wx-stat is the highest-leverage strategy to watch.** New
    defaults: `min_ask_cents=5` (skip lottery tickets) and

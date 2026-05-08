@@ -16,7 +16,8 @@
 # Output file (wx-stat-rules.json) is consumed directly by the
 # consolidated engine's wx-stat strategy when PREDIGY_WX_STAT_RULE_FILE
 # points at it. Same-day/past temperature markets are gated through ASOS
-# observed extremes before forecast/NBM scoring.
+# observed extremes before forecast/NBM scoring. Each run also writes a
+# coverage/skip report for scanner/calibration surfacing.
 #
 # Driven by launchd's StartCalendarInterval (com.predigy.wx-stat-curate).
 # Required env from ~/.zprofile:
@@ -53,6 +54,7 @@ if [[ "$PHASE" == "2" ]]; then
         --observations-cache "${DATA_DIR}/wx_stat_observations" \
         --nbm-predictions-dir "${DATA_DIR}/wx_stat_predictions" \
         --nbm-calibration    "${DATA_DIR}/wx_stat_calibration.json" \
+        --coverage-report-out "${DATA_DIR}/wx_stat_coverage_latest.json" \
         --write
 else
     "./target/release/wx-stat-curator" \
@@ -63,5 +65,6 @@ else
         --min-edge-cents "${PREDIGY_WX_STAT_MIN_EDGE_CENTS:-5}" \
         --min-margin-f   "${PREDIGY_WX_STAT_MIN_MARGIN_F:-5}" \
         --observations-cache "${DATA_DIR}/wx_stat_observations" \
+        --coverage-report-out "${DATA_DIR}/wx_stat_coverage_latest.json" \
         --write
 fi

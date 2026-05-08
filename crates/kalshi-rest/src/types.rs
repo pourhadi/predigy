@@ -154,6 +154,18 @@ pub struct MarketDetail {
     pub liquidity_dollars: Option<f64>,
     #[serde(default)]
     pub volume: Option<u64>,
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub market_result: Option<String>,
+    #[serde(default)]
+    pub settled_time: Option<String>,
+    #[serde(default)]
+    pub floor_strike: Option<f64>,
+    #[serde(default)]
+    pub cap_strike: Option<f64>,
+    #[serde(default)]
+    pub strike_type: Option<String>,
 }
 
 /// Raw orderbook response. Kalshi wraps the levels in `orderbook_fp`
@@ -161,6 +173,67 @@ pub struct MarketDetail {
 /// two-element array of decimal strings: `["0.4200", "100.00"]`.
 /// There is no ask side — YES asks are derived from NO bids by
 /// complement at the book layer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventsResponse {
+    #[serde(default)]
+    pub events: Vec<EventSummary>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventSummary {
+    pub event_ticker: String,
+    #[serde(default)]
+    pub series_ticker: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub mutually_exclusive: Option<bool>,
+    #[serde(default)]
+    pub markets: Vec<MarketSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortfolioSettlementsResponse {
+    #[serde(default)]
+    pub settlements: Vec<PortfolioSettlement>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PortfolioSettlement {
+    #[serde(default)]
+    pub ticker: Option<String>,
+    #[serde(default)]
+    pub market_ticker: Option<String>,
+    #[serde(default)]
+    pub market_result: Option<String>,
+    #[serde(default)]
+    pub settled_time: Option<String>,
+    #[serde(default, deserialize_with = "de_dollars::opt")]
+    pub revenue_dollars: Option<f64>,
+    #[serde(default, deserialize_with = "de_dollars::opt")]
+    pub fee_cost: Option<f64>,
+    #[serde(default, deserialize_with = "de_dollars::opt")]
+    pub yes_count: Option<f64>,
+    #[serde(default, deserialize_with = "de_dollars::opt")]
+    pub no_count: Option<f64>,
+}
+
+impl PortfolioSettlement {
+    #[must_use]
+    pub fn ticker_str(&self) -> &str {
+        self.market_ticker
+            .as_deref()
+            .or(self.ticker.as_deref())
+            .unwrap_or("")
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderbookResponse {
     pub orderbook_fp: Orderbook,

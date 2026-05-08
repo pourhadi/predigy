@@ -1,5 +1,5 @@
 [package]
-name = "stat-curator"
+name = "predigy-calibration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,24 +10,17 @@ repository.workspace = true
 workspace = true
 
 [[bin]]
-name = "stat-curator"
+name = "predigy-calibration"
 path = "src/main.rs"
 
-[lib]
-path = "src/lib.rs"
-
 [dependencies]
-predigy-core = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
 predigy-kalshi-rest = { workspace = true }
-stat-trader = { workspace = true }
+clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true }
-clap = { workspace = true }
-anyhow = { workspace = true }
-reqwest = { workspace = true }
-sqlx = { workspace = true }
-chrono = { workspace = true }

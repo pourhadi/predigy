@@ -218,6 +218,14 @@ Summary:
   reason + set_at + set_by.
 - `calibration` — fitted Platt coefficients per (strategy,
   airport, month).
+- `opportunity_observations` — append-only scanner records. These
+  are intentionally non-executing: scanner jobs write current edge /
+  skip evidence here and never write `intents`, `fills`, or
+  `positions`.
+- `calibration_reports` — archived reliability snapshots by
+  strategy/window (`n_predictions`, `n_settled`, Brier, log-loss,
+  bins, diagnosis). The dashboard's `/calibration` view reads the
+  latest row per strategy.
 
 Materialised views (refreshed periodically or on demand):
 
@@ -315,8 +323,10 @@ shared OMS to FIX/REST. Strategies don't talk to Kalshi directly.
 | `crates/strategies/stat` | bin/stat-trader | model_p vs ask, Kelly-sized. Now sees model_p updates from wx-stat continuously. |
 | `crates/strategies/latency` | bin/latency-trader | Subscribes to NWS alerts via the engine's external feed; fires faster via FIX. |
 | `crates/strategies/settlement` | bin/settlement-trader | Pre-settlement mispricing capture. |
-| `crates/strategies/wx-stat` | bin/wx-stat-curator | Consumes NBM-curated weather rules directly; curator gates same-day/past temperature markets through airport-local-day ASOS observed extremes before forecast scoring. `predigy-import` must not mirror `wx-stat-rules.json` into `stat`. |
-| `crates/strategies/wx-curator` | bin/wx-curator + bin/stat-curator + bin/cross-arb-curator | LLM-based rule producers. Now in-engine; output goes to `rules` table. |
+| `crates/strategies/wx-stat` | bin/wx-stat-curator | Consumes NBM-curated weather rules directly; curator gates same-day/past temperature markets through airport-local-day ASOS observed extremes before forecast scoring and can emit a JSON coverage/skip report. `predigy-import` must not mirror `wx-stat-rules.json` into `stat`. |
+| `crates/strategies/wx-curator` | bin/wx-curator + bin/stat-curator + bin/cross-arb-curator | LLM-based rule producers. `stat-curator --shadow-db` writes disabled `stat` rules plus `model_p_snapshots` for calibration evidence; it does not enable live `stat` trading. |
+| `bin/opportunity-scanner` | launchd one-shot | Read-only scanner that evaluates configured arb books via shared pure evaluators and writes only `opportunity_observations`. |
+| `bin/predigy-calibration` | launchd one-shot | Public settlement-outcome backfill plus reliability report writer for `calibration_reports`. |
 
 ### Active position management
 

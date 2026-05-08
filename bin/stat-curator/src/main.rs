@@ -21,7 +21,9 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
+use predigy_core::side::Side;
 use predigy_kalshi_rest::{Client as RestClient, Signer};
+use sqlx::postgres::PgPoolOptions;
 use stat_curator::{DEFAULT_CATEGORIES, propose_rules, scan_stat_markets};
 use stat_trader::StatRule;
 use std::path::PathBuf;
@@ -75,6 +77,16 @@ struct Args {
     /// rules are printed to stdout (dry-run mode).
     #[arg(long, default_value_t = false)]
     write: bool,
+
+    /// Shadow-write generated rules to Postgres as disabled stat
+    /// rules plus model_p snapshots. This is calibration evidence
+    /// only; it never enables live stat trading.
+    #[arg(long, default_value_t = false)]
+    shadow_db: bool,
+
+    /// Postgres DSN for `--shadow-db`.
+    #[arg(long, env = "DATABASE_URL", default_value = "postgresql:///predigy")]
+    database_url: String,
 }
 
 #[tokio::main]
@@ -184,6 +196,14 @@ async fn main() -> Result<()> {
         warn!(market = %m, why = %why, "dropped invalid rule");
     }
 
+    if args.shadow_db {
+        shadow_write_rules(&args.database_url, &all_rules).await?;
+        info!(
+            n_rules = all_rules.len(),
+            "stat shadow rules written disabled to DB"
+        );
+    }
+
     if args.write {
         write_rules(&all_rules, &args.output).await?;
         println!(
@@ -205,6 +225,83 @@ async fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn shadow_write_rules(database_url: &str, rules: &[StatRule]) -> Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(3)
+        .connect(database_url)
+        .await
+        .with_context(|| format!("connect postgres {database_url}"))?;
+    for rule in rules {
+        let ticker = rule.kalshi_market.as_str();
+        sqlx::query(
+            r#"
+            INSERT INTO markets (ticker, venue, market_type, title, tags, payload)
+            VALUES ($1, 'kalshi', 'binary', $2, $3, $4)
+            ON CONFLICT (ticker) DO UPDATE
+            SET last_updated_at = now(),
+                payload = COALESCE(markets.payload, EXCLUDED.payload)
+            "#,
+        )
+        .bind(ticker)
+        .bind(format!("stat shadow {ticker}"))
+        .bind(vec!["stat-shadow".to_string()])
+        .bind(serde_json::json!({
+            "source": "stat-curator --shadow-db",
+            "non_executing": true
+        }))
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO model_p_snapshots (strategy, ticker, raw_p, model_p, source, detail)
+            VALUES ('stat', $1, $2, $2, 'stat-curator-shadow', $3)
+            "#,
+        )
+        .bind(ticker)
+        .bind(rule.model_p)
+        .bind(serde_json::json!({
+            "side": side_str(rule.side),
+            "min_edge_cents": rule.min_edge_cents,
+            "settlement_date": rule.settlement_date,
+            "generated_at_utc": rule.generated_at_utc,
+            "enabled": false
+        }))
+        .execute(&pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO rules (
+                strategy, ticker, side, model_p, min_edge_cents,
+                expires_at, source, enabled
+            ) VALUES ('stat', $1, $2, $3, $4, NULL, 'stat-curator-shadow', false)
+            ON CONFLICT (strategy, ticker) DO UPDATE
+            SET side = EXCLUDED.side,
+                model_p = EXCLUDED.model_p,
+                min_edge_cents = EXCLUDED.min_edge_cents,
+                source = EXCLUDED.source,
+                fitted_at = now(),
+                enabled = false
+            "#,
+        )
+        .bind(ticker)
+        .bind(side_str(rule.side))
+        .bind(rule.model_p)
+        .bind(i32::try_from(rule.min_edge_cents).unwrap_or(i32::MAX))
+        .execute(&pool)
+        .await?;
+    }
+    Ok(())
+}
+
+fn side_str(side: Side) -> &'static str {
+    match side {
+        Side::Yes => "yes",
+        Side::No => "no",
+    }
 }
 
 async fn write_rules(rules: &[StatRule], output: &std::path::Path) -> Result<()> {

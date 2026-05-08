@@ -54,12 +54,52 @@ open http://192.168.1.217:8080        # LAN (your phone)
 
 Top-level pill: green = engine fresh, warn = stale, bad = down.
 
+Calibration view:
+
+```sh
+open http://localhost:8080/calibration
+curl -s http://localhost:8080/calibration/summary.json | jq .
+```
+
 ### Postgres
 
 ```sh
 psql -d predigy -c "SELECT status, COUNT(*) FROM intents GROUP BY status;"
 psql -d predigy -c "SELECT strategy, COUNT(*) FROM positions WHERE closed_at IS NULL GROUP BY strategy;"
 psql -d predigy -c "SELECT strategy, COUNT(*) FROM rules WHERE enabled = true GROUP BY strategy;"
+psql -d predigy -c "SELECT strategy, COUNT(*), COUNT(*) FILTER (WHERE would_fire) FROM opportunity_observations WHERE ts > now() - interval '6 hours' GROUP BY strategy;"
+psql -d predigy -c "SELECT strategy, window_end, n_predictions, n_settled, brier, log_loss FROM calibration_reports ORDER BY window_end DESC LIMIT 10;"
+```
+
+## Fill-growth scanner + calibration jobs
+
+Observation-only scanner:
+
+```sh
+# Dry-run; fetches public orderbooks for configured arb pairs/families.
+./target/release/opportunity-scanner arb
+
+# Production tick: writes opportunity_observations only.
+deploy/scripts/opportunity-scanner-run.sh
+```
+
+Calibration evidence:
+
+```sh
+# Backfill public settled outcomes for predicted tickers.
+./target/release/predigy-calibration sync-settlements --window-days 90 --limit 200
+
+# Compute/store reliability report.
+./target/release/predigy-calibration report --strategy stat --window-days 90
+./target/release/predigy-calibration report --strategy wx-stat --window-days 90
+```
+
+`stat-curate.sh` runs `stat-curator --shadow-db`; it upserts disabled
+`stat` rules and appends `model_p_snapshots`. It must not enable live
+`stat` rules. Verify after any curator/deploy change:
+
+```sh
+psql -d predigy -c "SELECT enabled, COUNT(*) FROM rules WHERE strategy='stat' GROUP BY enabled;"
 ```
 
 ## Kill switch (panic button)
@@ -99,6 +139,16 @@ If the plist itself changed (`deploy/macos/com.predigy.engine.plist`):
 cp deploy/macos/com.predigy.engine.plist ~/Library/LaunchAgents/
 launchctl bootout "gui/$(id -u)/com.predigy.engine"
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.engine.plist
+```
+
+Scanner/calibration launchd jobs are observation jobs (`opportunity-scanner`
+currently every 15m, `calibration` hourly). Install/reload:
+
+```sh
+cp deploy/macos/com.predigy.opportunity-scanner.plist ~/Library/LaunchAgents/
+cp deploy/macos/com.predigy.calibration.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.opportunity-scanner.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.calibration.plist
 ```
 
 ## Debugging
