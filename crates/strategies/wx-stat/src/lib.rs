@@ -119,6 +119,15 @@ pub struct WxStatConfig {
     /// fee floor is 1¢, so on a 3¢ entry the round-trip cost
     /// is 33% even on the winners. Default 5¢.
     pub min_ask_cents: u32,
+    /// Mirror of the risk engine's per-(ticker, side) contract cap
+    /// used to suppress predictable cap rejects before creating an
+    /// intent. Risk remains authoritative; this only saves churn.
+    pub max_open_contracts_per_side: i32,
+    /// Mirror of the risk engine's daily-loss cap. When the local
+    /// conservative mark-to-market is already below this breaker,
+    /// wx-stat stops constructing new entry intents and lets open
+    /// positions settle. `0` disables the local pre-check.
+    pub max_daily_loss_cents: i64,
 }
 
 impl WxStatConfig {
@@ -133,6 +142,10 @@ impl WxStatConfig {
     /// - `PREDIGY_WX_STAT_MAX_SIZE` (u32)
     /// - `PREDIGY_WX_STAT_COOLDOWN_MS` (u64)
     /// - `PREDIGY_WX_STAT_RULE_REFRESH_MS` (u64)
+    /// - `PREDIGY_WX_STAT_MAX_OPEN_CONTRACTS_PER_SIDE` (i32,
+    ///   default mirrors `PREDIGY_MAX_CONTRACTS_PER_SIDE` or 20)
+    /// - `PREDIGY_WX_STAT_MAX_DAILY_LOSS_CENTS` (i64,
+    ///   default mirrors `PREDIGY_MAX_DAILY_LOSS_CENTS` or disabled)
     #[must_use]
     pub fn from_env(rule_file: PathBuf) -> Self {
         let mut c = Self {
@@ -150,6 +163,14 @@ impl WxStatConfig {
             // 5¢ floor — fee structure makes &lt;5¢ entries
             // structurally fee-fragile.
             min_ask_cents: 5,
+            max_open_contracts_per_side: std::env::var("PREDIGY_MAX_CONTRACTS_PER_SIDE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+            max_daily_loss_cents: std::env::var("PREDIGY_MAX_DAILY_LOSS_CENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
         };
         if let Ok(v) = std::env::var("PREDIGY_WX_STAT_BANKROLL_CENTS")
             && let Ok(n) = v.parse()
@@ -196,6 +217,16 @@ impl WxStatConfig {
         {
             c.min_ask_cents = n;
         }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MAX_OPEN_CONTRACTS_PER_SIDE")
+            && let Ok(n) = v.parse()
+        {
+            c.max_open_contracts_per_side = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MAX_DAILY_LOSS_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.max_daily_loss_cents = n;
+        }
         c
     }
 }
@@ -226,6 +257,12 @@ pub struct WxStatStrategy {
     last_fire_at: HashMap<String, Instant>,
     last_rule_mtime: Option<SystemTime>,
     last_rule_refresh: Option<Instant>,
+    /// Current open quantity per (ticker, side). Refreshed on the
+    /// same cadence as rules; used only to avoid known risk-cap
+    /// rejects before creating an intent.
+    positions: HashMap<String, i32>,
+    daily_pnl_cents: Option<i64>,
+    last_position_refresh: Option<Instant>,
     /// Tickers we've already self-subscribed to. Bounded growth
     /// (one per market the curator has ever proposed since boot).
     subscribed: HashSet<String>,
@@ -239,6 +276,9 @@ impl WxStatStrategy {
             last_fire_at: HashMap::new(),
             last_rule_mtime: None,
             last_rule_refresh: None,
+            positions: HashMap::new(),
+            daily_pnl_cents: None,
+            last_position_refresh: None,
             subscribed: HashSet::new(),
         }
     }
@@ -403,28 +443,66 @@ impl WxStatStrategy {
         {
             return None;
         }
+        if self.config.max_daily_loss_cents > 0
+            && let Some(pnl) = self.daily_pnl_cents
+            && pnl < -self.config.max_daily_loss_cents
+        {
+            debug!(
+                pnl_cents = pnl,
+                cap_cents = self.config.max_daily_loss_cents,
+                "wx-stat: entry blocked by local daily-loss cap"
+            );
+            return None;
+        }
         let (ask_cents, available_qty) = derive_ask(book, rule.side)?;
+        let position_key = position_key(market.as_str(), rule.side);
+        let open_qty = self
+            .positions
+            .get(&position_key)
+            .copied()
+            .unwrap_or(0)
+            .max(0);
+        let remaining = self.config.max_open_contracts_per_side - open_qty;
+        if remaining <= 0 {
+            debug!(
+                ticker = %market.as_str(),
+                side = ?rule.side,
+                open_qty,
+                cap = self.config.max_open_contracts_per_side,
+                "wx-stat: entry blocked by local position cap"
+            );
+            return None;
+        }
+        let available_qty = available_qty.min(u32::try_from(remaining).ok()?);
         let intent = build_intent(market, rule, &self.config, ask_cents, available_qty)?;
         self.last_fire_at.insert(key, now);
         Some(intent)
     }
 
-    async fn subscribe_held_positions(
+    async fn refresh_positions(
         &mut self,
         state: &StrategyState,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let added: Vec<MarketTicker> = state
-            .db
-            .open_positions(Some(STRATEGY_ID.0))
-            .await?
-            .into_iter()
-            .map(|p| p.ticker)
-            .filter(|ticker| self.subscribed.insert(ticker.clone()))
-            .map(MarketTicker::new)
-            .collect();
+        let rows = state.db.open_positions(Some(STRATEGY_ID.0)).await?;
+        let mut next = HashMap::with_capacity(rows.len());
+        let mut added = Vec::new();
+        for p in rows {
+            let side = match p.side.as_str() {
+                "yes" => Side::Yes,
+                "no" => Side::No,
+                _ => continue,
+            };
+            next.insert(position_key(&p.ticker, side), p.current_qty);
+            if self.subscribed.insert(p.ticker.clone()) {
+                added.push(MarketTicker::new(&p.ticker));
+            }
+        }
         if !added.is_empty() {
             state.subscribe_to_markets(added);
         }
+        self.daily_pnl_cents = Some(state.db.daily_pnl_with_marks(STRATEGY_ID.0).await?);
+        self.positions = next;
+        self.last_position_refresh = Some(Instant::now());
         Ok(())
     }
 }
@@ -472,7 +550,12 @@ impl Strategy for WxStatStrategy {
             if !added.is_empty() {
                 state.subscribe_to_markets(added);
             }
-            self.subscribe_held_positions(state).await?;
+        }
+        let needs_position_refresh = self
+            .last_position_refresh
+            .is_none_or(|t| t.elapsed() >= self.config.rule_refresh_interval);
+        if needs_position_refresh {
+            self.refresh_positions(state).await?;
         }
 
         match ev {
@@ -491,6 +574,14 @@ impl Strategy for WxStatStrategy {
     fn tick_interval(&self) -> Option<Duration> {
         Some(self.config.rule_refresh_interval)
     }
+}
+
+fn position_key(ticker: &str, side: Side) -> String {
+    let tag = match side {
+        Side::Yes => 'y',
+        Side::No => 'n',
+    };
+    format!("{ticker}:{tag}")
 }
 
 fn derive_ask(book: &OrderBook, side: Side) -> Option<(u8, u32)> {
@@ -636,6 +727,8 @@ mod tests {
             max_rule_age: Duration::from_secs(6 * 60 * 60),
             max_notional_per_fire_cents: 500,
             min_ask_cents: 5,
+            max_open_contracts_per_side: 20,
+            max_daily_loss_cents: 0,
         }
     }
 
@@ -747,6 +840,50 @@ mod tests {
         // Re-running without changes returns empty.
         let added = s.reload_rules_from_disk();
         assert!(added.is_empty());
+    }
+
+    #[test]
+    fn entry_blocked_when_local_daily_loss_cap_reached() {
+        let mut cfg = cfg(PathBuf::from("/dev/null"));
+        cfg.max_daily_loss_cents = 1_000;
+        let mut s = WxStatStrategy::new(cfg);
+        s.rules
+            .insert("KX-LOSS".into(), cached_rule(Side::Yes, 0.95, 3));
+        s.daily_pnl_cents = Some(-1_001);
+        let market = MarketTicker::new("KX-LOSS");
+        let book = book_with_quotes(Some(20), Some(30));
+        assert!(s.evaluate(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn entry_blocked_when_local_position_cap_reached() {
+        let mut cfg = cfg(PathBuf::from("/dev/null"));
+        cfg.max_open_contracts_per_side = 20;
+        let mut s = WxStatStrategy::new(cfg);
+        s.rules
+            .insert("KX-CAPPED".into(), cached_rule(Side::No, 0.15, 3));
+        s.positions.insert(position_key("KX-CAPPED", Side::No), 20);
+        let market = MarketTicker::new("KX-CAPPED");
+        // For a NO bet, ask is 100 - YES bid = 70.
+        let book = book_with_quotes(Some(30), Some(30));
+        assert!(s.evaluate(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn entry_size_reduced_to_remaining_local_position_cap() {
+        let mut cfg = cfg(PathBuf::from("/dev/null"));
+        cfg.max_open_contracts_per_side = 20;
+        cfg.max_size = 10;
+        let mut s = WxStatStrategy::new(cfg);
+        s.rules
+            .insert("KX-ROOM".into(), cached_rule(Side::Yes, 0.95, 3));
+        s.positions.insert(position_key("KX-ROOM", Side::Yes), 18);
+        let market = MarketTicker::new("KX-ROOM");
+        let book = book_with_quotes(Some(20), Some(30)); // YES ask 70
+        let intent = s
+            .evaluate(&market, &book, Instant::now())
+            .expect("remaining cap allows reduced entry");
+        assert_eq!(intent.qty, 2);
     }
 
     #[test]

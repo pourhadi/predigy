@@ -82,6 +82,53 @@ impl Db {
         Ok(rows)
     }
 
+    /// Per-strategy daily P&L using the same conservative mark logic
+    /// as the live OMS risk check. Used by strategies only to avoid
+    /// repeatedly constructing intents that the OMS daily-loss breaker
+    /// is guaranteed to reject; the OMS remains authoritative.
+    pub async fn daily_pnl_with_marks(&self, strategy: &str) -> Result<i64, sqlx::Error> {
+        let rows: Vec<DailyPnlMarkRow> = sqlx::query_as(
+            "SELECT p.current_qty,
+                    p.side,
+                    p.avg_entry_cents,
+                    p.realized_pnl_cents,
+                    p.fees_paid_cents,
+                    b.best_yes_bid_cents,
+                    b.best_yes_ask_cents,
+                    b.last_update
+               FROM positions p
+          LEFT JOIN book_snapshots b ON b.ticker = p.ticker
+              WHERE p.strategy = $1
+                AND (p.closed_at >= date_trunc('day', now()) OR p.closed_at IS NULL)",
+        )
+        .bind(strategy)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut pnl = 0_i64;
+        let now = chrono::Utc::now();
+        for row in rows {
+            pnl += row.realized_pnl_cents - row.fees_paid_cents;
+            if row.current_qty == 0 {
+                continue;
+            }
+            let recent = row
+                .last_update
+                .is_some_and(|ts| now.signed_duration_since(ts).num_seconds() <= 120);
+            let mark = conservative_mark_cents(
+                &row.side,
+                row.current_qty,
+                row.best_yes_bid_cents,
+                row.best_yes_ask_cents,
+                recent,
+            );
+            pnl += i64::from(mark - row.avg_entry_cents)
+                * i64::from(row.current_qty.signum())
+                * i64::from(row.current_qty.abs());
+        }
+        Ok(pnl)
+    }
+
     /// Latest model_p value seen per (strategy, ticker). Used by
     /// the engine when bootstrapping a strategy at startup so it
     /// doesn't fire entries until a fresh enough number lands.
@@ -186,6 +233,53 @@ pub struct DailyPnl {
     pub strategy: String,
     pub realized_pnl_cents: i64,
     pub n_positions: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DailyPnlMarkRow {
+    current_qty: i32,
+    side: String,
+    avg_entry_cents: i32,
+    realized_pnl_cents: i64,
+    fees_paid_cents: i64,
+    best_yes_bid_cents: Option<i32>,
+    best_yes_ask_cents: Option<i32>,
+    last_update: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+fn conservative_mark_cents(
+    side: &str,
+    qty: i32,
+    best_yes_bid_cents: Option<i32>,
+    best_yes_ask_cents: Option<i32>,
+    recent: bool,
+) -> i32 {
+    if recent {
+        match (side, qty.signum()) {
+            ("yes", 1) => {
+                if let Some(mark) = best_yes_bid_cents {
+                    return mark;
+                }
+            }
+            ("yes", -1) => {
+                if let Some(mark) = best_yes_ask_cents {
+                    return mark;
+                }
+            }
+            ("no", 1) => {
+                if let Some(mark) = best_yes_ask_cents.map(|ask| 100 - ask) {
+                    return mark;
+                }
+            }
+            ("no", -1) => {
+                if let Some(mark) = best_yes_bid_cents.map(|bid| 100 - bid) {
+                    return mark;
+                }
+            }
+            _ => {}
+        }
+    }
+    if qty > 0 { 0 } else { 100 }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
