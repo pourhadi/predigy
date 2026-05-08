@@ -176,7 +176,12 @@ impl CrossArbConfig {
 impl Default for CrossArbConfig {
     fn default() -> Self {
         Self {
-            min_edge_cents: 1,
+            // 3¢ default — Kalshi taker fee on a typical 30-70¢
+            // contract is 1-2¢ round trip; firing at edge=1¢ pays
+            // fees to enter a fee-loss. Mechanism audit 2026-05-08
+            // raised the floor to ensure each fire has positive
+            // EV after fees.
+            min_edge_cents: 3,
             max_size: 25,
             cooldown: Duration::from_millis(500),
             // Phase 6.2 defaults: take 5¢ profit, cap 4¢ loss.
