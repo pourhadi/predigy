@@ -11,14 +11,21 @@
 launchctl list | grep predigy
 ```
 
-Expected (post-cutover):
+Expected (post-2026-05-08 ops cleanup):
 
 ```
 <pid>  0  com.predigy.engine
 <pid>  0  com.predigy.dashboard
 <pid>  0  com.predigy.cross-arb-curate     # only when cron-firing
    -   0  com.predigy.{stat,wx,wx-stat}-curate
-   -   0  com.predigy.import
+```
+
+`com.predigy.import` and the legacy trader jobs
+`{latency-trader,stat-trader,settlement,cross-arb}` should be absent and
+persistently disabled:
+
+```sh
+launchctl print-disabled "gui/$(id -u)" | grep 'com.predigy'
 ```
 
 The `<pid>  0` rows are running; the `-  0` rows are scheduled cron
@@ -100,8 +107,8 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.engine.pli
 
 1. Check kill switch: `cat ~/.config/predigy/kill-switch.flag` —
    non-empty = armed.
-2. Check rules count: stat needs `rules.enabled = true` rows;
-   curators populate them.
+2. Check rules count. `stat` currently has 0 enabled rules by design
+   pending calibration; `wx-stat` consumes its JSON rule file directly.
 3. Check WS connection: `grep "router: subscribe submitted"
    ~/Library/Logs/predigy/engine.stderr.log | tail -1`.
 4. Check that markets are open and have books. Overnight markets
@@ -151,6 +158,15 @@ tail -n 120 ~/Library/Logs/predigy/engine.stderr.log
 
 If venue state disagrees with Postgres, keep the kill switch armed until you
 understand whether the drift is legacy/manual exposure or a current OMS bug.
+For a quick aggregate venue-vs-DB check, compare dashboard `/api/state`
+non-zero `open_positions[].contracts` with:
+
+```sh
+psql -d predigy -c "SELECT ticker, SUM(CASE WHEN side='yes' THEN current_qty ELSE -current_qty END) AS db_qty FROM positions WHERE closed_at IS NULL GROUP BY ticker ORDER BY ticker;"
+```
+
+The 2026-05-08 cleanup manually aligned stale force-flatten DB rows to
+Kalshi `/portfolio/positions`; repeat that only after a fresh DB backup.
 
 ### "Dashboard or engine is producing many Kalshi 429s"
 
@@ -222,8 +238,9 @@ crosses a threshold, the emitted rule must be forced to the
 observed-deterministic side.
 
 The consolidated engine consumes `wx-stat-rules.json` directly under the
-`wx-stat` strategy. `predigy-import` must not import that file as `stat` rules.
-Verify after import refreshes:
+`wx-stat` strategy. `predigy-import` is currently disabled; if it is ever
+re-enabled, it must not import that file as `stat` rules. Verify after any
+import refresh:
 
 ```sh
 psql -d predigy -c "SELECT COUNT(*) FROM rules WHERE strategy = 'stat' AND source = 'import:/Users/dan/.config/predigy/wx-stat-rules.json' AND enabled = true;"
@@ -253,9 +270,9 @@ Postgres for forensic analysis without spending real money.
 
 ## Manual position management
 
-The engine doesn't manage positions held by the legacy daemons (those
-positions live in the legacy JSON state files, not Postgres).
-If you need to flatten a legacy position manually:
+Legacy daemons are disabled. The engine's Postgres `positions` table should
+match aggregate Kalshi venue exposure. If you need to flatten a residual
+venue position manually:
 
 ```sh
 # List Kalshi-account-side positions:
@@ -269,14 +286,16 @@ or write a one-shot script that uses `predigy-kalshi-rest`.
 
 ## Rolling back to legacy daemons
 
-The legacy plists are still on disk. To revert (one cycle only):
+The legacy plists are still on disk but are disabled with launchctl. To
+revert (one cycle only):
 
 ```sh
 # 1. Stop engine
 launchctl bootout "gui/$(id -u)/com.predigy.engine"
 
-# 2. Re-bootstrap legacy traders
+# 2. Re-enable + bootstrap legacy traders
 for n in latency-trader stat-trader settlement cross-arb; do
+    launchctl enable "gui/$(id -u)/com.predigy.$n"
     launchctl bootstrap "gui/$(id -u)" \
         ~/Library/LaunchAgents/com.predigy.$n.plist
 done
@@ -306,7 +325,7 @@ tail -f ~/Library/Logs/predigy/cross-arb-curate.stderr.log
 tail -f ~/Library/Logs/predigy/wx-curate.stderr.log
 tail -f ~/Library/Logs/predigy/stat-curate.stderr.log
 tail -f ~/Library/Logs/predigy/wx-stat-curate.stderr.log
-tail -f ~/Library/Logs/predigy/import.stderr.log
+tail -f ~/Library/Logs/predigy/import.stderr.log          # currently disabled
 ```
 
 The engine's log is structured `tracing` output; filter with grep

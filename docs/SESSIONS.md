@@ -16,7 +16,7 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-08, post-audit-tightening)
+## What is running RIGHT NOW (2026-05-08, post-audit ops cleanup)
 
 ```
 launchctl list | grep predigy
@@ -29,8 +29,11 @@ launchctl list | grep predigy
 | `com.predigy.stat-curate` | model_p curator for stat strategy. | scheduled |
 | `com.predigy.wx-curate` | NWS-state-aware weather rule curator. (Was for the now-disabled latency strategy; kept running so rules don't go stale if latency is re-enabled later.) | scheduled |
 | `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. Hourly post-Phase-A. | scheduled |
-| `com.predigy.import` | Legacy JSON-state mirror to Postgres. | scheduled |
 | `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080. | running |
+
+`com.predigy.import` is intentionally **disabled**. With legacy traders
+retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
+`stat-rules.json` on every import tick.
 
 **Active engine strategies (6, post-2026-05-08 mechanism audit):**
 `stat`, `wx-stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
@@ -43,8 +46,10 @@ vars in `~/.zprofile` (engine skips registration when
 for verdicts and re-enable conditions.
 
 Retired (post-cutover): `latency-trader`, `settlement-trader`,
-`stat-trader`, `cross-arb-trader`. Plists still on disk under
-`deploy/macos/`; Phase 7 will delete them once ≥1 week stable.
+`stat-trader`, `cross-arb-trader`. As of the 2026-05-08 ops cleanup they
+are booted out and persistently disabled with `launchctl disable`.
+Plists still on disk under `deploy/macos/`; Phase 7 will delete them once
+≥1 week stable.
 
 ## The cutover (2026-05-07 07:45 UTC)
 
@@ -65,8 +70,9 @@ Retired (post-cutover): `latency-trader`, `settlement-trader`,
 
 ## Where money lives
 
-- **Kalshi production account**: ~$50 funded. `KALSHI_KEY_ID` in
-  `~/.zprofile`; PEM at `~/.config/predigy/kalshi.pem`.
+- **Kalshi production account**: $100 deposited, account value roughly
+  mid-$70s after the shake-down / force-flatten period. `KALSHI_KEY_ID`
+  in `~/.zprofile`; PEM at `~/.config/predigy/kalshi.pem`.
 - **Capital caps in the engine** (RiskCaps shake-down defaults):
   - `max_notional_cents` per strategy: $40 ($4000¢)
   - `max_global_notional_cents`: $120 ($12000¢)
@@ -91,9 +97,11 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 
 ### `stat` (statistical model probability vs ask)
 
-- 5 enabled rules in `rules` table (Postgres) as of the latest check.
-  Curated by `stat-curate`; `wx-stat-curate` feeds the dedicated
-  `wx-stat` strategy directly.
+- 0 enabled rules in `rules` table (Postgres) as of the 2026-05-08 ops
+  cleanup. `stat-curate` may still write `stat-rules.json`, but
+  `predigy-import` is disabled so stale/unproven econ rules do not get
+  mirrored back into DB trading state. `wx-stat-curate` feeds the
+  dedicated `wx-stat` strategy directly.
 - Phase 6.1 active exits: take-profit 8¢ / stop-loss 5¢, defaults.
   Closing IOCs use idempotent
   `stat-exit:{ticker}:{side}:{tp|sl}:{minute_bucket}` cids.
@@ -123,9 +131,9 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
   from the Kalshi event-ticker date suffix (`26MAY07`) rather than naive
   UTC `occurrence_datetime`, which can land on the following UTC date for
   US local-day temperature markets.
-- Latest live restart loaded zero active `wx-stat` rules because the
-  old metadata-less/misdated rule file is skipped. `com.predigy.wx-stat-curate`
-  was running a full NBM cache refresh to regenerate metadata-bearing rules.
+- Latest live restart loaded 3 active `wx-stat` rules after curator output
+  regeneration. Keep watching this lane first; it remains the highest-
+  conviction directional strategy.
 
 ### `settlement` (sports tape-reading near close)
 
@@ -159,7 +167,9 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
   `PREDIGY_CROSS_ARB_MIN_EDGE_CENTS`.
 - **2026-05-08 cleanup**: 18 stale `venue-reconcile` rows purged
   from `positions` table. They were stranding cross-arb's contract
-  cap with phantom 50¢ entries.
+  cap with phantom 50¢ entries. Later the same ops pass reconciled
+  Postgres open positions to Kalshi `/portfolio/positions`; aggregate
+  DB-vs-venue position mismatch count was verified at 0.
 - Cross-strategy bus: cross-arb publishes `PolyMidUpdate` for
   paired markets; stat subscribes (currently log-only — augmenting
   belief from poly-mid is a future enhancement).
@@ -199,10 +209,10 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 
 The 2026-05-08 mechanism audit (see `docs/AUDIT_2026-05-08.md`)
 is the current strategic frame. Live fleet has been narrowed
-from 10 → 6 strategies; force-flatten of 32/52 positions has
-freed capital; engine is **disarmed and trading** as of
-2026-05-08 ~03:30 UTC. Account is ~$76.71 ($100 deposited net
-−$23 from shake-down period).
+from 10 → 6 strategies; force-flatten of 32/52 positions freed capital;
+legacy launchd traders + `predigy-import` are disabled; engine is
+**disarmed and trading** as of the 2026-05-08 ops cleanup. Account value
+is roughly mid-$70s ($100 deposited net minus shake-down losses).
 
 1. **Watch the surviving 6 for ≥30 closed trades each before
    scaling caps.** The audit's mechanism verdict is theoretical —
@@ -211,10 +221,11 @@ freed capital; engine is **disarmed and trading** as of
    skilled), `internal-arb` and `implication-arb` (real arb math).
    On probation: `stat`, `settlement`, `cross-arb`.
 
-2. **20 short-dated weather positions auto-settle in 24-48h**
-   from the 2026-05-07 force-flatten. Cost basis ~$20.21, current
-   exposure ~$1.06 on the dashboard. Don't conflate their
-   settlement P&L with the post-disarm strategy P&L.
+2. **Residual short-dated weather positions auto-settle in 24-48h**
+   from the 2026-05-07 force-flatten. The ops cleanup aligned DB
+   aggregate exposure to Kalshi venue exposure, but realized P&L from
+   the force-flatten/settlement mess is still not clean strategy evidence.
+   Don't conflate it with post-cleanup unforced strategy P&L.
 
 3. **stat econ rules disabled pending recalibration.** All 9
    active stat rules were econ markets (BRAZILINF, ECONSTATU3,
@@ -230,8 +241,9 @@ freed capital; engine is **disarmed and trading** as of
 
 5. **cross-arb on probation.** `min_edge_cents` 1 → 3 fixes the
    fee-floor bug. 18 venue-reconcile phantom rows purged from
-   the contract-cap accounting. Watch for actual fires post-
-   purge.
+   the contract-cap accounting, and the legacy `cross-arb` launchd
+   job is disabled so the curator cannot restart the old trader.
+   Watch for actual fires from the consolidated engine only.
 
 6. **Disabled-strategy re-enable conditions** (per
    `docs/AUDIT_2026-05-08.md`):

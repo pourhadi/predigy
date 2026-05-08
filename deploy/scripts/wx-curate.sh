@@ -1,11 +1,13 @@
 #!/bin/zsh
-# Daily curate-and-restart wrapper for the weather strategy.
+# Daily weather-rule curator wrapper.
 #
 # Run by launchd (com.predigy.wx-curate.plist) once per day.
-# Re-curates the rule set against current Kalshi weather markets,
-# then restarts latency-trader so it picks up the fresh rules.
-# A no-op if the curator fails — preserves whatever rules were
-# previously written rather than leaving an empty file.
+# Re-curates the rule set against current Kalshi weather markets.
+# The latency strategy is disabled unless explicitly re-enabled in
+# the consolidated engine; legacy latency-trader restart hooks are
+# intentionally not used. A no-op if the curator fails — preserves
+# whatever rules were previously written rather than leaving an
+# empty file.
 #
 # Layout assumed:
 #   $PREDIGY_HOME/target/release/wx-curator
@@ -48,7 +50,4 @@ mv "$RULES_TMP" "$RULES"
 RULE_COUNT=$(grep -c '"kalshi_market"' "$RULES" 2>/dev/null || echo 0)
 echo "[$(date -Iseconds)] wx-curate: wrote $RULE_COUNT rules to $RULES"
 
-# Signal latency-trader (loaded by the other plist) to restart and
-# pick up fresh rules. launchd will auto-relaunch it.
-launchctl kickstart -k gui/$(id -u)/com.predigy.latency-trader || true
-echo "[$(date -Iseconds)] wx-curate: triggered latency-trader reload"
+echo "[$(date -Iseconds)] wx-curate: refresh complete (no legacy trader restart)"

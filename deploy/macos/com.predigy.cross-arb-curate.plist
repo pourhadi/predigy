@@ -5,10 +5,11 @@
     <!-- Cross-arb pair curator. Cron-style: launchd kicks the
          binary every StartInterval seconds; each tick loads state,
          scans Kalshi+Polymarket, only calls Claude on NEW
-         candidates, writes the pair file + state file, and
-         kickstarts com.predigy.cross-arb if the pair set changed
-         so the trader picks up new pairs. ThrottleInterval gives
-         launchd a backstop against the binary spinning. -->
+         candidates, and writes the pair file + state file. The
+         consolidated engine hot-reloads the pair file directly;
+         legacy trader restart hooks are intentionally disabled.
+         ThrottleInterval gives launchd a backstop against the
+         binary spinning. -->
     <key>Label</key>
     <string>com.predigy.cross-arb-curate</string>
 

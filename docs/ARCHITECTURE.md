@@ -361,6 +361,10 @@ the work.
 - [x] Add a launchd job that runs `predigy-import` every 30 min so
       the DB stays in sync until Phase 5 flips the write path over.
       `com.predigy.import` plist + `deploy/scripts/predigy-import-run.sh`.
+      **Disabled 2026-05-08 after live engine cutover** because the
+      stale legacy JSON mirror was re-enabling disabled `stat` rules.
+      The wrapper now exits unless `PREDIGY_ENABLE_LEGACY_IMPORT=1`
+      is set for an explicit one-off migration.
 
 ### Phase 2 — Engine skeleton + Postgres read path (DONE 2026-05-07)
 

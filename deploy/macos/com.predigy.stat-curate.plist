@@ -10,14 +10,8 @@
          is wasteful (Anthropic cost) and slower than 12h leaves
          too much rule staleness during fast-moving days.
 
-         After each run, kickstarts com.predigy.stat-trader so it
-         picks up new rules without waiting for its own poll
-         cadence.
-
-         Pre-flight: until com.predigy.stat-trader is enabled,
-         the kickstart inside stat-curate.sh is a harmless no-op
-         (launchctl returns an error on a disabled-or-unloaded
-         job; we log + continue).
+         The consolidated engine consumes DB rules. Legacy
+         stat-trader restart hooks are intentionally disabled.
     -->
     <key>Label</key>
     <string>com.predigy.stat-curate</string>

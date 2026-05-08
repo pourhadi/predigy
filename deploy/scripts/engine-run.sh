@@ -1,17 +1,13 @@
 #!/bin/zsh
-# predigy-engine launcher (shadow mode by default).
+# predigy-engine launcher.
 #
-# The consolidated trading engine. Replaces the per-strategy
+# The consolidated trading engine. It replaced the per-strategy
 # binaries (stat-trader, settlement-trader, latency-trader,
-# cross-arb-trader) once dual-write parity is verified — see
-# docs/CUTOVER.md.
+# cross-arb-trader) during the 2026-05-07 cutover. Legacy trader
+# launchd jobs are disabled; this binary is the only live order path.
 #
-# By default this runs in **Shadow mode**: the engine writes
-# intents to Postgres at status='shadow' but does NOT submit to
-# Kalshi. The legacy daemons keep trading as the sole live
-# trader. Once parity-diff shows engine and legacy fire the same
-# intents, flip via PREDIGY_ENGINE_MODE=live and disable the
-# corresponding legacy launchd job.
+# Defaults to Shadow if PREDIGY_ENGINE_MODE is absent, but production
+# sets PREDIGY_ENGINE_MODE=live in ~/.zprofile.
 #
 # Required env from ~/.zprofile:
 #   KALSHI_KEY_ID
@@ -36,9 +32,7 @@ KALSHI_KEY_ID="${KALSHI_KEY_ID:?KALSHI_KEY_ID env var required}"
 KALSHI_PEM="${KALSHI_PEM:-${CONFIG_DIR}/kalshi.pem}"
 export KALSHI_KEY_ID KALSHI_PEM
 
-# Default to Shadow. Operator flips to "live" via env override
-# after parity-diff has shown ledger agreement with the legacy
-# daemon for at least one full trading day.
+# Default to Shadow for safety outside the production launchd env.
 export PREDIGY_ENGINE_MODE="${PREDIGY_ENGINE_MODE:-shadow}"
 
 # Postgres connection string. Local dev uses peer-auth on the
@@ -48,9 +42,7 @@ export DATABASE_URL="${DATABASE_URL:-postgresql:///predigy}"
 # Run pending migrations on startup (idempotent).
 export PREDIGY_ENGINE_AUTO_MIGRATE="${PREDIGY_ENGINE_AUTO_MIGRATE:-true}"
 
-# Kill-switch flag file — same convention as the legacy daemons
-# so the dashboard's emergency-stop button arms ALL traders +
-# the engine in one click.
+# Kill-switch flag file observed by the engine and dashboard.
 export PREDIGY_KILL_SWITCH_FILE="${PREDIGY_KILL_SWITCH_FILE:-${CONFIG_DIR}/kill-switch.flag}"
 
 # Plumb optional strategy settings if set. The engine binary

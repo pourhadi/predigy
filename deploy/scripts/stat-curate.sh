@@ -6,15 +6,13 @@
 # within the configured horizon, call Claude on each batch to
 # generate calibrated model probabilities, validate (probability
 # range, confidence, edge gap, side direction), and write the
-# resulting StatRule array to disk.  Optionally kickstart the
-# stat-trader so it picks up the new rules without waiting for
-# its own poll cadence.
+# resulting StatRule array to disk.  The consolidated engine reads
+# DB rules; legacy stat-trader restart hooks are intentionally not
+# used.
 #
 # Driven by launchd's StartInterval (com.predigy.stat-curate).
 # Required env from ~/.zprofile:
 #   KALSHI_KEY_ID, ANTHROPIC_API_KEY
-#   PREDIGY_LIVE=1 if you want changes to actually restart the
-#                 trader; otherwise the kickstart is harmless.
 
 set -euo pipefail
 
@@ -39,5 +37,4 @@ exec "./target/release/stat-curator" \
     --batch-size         "${PREDIGY_STAT_CURATE_BATCH:-25}" \
     --max-batches        "${PREDIGY_STAT_CURATE_MAX_BATCHES:-4}" \
     --max-days-to-settle "${PREDIGY_STAT_CURATE_MAX_DAYS:-14}" \
-    --restart-job        "com.predigy.stat-trader" \
     --write

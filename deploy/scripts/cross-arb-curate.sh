@@ -4,14 +4,13 @@
 # Each invocation = one tick: load state, scan Kalshi + Polymarket,
 # only call Claude on NEW Polymarket candidates (`seen_poly_ids` in
 # the state file gates that), drop pairs whose Kalshi side settled,
-# write the pair file + state, kickstart the trader if the pair set
-# changed.
+# write the pair file + state. The consolidated predigy-engine
+# hot-reloads this file via its pair-file service; legacy trader
+# restart hooks are intentionally not used.
 #
 # Driven by launchd's StartInterval (com.predigy.cross-arb-curate).
 # Required env from ~/.zprofile:
 #   KALSHI_KEY_ID, ANTHROPIC_API_KEY
-#   PREDIGY_LIVE=1 if you want changes to actually restart the
-#                 trader; otherwise the kickstart is harmless.
 
 set -euo pipefail
 
@@ -39,5 +38,4 @@ exec "./target/release/cross-arb-curator" \
     --max-batches       "${PREDIGY_CURATE_MAX_BATCHES:-8}" \
     --min-poly-liquidity "${PREDIGY_CURATE_MIN_LIQUIDITY:-2000}" \
     --max-days-to-settle "${PREDIGY_CURATE_MAX_DAYS:-90}" \
-    --restart-job       "com.predigy.cross-arb" \
     --write

@@ -7,9 +7,9 @@
          at "today's" markets which expire at 00:00 UTC, so any
          alert in the gap window between midnight UTC and the next
          06:30 cron submitted to a settled market and got rejected.
-         Re-running at 4h cadence keeps the rules current. After
-         each run, kicks latency-trader so it picks up the new
-         rules. -->
+         Re-running at 4h cadence keeps the rules current if the
+         latency strategy is explicitly re-enabled later. Legacy
+         latency-trader restart hooks are intentionally disabled. -->
     <key>Label</key>
     <string>com.predigy.wx-curate</string>
 
@@ -65,8 +65,8 @@
         </dict>
     </array>
 
-    <!-- Re-curate immediately on boot so the trader doesn't fire
-         on stale rules after a restart. -->
+    <!-- Re-curate immediately on boot so the rule file is fresh
+         after a restart. -->
     <key>RunAtLoad</key>
     <true/>
 
