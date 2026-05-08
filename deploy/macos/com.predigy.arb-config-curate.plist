@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Implication-arb / internal-arb config curator. Each tick
+         validates the live config against Kalshi REST and seeds
+         fresh entries from active monotonic ladder series +
+         2-leg event families. Strategies hot-reload via 30s
+         mtime poll, no engine bounce.
+
+         Cadence: every 30 min. Faster than 30 min would mostly
+         re-confirm the same active universe; slower than 1h
+         risks stale ticker references on event-rollover days
+         (Mondays/MLB-game-end). 30 min is a comfortable middle
+         that aligns with sports schedules. -->
+    <key>Label</key>
+    <string>com.predigy.arb-config-curate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec /Users/dan/code/predigy/deploy/scripts/arb-config-curate.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/dan/Library/Logs/predigy/arb-config-curate.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dan/Library/Logs/predigy/arb-config-curate.stderr.log</string>
+</dict>
+</plist>
