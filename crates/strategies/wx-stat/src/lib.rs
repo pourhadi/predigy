@@ -107,6 +107,18 @@ pub struct WxStatConfig {
     pub same_day_only: bool,
     /// Reject curator rules older than this. `0` disables age gating.
     pub max_rule_age: Duration,
+    /// Hard ceiling on dollar notional for a single fire on one
+    /// ticker (cents). Mechanism audit 2026-05-08: deep-OTM YES
+    /// legs at 1-5¢ on size 20 = $0.20-$1.00 in fees alone before
+    /// any settlement, vs $20 cost basis. Cap per-ticker so we
+    /// don't load up on lottery tickets even when Kelly suggests
+    /// large size on a high `model_p × low ask`.
+    pub max_notional_per_fire_cents: u32,
+    /// Skip rules whose Kalshi-side ask is below this floor (cents).
+    /// Penny-priced YES (1-4¢) is a fee-fragile lottery ticket:
+    /// fee floor is 1¢, so on a 3¢ entry the round-trip cost
+    /// is 33% even on the winners. Default 5¢.
+    pub min_ask_cents: u32,
 }
 
 impl WxStatConfig {
@@ -132,6 +144,12 @@ impl WxStatConfig {
             rule_refresh_interval: Duration::from_secs(30),
             same_day_only: true,
             max_rule_age: Duration::from_secs(6 * 60 * 60),
+            // 500¢ = $5/ticker default. Override via
+            // PREDIGY_WX_STAT_MAX_NOTIONAL_PER_FIRE_CENTS.
+            max_notional_per_fire_cents: 500,
+            // 5¢ floor — fee structure makes &lt;5¢ entries
+            // structurally fee-fragile.
+            min_ask_cents: 5,
         };
         if let Ok(v) = std::env::var("PREDIGY_WX_STAT_BANKROLL_CENTS")
             && let Ok(n) = v.parse()
@@ -167,6 +185,16 @@ impl WxStatConfig {
             && let Ok(n) = v.parse::<u64>()
         {
             c.max_rule_age = Duration::from_secs(n);
+        }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MAX_NOTIONAL_PER_FIRE_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.max_notional_per_fire_cents = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MIN_ASK_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.min_ask_cents = n;
         }
         c
     }
@@ -499,6 +527,14 @@ fn build_intent(
     if ask_cents == 0 || ask_cents >= 100 {
         return None;
     }
+    // Penny-priced YES (or near-zero NO via complement) is fee-
+    // fragile lottery territory: Kalshi's 1¢ fee floor means a
+    // 3¢ entry pays 33% in fees on the round-trip even when the
+    // bet wins. Mechanism audit 2026-05-08 added this floor.
+    let min_ask = u8::try_from(config.min_ask_cents).unwrap_or(u8::MAX);
+    if ask_cents < min_ask {
+        return None;
+    }
     let ask_dollars = f64::from(ask_cents) / 100.0;
     let bet_p = match rule.side {
         Side::Yes => rule.model_p,
@@ -526,6 +562,14 @@ fn build_intent(
     if target == 0 {
         return None;
     }
+    // Cap by per-fire notional. Stops the strategy loading 20 ctr
+    // of YES at 5¢ ($1 cost) when Kelly and max_size both allow it
+    // — caps total ticker exposure regardless of size signal.
+    let size_by_notional = u32::from(ask_cents)
+        .checked_mul(1)
+        .map(|_| config.max_notional_per_fire_cents / u32::from(ask_cents).max(1))
+        .unwrap_or(target);
+    let target = target.min(size_by_notional.max(1));
     let size = target.min(available_qty);
     if size == 0 {
         return None;
@@ -590,6 +634,8 @@ mod tests {
             rule_refresh_interval: Duration::from_secs(30),
             same_day_only: true,
             max_rule_age: Duration::from_secs(6 * 60 * 60),
+            max_notional_per_fire_cents: 500,
+            min_ask_cents: 5,
         }
     }
 

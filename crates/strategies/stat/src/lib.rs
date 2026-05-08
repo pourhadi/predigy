@@ -102,6 +102,12 @@ pub struct StatConfig {
     /// When no poly mid is available for a ticker, the rule's
     /// `model_p` is used unchanged (regardless of α).
     pub poly_mid_blend_alpha: f64,
+    /// Skip rules whose Kalshi-side ask is below this floor (cents).
+    /// Penny-priced YES (1-4¢) is fee-fragile lottery territory:
+    /// the 1¢ taker fee floor means a 3¢ entry pays 33% in fees
+    /// on the round-trip even when the bet wins. Mechanism audit
+    /// 2026-05-08 added this floor.
+    pub min_ask_cents: u32,
 }
 
 impl StatConfig {
@@ -186,6 +192,11 @@ impl StatConfig {
                 c.poly_mid_blend_alpha = n.clamp(0.0, 1.0);
             }
         }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_MIN_ASK_CENTS") {
+            if let Ok(n) = v.parse() {
+                c.min_ask_cents = n;
+            }
+        }
         c
     }
 }
@@ -223,6 +234,9 @@ impl Default for StatConfig {
             // available; rule still dominates. Set to 1.0 to
             // turn the blend off entirely.
             poly_mid_blend_alpha: 0.85,
+            // 5¢ floor — fee structure makes <5¢ entries
+            // structurally fee-fragile. Mechanism audit 2026-05-08.
+            min_ask_cents: 5,
         }
     }
 }
@@ -835,6 +849,13 @@ fn build_intent(
     if ask_cents == 0 || ask_cents >= 100 {
         return None;
     }
+    // Mechanism audit 2026-05-08: skip penny-priced YES entries.
+    // Kalshi's 1¢ taker-fee floor makes a 3¢ entry pay 33% in
+    // fees on the round trip even when the bet wins.
+    let min_ask = u8::try_from(config.min_ask_cents).unwrap_or(u8::MAX);
+    if ask_cents < min_ask {
+        return None;
+    }
     let ask_dollars = f64::from(ask_cents) / 100.0;
     let bet_p = match rule.side {
         Side::Yes => rule.model_p,
@@ -953,6 +974,9 @@ mod tests {
             // alpha=1.0 means pure rule (no blend); existing
             // tests don't exercise the blend.
             poly_mid_blend_alpha: 1.0,
+            // Tests use ask_cents far above any threshold; set
+            // to 0 to keep existing fixtures unaffected.
+            min_ask_cents: 0,
         }
     }
 
