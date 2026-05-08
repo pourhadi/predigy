@@ -43,6 +43,12 @@ pub struct StatRule {
     pub side: Side,
     /// Min after-fee per-contract edge to fire (cents).
     pub min_edge_cents: u32,
+    /// Local settlement date (`YYYY-MM-DD`) for horizon gating.
+    #[serde(default)]
+    pub settlement_date: Option<String>,
+    /// Curator generation timestamp (RFC3339 UTC) for stale-rule gating.
+    #[serde(default)]
+    pub generated_at_utc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +218,8 @@ mod tests {
             model_p,
             side: Side::Yes,
             min_edge_cents: edge,
+            settlement_date: None,
+            generated_at_utc: None,
         }
     }
 
@@ -303,6 +311,8 @@ mod tests {
                 model_p: 1.0, // boundary — degenerate
                 side: Side::Yes,
                 min_edge_cents: 1,
+                settlement_date: None,
+                generated_at_utc: None,
             }],
         );
         assert!(
@@ -325,6 +335,8 @@ mod tests {
             model_p: 0.30,
             side: Side::No,
             min_edge_cents: 2,
+            settlement_date: None,
+            generated_at_utc: None,
         };
         let mut s = StatStrategy::new(cfg(), vec![no_rule]);
         let intent = s

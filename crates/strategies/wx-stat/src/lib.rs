@@ -76,6 +76,12 @@ pub struct WxStatRule {
     pub side: Side,
     /// Min after-fee per-contract edge to fire (cents).
     pub min_edge_cents: u32,
+    /// Local settlement date (`YYYY-MM-DD`) produced by the curator.
+    #[serde(default)]
+    pub settlement_date: Option<String>,
+    /// Curator generation timestamp (RFC3339 UTC).
+    #[serde(default)]
+    pub generated_at_utc: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +103,10 @@ pub struct WxStatConfig {
     pub rule_file: PathBuf,
     /// How often to mtime-poll the rule file.
     pub rule_refresh_interval: Duration,
+    /// Only trade rules whose settlement date is today's local date.
+    pub same_day_only: bool,
+    /// Reject curator rules older than this. `0` disables age gating.
+    pub max_rule_age: Duration,
 }
 
 impl WxStatConfig {
@@ -120,6 +130,8 @@ impl WxStatConfig {
             cooldown: Duration::from_secs(60),
             rule_file,
             rule_refresh_interval: Duration::from_secs(30),
+            same_day_only: true,
+            max_rule_age: Duration::from_secs(6 * 60 * 60),
         };
         if let Ok(v) = std::env::var("PREDIGY_WX_STAT_BANKROLL_CENTS")
             && let Ok(n) = v.parse()
@@ -148,6 +160,14 @@ impl WxStatConfig {
         {
             c.rule_refresh_interval = Duration::from_millis(n);
         }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_SAME_DAY_ONLY") {
+            c.same_day_only = !matches!(v.trim(), "0" | "false" | "FALSE" | "False");
+        }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MAX_RULE_AGE_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            c.max_rule_age = Duration::from_secs(n);
+        }
         c
     }
 }
@@ -167,6 +187,8 @@ struct CachedRule {
     side: Side,
     model_p: f64,
     min_edge_cents: i32,
+    settlement_date: String,
+    generated_at_utc: String,
 }
 
 #[derive(Debug)]
@@ -254,6 +276,8 @@ impl WxStatStrategy {
             }
         };
         let mut next: HashMap<String, CachedRule> = HashMap::with_capacity(parsed.len());
+        let today = local_yyyy_mm_dd();
+        let now = chrono::Utc::now();
         for r in parsed {
             if !(0.01..=0.99).contains(&r.model_p) {
                 debug!(
@@ -263,6 +287,48 @@ impl WxStatStrategy {
                 );
                 continue;
             }
+            let Some(settlement_date) = r.settlement_date.as_deref() else {
+                warn!(
+                    ticker = %r.kalshi_market.as_str(),
+                    "wx-stat: rule missing settlement_date; skipping"
+                );
+                continue;
+            };
+            if self.config.same_day_only && settlement_date != today {
+                debug!(
+                    ticker = %r.kalshi_market.as_str(),
+                    settlement_date,
+                    today,
+                    "wx-stat: non-same-day rule skipped"
+                );
+                continue;
+            }
+            let Some(generated_at_utc) = r.generated_at_utc.as_deref() else {
+                warn!(
+                    ticker = %r.kalshi_market.as_str(),
+                    "wx-stat: rule missing generated_at_utc; skipping"
+                );
+                continue;
+            };
+            if self.config.max_rule_age > Duration::ZERO {
+                let Some(age) = rule_age(now, generated_at_utc) else {
+                    warn!(
+                        ticker = %r.kalshi_market.as_str(),
+                        generated_at_utc,
+                        "wx-stat: rule generated_at_utc invalid; skipping"
+                    );
+                    continue;
+                };
+                if age > self.config.max_rule_age {
+                    debug!(
+                        ticker = %r.kalshi_market.as_str(),
+                        age_secs = age.as_secs(),
+                        max_age_secs = self.config.max_rule_age.as_secs(),
+                        "wx-stat: stale rule skipped"
+                    );
+                    continue;
+                }
+            }
             let key = r.kalshi_market.as_str().to_string();
             let min_edge = i32::try_from(r.min_edge_cents).unwrap_or(0);
             next.insert(
@@ -271,6 +337,8 @@ impl WxStatStrategy {
                     side: r.side,
                     model_p: r.model_p,
                     min_edge_cents: min_edge,
+                    settlement_date: settlement_date.to_string(),
+                    generated_at_utc: generated_at_utc.to_string(),
                 },
             );
         }
@@ -406,6 +474,18 @@ fn derive_ask(book: &OrderBook, side: Side) -> Option<(u8, u32)> {
     Some((ask, qty))
 }
 
+fn local_yyyy_mm_dd() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn rule_age(now: chrono::DateTime<chrono::Utc>, generated_at_utc: &str) -> Option<Duration> {
+    let generated = chrono::DateTime::parse_from_rfc3339(generated_at_utc)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let secs = now.signed_duration_since(generated).num_seconds();
+    u64::try_from(secs).ok().map(Duration::from_secs)
+}
+
 fn build_intent(
     market: &MarketTicker,
     rule: &CachedRule,
@@ -469,8 +549,13 @@ fn build_intent(
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: Some(format!(
-            "wx-stat fire: model_p={:.3} ask={}c edge={:.1}c size={}",
-            rule.model_p, ask_cents, raw_edge_cents, size
+            "wx-stat fire: model_p={:.3} ask={}c edge={:.1}c size={} settlement_date={} generated_at_utc={}",
+            rule.model_p,
+            ask_cents,
+            raw_edge_cents,
+            size,
+            rule.settlement_date,
+            rule.generated_at_utc
         )),
     })
 }
@@ -503,16 +588,35 @@ mod tests {
             cooldown: Duration::from_secs(60),
             rule_file,
             rule_refresh_interval: Duration::from_secs(30),
+            same_day_only: true,
+            max_rule_age: Duration::from_secs(6 * 60 * 60),
         }
+    }
+
+    fn cached_rule(side: Side, model_p: f64, min_edge_cents: i32) -> CachedRule {
+        CachedRule {
+            side,
+            model_p,
+            min_edge_cents,
+            settlement_date: local_yyyy_mm_dd(),
+            generated_at_utc: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn rule_json(ticker: &str, model_p: f64, side: &str, min_edge_cents: u32) -> serde_json::Value {
+        serde_json::json!({
+            "kalshi_market": ticker,
+            "model_p": model_p,
+            "side": side,
+            "min_edge_cents": min_edge_cents,
+            "settlement_date": local_yyyy_mm_dd(),
+            "generated_at_utc": chrono::Utc::now().to_rfc3339(),
+        })
     }
 
     #[test]
     fn build_intent_fires_on_clear_edge() {
-        let rule = CachedRule {
-            side: Side::Yes,
-            model_p: 0.85,
-            min_edge_cents: 3,
-        };
+        let rule = cached_rule(Side::Yes, 0.85, 3);
         let cfg = cfg(PathBuf::from("/dev/null"));
         let market = MarketTicker::new("KX-WX");
         let intent = build_intent(&market, &rule, &cfg, 70, 100).expect("fires");
@@ -525,11 +629,7 @@ mod tests {
 
     #[test]
     fn build_intent_skips_when_edge_below_threshold() {
-        let rule = CachedRule {
-            side: Side::Yes,
-            model_p: 0.55,
-            min_edge_cents: 5,
-        };
+        let rule = cached_rule(Side::Yes, 0.55, 5);
         let cfg = cfg(PathBuf::from("/dev/null"));
         let market = MarketTicker::new("KX-NEAR");
         // ask 50 → raw edge 5¢ minus fee ~ < 5; should skip.
@@ -538,11 +638,7 @@ mod tests {
 
     #[test]
     fn build_intent_skips_when_model_p_invalid() {
-        let rule = CachedRule {
-            side: Side::Yes,
-            model_p: 0.005, // outside [0.01, 0.99]
-            min_edge_cents: 1,
-        };
+        let rule = cached_rule(Side::Yes, 0.005, 1); // outside [0.01, 0.99]
         let cfg = cfg(PathBuf::from("/dev/null"));
         let market = MarketTicker::new("KX-INV");
         assert!(build_intent(&market, &rule, &cfg, 1, 100).is_none());
@@ -560,25 +656,14 @@ mod tests {
     fn cooldown_blocks_repeat_fires() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wx-stat-rules.json");
-        let rules = serde_json::json!([{
-            "kalshi_market": "KX-WX1",
-            "model_p": 0.85,
-            "side": "yes",
-            "min_edge_cents": 3
-        }]);
+        let rules = serde_json::json!([rule_json("KX-WX1", 0.85, "yes", 3)]);
         std::fs::write(&path, serde_json::to_string(&rules).unwrap()).unwrap();
         let mut s = WxStatStrategy::new(cfg(path));
 
         // Force-load the rules (bypass the StrategyState plumbing
         // by stuffing them directly).
-        s.rules.insert(
-            "KX-WX1".into(),
-            CachedRule {
-                side: Side::Yes,
-                model_p: 0.85,
-                min_edge_cents: 3,
-            },
-        );
+        s.rules
+            .insert("KX-WX1".into(), cached_rule(Side::Yes, 0.85, 3));
 
         let book = book_with_quotes(Some(30), Some(30)); // YES ask 70
         let market = MarketTicker::new("KX-WX1");
@@ -605,12 +690,7 @@ mod tests {
         // is ms-coarse so sleep briefly to force a distinct
         // mtime, then write.
         std::thread::sleep(Duration::from_millis(20));
-        let rules = serde_json::json!([{
-            "kalshi_market": "KX-NEW",
-            "model_p": 0.7,
-            "side": "yes",
-            "min_edge_cents": 2
-        }]);
+        let rules = serde_json::json!([rule_json("KX-NEW", 0.7, "yes", 2)]);
         std::fs::write(&path, serde_json::to_string(&rules).unwrap()).unwrap();
 
         let added = s.reload_rules_from_disk();
@@ -628,9 +708,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wx-stat-rules.json");
         let rules = serde_json::json!([
-            { "kalshi_market": "KX-OK",  "model_p": 0.7,   "side": "yes", "min_edge_cents": 2 },
-            { "kalshi_market": "KX-BAD", "model_p": 1.5,   "side": "yes", "min_edge_cents": 2 },
-            { "kalshi_market": "KX-LOW", "model_p": 0.001, "side": "no",  "min_edge_cents": 2 },
+            rule_json("KX-OK", 0.7, "yes", 2),
+            rule_json("KX-BAD", 1.5, "yes", 2),
+            rule_json("KX-LOW", 0.001, "no", 2),
         ]);
         std::fs::write(&path, serde_json::to_string(&rules).unwrap()).unwrap();
         let mut s = WxStatStrategy::new(cfg(path));

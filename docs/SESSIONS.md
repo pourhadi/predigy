@@ -82,11 +82,17 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
 
 ### `stat` (statistical model probability vs ask)
 
-- 68 active rules in `rules` table (Postgres). Curated by
-  `stat-curate` + `wx-stat-curate`.
+- 5 enabled rules in `rules` table (Postgres) as of the latest check.
+  Curated by `stat-curate`; `wx-stat-curate` feeds the dedicated
+  `wx-stat` strategy directly.
 - Phase 6.1 active exits: take-profit 8¢ / stop-loss 5¢, defaults.
   Closing IOCs use idempotent
   `stat-exit:{ticker}:{side}:{tp|sl}:{minute_bucket}` cids.
+- 2026-05-07 churn fix: entries are now same-day-only by default,
+  exits are evaluated before entries, and the strategy will not enter
+  while any same-ticker position is open or during the post-exit
+  re-entry cooldown. This specifically stops the observed buy/instant
+  stop-loss loop in stale/non-same-day econ rules.
 - 2026-05-07 safety note: `stat` and `wx-stat` were halted after a
   same-day SFO high-temperature rule bought YES on a below-62 market after
   observed high had already reached 64°F. `wx-stat-curator` now gates
@@ -96,6 +102,21 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
   stale. A second wx-stat bug on PHX below-98 for May 8 found that NBM used
   max hourly probability for all strike directions; daily-high `less` and
   daily-low `greater` now use the constraining all-hours probability instead.
+
+### `wx-stat` (NBM probability vs weather ask)
+
+- Consumes `~/.config/predigy/wx-stat-rules.json` directly.
+- New entries are fail-closed unless curator rules carry
+  `settlement_date` and `generated_at_utc`. By default the strategy only
+  trades rules whose settlement date equals today's local date and whose
+  curator timestamp is no older than 6h.
+- 2026-05-07 same-day fix: temperature-market settlement date now comes
+  from the Kalshi event-ticker date suffix (`26MAY07`) rather than naive
+  UTC `occurrence_datetime`, which can land on the following UTC date for
+  US local-day temperature markets.
+- Latest live restart loaded zero active `wx-stat` rules because the
+  old metadata-less/misdated rule file is skipped. `com.predigy.wx-stat-curate`
+  was running a full NBM cache refresh to regenerate metadata-bearing rules.
 
 ### `settlement` (sports tape-reading near close)
 

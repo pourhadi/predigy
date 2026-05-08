@@ -51,6 +51,10 @@ pub struct StatConfig {
     pub max_size: u32,
     /// Per-market cooldown between fires.
     pub cooldown: Duration,
+    /// Per-market cooldown after an exit attempt before re-entry.
+    pub reentry_cooldown: Duration,
+    /// Only enter rules whose embedded market date is today's local date.
+    pub same_day_only: bool,
     /// How often to reload the rule cache from Postgres.
     pub rule_refresh_interval: Duration,
     /// **Phase 6.1 active exits**:
@@ -139,6 +143,14 @@ impl StatConfig {
                 c.cooldown = Duration::from_millis(n);
             }
         }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_REENTRY_COOLDOWN_MS") {
+            if let Ok(n) = v.parse::<u64>() {
+                c.reentry_cooldown = Duration::from_millis(n);
+            }
+        }
+        if let Ok(v) = std::env::var("PREDIGY_STAT_SAME_DAY_ONLY") {
+            c.same_day_only = !matches!(v.trim(), "0" | "false" | "FALSE" | "False");
+        }
         if let Ok(v) = std::env::var("PREDIGY_STAT_TAKE_PROFIT_CENTS") {
             if let Ok(n) = v.parse() {
                 c.take_profit_cents = n;
@@ -185,6 +197,8 @@ impl Default for StatConfig {
             kelly_factor: 0.25,
             max_size: 3,
             cooldown: Duration::from_secs(60),
+            reentry_cooldown: Duration::from_secs(30 * 60),
+            same_day_only: true,
             rule_refresh_interval: Duration::from_secs(60),
             // Phase 6.1 defaults: take 8¢ profit, cap 5¢ loss.
             // 0 disables. Operator can tune via the (future)
@@ -327,6 +341,18 @@ impl StatStrategy {
     ) -> Option<Intent> {
         let key = market.as_str().to_string();
         let rule = self.rules.get(&key)?;
+        if self.config.same_day_only {
+            let today = local_yyyy_mm_dd();
+            if embedded_market_date(market.as_str()).as_deref() != Some(today.as_str()) {
+                return None;
+            }
+        }
+        if self.has_open_position(market.as_str()) {
+            return None;
+        }
+        if self.recent_exit_attempt(market.as_str(), now) {
+            return None;
+        }
         if let Some(&last) = self.last_fire_at.get(&key)
             && now.duration_since(last) < self.config.cooldown
         {
@@ -360,6 +386,19 @@ impl StatStrategy {
         )?;
         self.last_fire_at.insert(key, now);
         Some(intent)
+    }
+
+    fn has_open_position(&self, ticker: &str) -> bool {
+        self.positions
+            .keys()
+            .any(|key| key.split_once(':').is_some_and(|(t, _)| t == ticker))
+    }
+
+    fn recent_exit_attempt(&self, ticker: &str, now: Instant) -> bool {
+        self.last_exit_at.iter().any(|(key, last)| {
+            key.split_once(':').is_some_and(|(t, _)| t == ticker)
+                && now.duration_since(*last) < self.config.reentry_cooldown
+        })
     }
 
     /// Phase 6.1 — refresh the in-memory open-position cache from
@@ -604,6 +643,44 @@ fn position_key(ticker: &str, side: Side) -> String {
     format!("{ticker}:{tag}")
 }
 
+fn local_yyyy_mm_dd() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn embedded_market_date(ticker: &str) -> Option<String> {
+    ticker
+        .split('-')
+        .find_map(|segment| parse_yymmmdd_to_iso(segment))
+}
+
+fn parse_yymmmdd_to_iso(segment: &str) -> Option<String> {
+    if segment.len() != 7 {
+        return None;
+    }
+    let yy: u32 = segment.get(..2)?.parse().ok()?;
+    let mon = segment.get(2..5)?.to_ascii_uppercase();
+    let dd: u32 = segment.get(5..7)?.parse().ok()?;
+    if !(1..=31).contains(&dd) {
+        return None;
+    }
+    let mm = match mon.as_str() {
+        "JAN" => 1,
+        "FEB" => 2,
+        "MAR" => 3,
+        "APR" => 4,
+        "MAY" => 5,
+        "JUN" => 6,
+        "JUL" => 7,
+        "AUG" => 8,
+        "SEP" => 9,
+        "OCT" => 10,
+        "NOV" => 11,
+        "DEC" => 12,
+        _ => return None,
+    };
+    Some(format!("{:04}-{mm:02}-{dd:02}", 2000 + yy))
+}
+
 #[async_trait]
 impl Strategy for StatStrategy {
     fn id(&self) -> StrategyId {
@@ -661,16 +738,18 @@ impl Strategy for StatStrategy {
             Event::BookUpdate { market, book } => {
                 let now = Instant::now();
                 let mut intents = Vec::new();
-                // Entry: if there's a rule for this ticker and an
-                // edge, fire.
-                if let Some(entry) = self.evaluate(market, book, now) {
-                    intents.push(entry);
-                }
                 // Exit: if there's an open position for this
                 // ticker and the take-profit / stop-loss trips,
                 // fire a closing IOC.
                 if let Some(exit) = self.evaluate_exit(market, book, now) {
                     intents.push(exit);
+                    return Ok(intents);
+                }
+                // Entry: if there's a rule for this ticker and an
+                // edge, fire. Entries are never emitted alongside an
+                // exit for the same book update.
+                if let Some(entry) = self.evaluate(market, book, now) {
+                    intents.push(entry);
                 }
                 Ok(intents)
             }
@@ -856,6 +935,8 @@ mod tests {
             kelly_factor: 0.25,
             max_size: 100,
             cooldown: Duration::from_secs(60),
+            reentry_cooldown: Duration::from_secs(30 * 60),
+            same_day_only: false,
             rule_refresh_interval: Duration::from_secs(60),
             // Exit thresholds chosen so unit tests can drive
             // them deterministically: take 8¢, stop 5¢.
@@ -896,6 +977,14 @@ mod tests {
             avg_entry_cents,
             opened_at: chrono::Utc::now() - chrono::Duration::hours(hours_old),
         }
+    }
+
+    fn dated_market_for_today() -> MarketTicker {
+        let today = chrono::Local::now()
+            .format("%y%b%d")
+            .to_string()
+            .to_uppercase();
+        MarketTicker::new(format!("KXTEST-{today}-T50"))
     }
 
     #[test]
@@ -994,6 +1083,78 @@ mod tests {
         let later = now + Duration::from_secs(120);
         let third = s.evaluate(&market, &book, later);
         assert!(third.is_some(), "fire should resume after cooldown");
+    }
+
+    #[test]
+    fn same_day_gate_blocks_non_today_market() {
+        let mut s = StatStrategy::new(StatConfig {
+            same_day_only: true,
+            ..cfg()
+        });
+        s.rules
+            .insert("KXTEST-26APR01-T50".into(), cached_rule(0.85, Side::Yes, 2));
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KXTEST-26APR01-T50"),
+                &book_with_quotes(None, Some(30)),
+                Instant::now(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn same_day_gate_allows_today_market() {
+        let market = dated_market_for_today();
+        let mut s = StatStrategy::new(StatConfig {
+            same_day_only: true,
+            ..cfg()
+        });
+        s.rules
+            .insert(market.as_str().to_string(), cached_rule(0.85, Side::Yes, 2));
+        assert!(
+            s.evaluate(&market, &book_with_quotes(None, Some(30)), Instant::now())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn entry_blocked_while_position_open() {
+        let mut s = StatStrategy::new(cfg());
+        s.rules
+            .insert("KX-HELD".into(), cached_rule(0.85, Side::Yes, 2));
+        s.positions.insert(
+            position_key("KX-HELD", Side::Yes),
+            cached_position(Side::Yes, 1, 70),
+        );
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-HELD"),
+                &book_with_quotes(None, Some(30)),
+                Instant::now(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn reentry_blocked_after_recent_exit_attempt() {
+        let mut s = StatStrategy::new(StatConfig {
+            reentry_cooldown: Duration::from_secs(60),
+            ..cfg()
+        });
+        s.rules
+            .insert("KX-EXITED".into(), cached_rule(0.85, Side::Yes, 2));
+        s.last_exit_at
+            .insert(position_key("KX-EXITED", Side::Yes), Instant::now());
+        assert!(
+            s.evaluate(
+                &MarketTicker::new("KX-EXITED"),
+                &book_with_quotes(None, Some(30)),
+                Instant::now(),
+            )
+            .is_none()
+        );
     }
 
     // ─── Phase 6.1 active-exit tests ─────────────────────────

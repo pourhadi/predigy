@@ -118,6 +118,8 @@ impl CuratedStatRule {
             model_p: self.model_probability,
             side,
             min_edge_cents: self.min_edge_cents,
+            settlement_date: None,
+            generated_at_utc: None,
         };
         let audit = format!(
             "{} {:?} model_p={:.3} edge={} cents conf={}",

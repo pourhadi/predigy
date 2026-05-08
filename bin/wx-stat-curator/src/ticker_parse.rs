@@ -5,8 +5,11 @@
 //! ## Where the fields come from
 //!
 //! Kalshi exposes `floor_strike` / `cap_strike` / `strike_type` /
-//! `occurrence_datetime` directly in market metadata — those are
-//! authoritative. We do NOT parse the threshold from the ticker
+//! `occurrence_datetime` directly in market metadata. For the local
+//! settlement day we use the event-ticker date suffix (`26MAY07`),
+//! because Kalshi's occurrence timestamp is UTC and can land on the
+//! following UTC date for US local-day temperature markets. We do NOT
+//! parse the threshold from the ticker
 //! letter prefix (`-T68` vs `-B65.5`); the ticker is shape-stable
 //! but the meaning of `T` flips between "greater than" and "less
 //! than" depending on `strike_type`.
@@ -37,8 +40,7 @@ pub struct TempMarketSpec {
     pub measurement: TempMeasurement,
     pub kind: TempStrikeKind,
     /// Local-time calendar date the settlement value is observed
-    /// on. `YYYY-MM-DD`. Derived from `occurrence_datetime` when
-    /// present; from the event-ticker date suffix otherwise.
+    /// on. `YYYY-MM-DD`. Derived from the event-ticker date suffix.
     pub settlement_date: String,
 }
 
@@ -67,7 +69,8 @@ pub enum ParseError {
 /// `event_ticker` is the series-date prefix (`"KXHIGHDEN-26MAY07"`).
 /// `strike_type` / `floor_strike` / `cap_strike` come from the
 /// market's metadata fields (now part of `MarketSummary`).
-/// `occurrence_datetime` is the RFC3339 settlement target time.
+/// `occurrence_datetime` is the RFC3339 settlement target time; it is
+/// only a fallback for malformed legacy event tickers.
 pub fn parse_temp_market(
     event_ticker: &str,
     strike_type: Option<&str>,
@@ -155,15 +158,19 @@ fn parse_event_ticker(event_ticker: &str) -> Option<(TempMeasurement, String)> {
 
 /// Derive the local calendar date the market settles on.
 ///
-/// Preference order: `occurrence_datetime` (authoritative) →
-/// event-ticker date suffix `26MAY07` → fail.
+/// Preference order: event-ticker date suffix `26MAY07` →
+/// `occurrence_datetime` fallback → fail.
 fn derive_settlement_date(occurrence_datetime: Option<&str>, event_ticker: &str) -> Option<String> {
+    if let Some(suffix) = event_ticker.split('-').nth(1)
+        && let Some(date) = parse_yymmmdd_to_iso(suffix)
+    {
+        return Some(date);
+    }
     if let Some(odt) = occurrence_datetime {
         // RFC3339, take the date part. `2026-05-07T14:00:00Z` →
-        // `2026-05-07`. Naive — assumes the timezone offset is
-        // small enough not to cross a day boundary, which holds for
-        // the daily-temperature markets where occurrence_datetime
-        // always lands at noon UTC.
+        // `2026-05-07`. This fallback is not used for canonical
+        // temperature event tickers because UTC can cross the local
+        // settlement-day boundary.
         if let Some(date) = odt.get(..10)
             && date.len() == 10
             && date.chars().nth(4) == Some('-')
@@ -171,9 +178,7 @@ fn derive_settlement_date(occurrence_datetime: Option<&str>, event_ticker: &str)
             return Some(date.to_string());
         }
     }
-    // Fall back: the event ticker carries the date as `26MAY07`.
-    let suffix = event_ticker.split('-').nth(1)?;
-    parse_yymmmdd_to_iso(suffix)
+    None
 }
 
 /// `"26MAY07"` → `"2026-05-07"`. Returns None on shape mismatch.

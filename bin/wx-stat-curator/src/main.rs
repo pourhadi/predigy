@@ -474,11 +474,13 @@ async fn curate_one(
         } => emit_rule(
             m,
             airport,
+            &spec.settlement_date,
             &spec.kind,
             model_p,
             forecast_value_f,
             hours_considered,
             "forecast",
+            &format_unix_utc_iso(run_unix),
         ),
     }
 }
@@ -527,7 +529,15 @@ fn observed_gate_outcome(
             reason,
             ..
         }) => Some(emit_rule(
-            m, airport, &spec.kind, model_p, observed_f, 0, &reason,
+            m,
+            airport,
+            &spec.settlement_date,
+            &spec.kind,
+            model_p,
+            observed_f,
+            0,
+            &reason,
+            &format_unix_utc_iso(run_unix),
         )),
         Some(ObservedGateDecision::Undecided { .. }) | None => None,
     }
@@ -536,11 +546,13 @@ fn observed_gate_outcome(
 fn emit_rule(
     m: &TempMarket,
     airport: &Airport,
+    settlement_date: &str,
     kind: &TempStrikeKind,
     model_p: f64,
     forecast_value_f: f64,
     hours_considered: usize,
     evidence: &str,
+    generated_at_utc: &str,
 ) -> CurateOutcome {
     if m.ticker.is_empty() {
         return CurateOutcome::Error("empty market ticker".into());
@@ -561,6 +573,8 @@ fn emit_rule(
         // because the rule file is the contract; bumping the floor
         // requires re-curating.
         min_edge_cents: 5,
+        settlement_date: Some(settlement_date.to_string()),
+        generated_at_utc: Some(generated_at_utc.to_string()),
     };
     let threshold_str = match kind {
         TempStrikeKind::Greater { threshold } => format!(">{threshold}"),

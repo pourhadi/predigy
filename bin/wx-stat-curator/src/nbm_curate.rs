@@ -269,6 +269,7 @@ fn score_plan(
                         model_p,
                         None,
                         observed_f,
+                        run_ts_utc,
                         Some(&reason),
                         None,
                     ));
@@ -347,6 +348,7 @@ fn score_plan(
         model_p,
         best_h,
         forecast_value_f,
+        run_ts_utc,
         calibration_note(&raw_p, &calibrated_p).as_deref(),
         Some(prediction),
     ))
@@ -400,6 +402,7 @@ fn build_rule_out(
     model_p: f64,
     best_h: Option<u16>,
     forecast_value_f: f64,
+    generated_at_utc: &str,
     note: Option<&str>,
     prediction: Option<PredictionRecord>,
 ) -> NbmRuleOut {
@@ -445,6 +448,8 @@ fn build_rule_out(
         model_p,
         side,
         min_edge_cents: 5,
+        settlement_date: Some(plan.spec.settlement_date.clone()),
+        generated_at_utc: Some(generated_at_utc.to_string()),
     };
     NbmRuleOut {
         rule,
