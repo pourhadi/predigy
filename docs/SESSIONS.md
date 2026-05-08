@@ -16,7 +16,7 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-07, post-audit hardening)
+## What is running RIGHT NOW (2026-05-08, post-audit-tightening)
 
 ```
 launchctl list | grep predigy
@@ -24,18 +24,27 @@ launchctl list | grep predigy
 
 | Job | What it does | State |
 |---|---|---|
-| `com.predigy.engine` | Consolidated trader. Owns OMS, market data, exec, all four strategies. | running, mode=Live |
-| `com.predigy.cross-arb-curate` | Anthropic-driven Kalshi×Polymarket pair curator. 10-min cron. | scheduled |
+| `com.predigy.engine` | Consolidated trader. Owns OMS, market data, exec, **6 active strategies** post-audit. | running, mode=Live |
+| `com.predigy.cross-arb-curate` | Anthropic-driven Kalshi×Polymarket pair curator. 2-min cron (post-Phase-A). | scheduled |
 | `com.predigy.stat-curate` | model_p curator for stat strategy. | scheduled |
-| `com.predigy.wx-curate` | NWS-state-aware weather rule curator (latency strategy). | scheduled |
-| `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. | scheduled |
+| `com.predigy.wx-curate` | NWS-state-aware weather rule curator. (Was for the now-disabled latency strategy; kept running so rules don't go stale if latency is re-enabled later.) | scheduled |
+| `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. Hourly post-Phase-A. | scheduled |
 | `com.predigy.import` | Legacy JSON-state mirror to Postgres. | scheduled |
 | `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080. | running |
 
-Retired (post-cutover): `latency-trader`, `settlement`, `stat-trader`,
-`cross-arb`. The plists are still on disk under
-`deploy/macos/`; keeping them around for one cycle as a rollback
-path before deletion.
+**Active engine strategies (6, post-2026-05-08 mechanism audit):**
+`stat`, `wx-stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
+
+**Disabled engine strategies (4):** `book-imbalance`, `variance-fade`,
+`latency`, `news-trader`. Disabled by unsetting their config env
+vars in `~/.zprofile` (engine skips registration when
+`PREDIGY_*_CONFIG` / `PREDIGY_*_RULE_FILE` /
+`PREDIGY_*_ITEMS_FILE` is unset). See `docs/AUDIT_2026-05-08.md`
+for verdicts and re-enable conditions.
+
+Retired (post-cutover): `latency-trader`, `settlement-trader`,
+`stat-trader`, `cross-arb-trader`. Plists still on disk under
+`deploy/macos/`; Phase 7 will delete them once ≥1 week stable.
 
 ## The cutover (2026-05-07 07:45 UTC)
 
@@ -126,18 +135,16 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
   router, pushes `Event::DiscoveryDelta` to the strategy.
 - No active exits — Kalshi auto-settles binary outcomes at $1/$0.
 
-### `latency` (NWS-alert lift on weather markets)
+### `latency` (NWS-alert lift on weather markets) — **DISABLED 2026-05-08**
 
-- Rules loaded from `PREDIGY_LATENCY_RULE_FILE` JSON at startup.
-  Set in `~/.zprofile` if you want the strategy to fire — without
-  the env var the engine logs a warning and the strategy is a no-op.
-- Phase 6.2 force-flat: positions held >30 min get a wide-IOC exit
-  at 1¢ (any standing bid takes us). Latency has no book
-  subscription so mark-aware exits aren't possible.
-- Requires `PREDIGY_NWS_USER_AGENT` in env or NWS feed won't spawn.
-- 2026-05-07 audit note: DB kill switch is armed for `latency` after a stale
-  NWS alert re-fired following restarts. Keep halted until event freshness and
-  restart-persistent de-dupe are fixed.
+- `PREDIGY_LATENCY_RULE_FILE` commented out in `~/.zprofile`.
+- Mechanism audit verdict: structurally infeasible without FIX +
+  co-located VPS. Public NWS RSS + REST submit puts us 200-500ms
+  behind FIX takers. Tier-3 1¢ force-flat floor turns every
+  non-converging long into max-loss.
+- **Re-enable condition**: B4 (Kalshi institutional FIX access)
+  approved AND us-east-2 VPS deployed. Engine code is fine; it's
+  the path that's wrong.
 
 ### `cross-arb` (Kalshi vs Polymarket convergence)
 
@@ -146,61 +153,109 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
   `cross-arb-curate`. Pair-file service polls mtime; hot reload.
 - Phase 6.2 active exits: take-profit 5¢ / stop-loss 4¢ (tighter
   than stat because cross-arb scalps smaller convergences).
+- **2026-05-08 audit**: `min_edge_cents` raised 1 → 3. Round-trip
+  taker fee at 30-70¢ contracts is 1-2¢; firing at 1¢ raw edge
+  is buying a fee-loss. Override via
+  `PREDIGY_CROSS_ARB_MIN_EDGE_CENTS`.
+- **2026-05-08 cleanup**: 18 stale `venue-reconcile` rows purged
+  from `positions` table. They were stranding cross-arb's contract
+  cap with phantom 50¢ entries.
 - Cross-strategy bus: cross-arb publishes `PolyMidUpdate` for
   paired markets; stat subscribes (currently log-only — augmenting
   belief from poly-mid is a future enhancement).
 
+### `book-imbalance` — **DISABLED 2026-05-08**
+
+- `PREDIGY_BOOK_IMBALANCE_CONFIG` commented out in `~/.zprofile`.
+- Mechanism audit verdict: displayed-touch quantity has no proven
+  alpha on Kalshi (makers cancel constantly); strategy demonstrably
+  bought both YES@85 and NO@15 on the same ticker for guaranteed
+  fee-loss. The `min_edge_cents=1` is a fee-affordability check,
+  not an EV check.
+- **Re-enable condition**: signal-quality study showing displayed-
+  imbalance has positive EV after fees on a defined market subset,
+  AND a pre-trade gate that prevents same-ticker both-side entry.
+
+### `variance-fade` — **DISABLED 2026-05-08**
+
+- `PREDIGY_VARIANCE_FADE_CONFIG` commented out in `~/.zprofile`.
+- Mechanism audit verdict: fades 8¢ moves without news suppression
+  → fades legitimate info trends. No probabilistic edge model.
+- **Re-enable condition**: news-suppression layer that gates fade
+  entries when a relevant news event has fired in the last N min.
+  Probably depends on news-trader's classifier shipping first.
+
+### `news-trader` — **DISABLED 2026-05-08** (dormant)
+
+- `PREDIGY_NEWS_TRADER_ITEMS_FILE` commented out in `~/.zprofile`.
+- Strategy code is fine — it's a clean adapter for an external
+  classifier that writes JSONL items. The classifier itself is
+  not deployed.
+- **Re-enable condition**: classifier service running and
+  appending to the JSONL file. Until then the strategy sat idle
+  even when registered.
+
 ## Open work / next session priorities
 
-1. **Do not scale yet.** Priority 0 and Priority 1 safety hardening from
-   `docs/PROFITABILITY_AUDIT_PLAN.md` is now live, but it needs clean
-   observation before caps increase.
-2. **Watch reconciliation drift.** The new REST reconciliation loop applies
-   missed fills/order terminal states and logs position mismatches. The REST
-   positions client now exhausts cursor pages; legacy/manual venue exposure from
-   the pre-engine era was imported as `strategy='venue-reconcile'` rows so DB
-   net exposure includes hidden account risk.
-3. **Watch mark availability.** `book_snapshots` are now persisted from WS
-   books. The OMS fails closed for risk-increasing entries when a strategy
-   has open positions without recent marks; exits/reductions still pass.
-4. **Gate strategy exposure while proving edge.** Favor `wx-stat`,
-   `implication-arb`, `internal-arb`, and measured `settlement`.
-   Shadow or tightly gate `book-imbalance`, `variance-fade`, `latency`,
-   and `news-trader` until empirical edge exists.
-5. **Book-imbalance has scalable inventory controls.** The 2026-05-07 live
-   audit found it buying both YES and NO on `KXVOTEHUBTRUMPUPDOWN-26MAY07`, plus
-   insufficient-balance rejects. NO-side accounting was fixed and pre-fix ledger
-   rows repaired; corrected mark was about `-30c`, not the pre-repair `-700c`.
-   The strategy now scales only same-side exposure under dynamic imbalance /
-   liquidity caps, blocks while active orders exist, and treats opposite-side
-   signals as flatten-first exits instead of opening the other side.
-6. **Implication-arb has package-aware scale caps.** Corrected marks turned the
-   existing `KXECONSTATU3` package from apparently positive to about `-130c`.
-   The strategy now models parent-YES/child-NO packages, blocks unbalanced pair
-   inventory, scales balanced packages by edge/liquidity/pair cap/cluster cap,
-   and reserves queued groups in-memory so one book event cannot overrun caps.
-7. **Weather stat/wx-stat are intentionally resumed, but keep watching.** The
-   wx-stat rule file was regenerated through the observed-extreme gate and
-   corrected NBM aggregation. `predigy-import` no longer imports
-   `wx-stat-rules.json` as `stat`, and the latest DB refresh disabled all
-   legacy enabled rows from that source; `KXHIGHTSFO-26MAY07-T62` is disabled.
-   `KXHIGHTPHX-26MAY08-T98` was corrected from YES 0.98 to NO 0.066, and the
-   bad 14-contract YES exposure was sold at 3c. The OMS no longer blanket-blocks
-   all strategy entries because unrelated held positions have stale marks; stale
-   marks are valued conservatively for daily-loss checks, while `stat` and
-   `wx-stat` self-subscribe held-position tickers so marks can recover after
-   rules roll off. Follow-up: leg-group submits now use the same conservative
-   stale/missing-mark daily-loss valuation instead of refusing the whole group.
-8. **Latency stale-replay guard is fixed.** NWS alerts now require fresh onset
-   or effective timestamps, reject expired or missing-timestamp alerts, and use
-   a stable full-alert SHA-256 hash in cids instead of a shared short prefix.
-9. **Phase 4b (FIX)** remains blocked on Kalshi institutional access.
-   Email draft in `docs/KALSHI_FIX_REQUEST.md`. Operator action, but
-   do not prioritize FIX above the safety blockers.
-10. **Phase 7 — retire legacy daemons** completely (delete
+The 2026-05-08 mechanism audit (see `docs/AUDIT_2026-05-08.md`)
+is the current strategic frame. Live fleet has been narrowed
+from 10 → 6 strategies; force-flatten of 32/52 positions has
+freed capital; engine is **disarmed and trading** as of
+2026-05-08 ~03:30 UTC. Account is ~$76.71 ($100 deposited net
+−$23 from shake-down period).
+
+1. **Watch the surviving 6 for ≥30 closed trades each before
+   scaling caps.** The audit's mechanism verdict is theoretical —
+   live realized P&L on unforced exits is what proves it.
+   Highest-conviction strategies: `wx-stat` (NBM is genuinely
+   skilled), `internal-arb` and `implication-arb` (real arb math).
+   On probation: `stat`, `settlement`, `cross-arb`.
+
+2. **20 short-dated weather positions auto-settle in 24-48h**
+   from the 2026-05-07 force-flatten. Cost basis ~$20.21, current
+   exposure ~$1.06 on the dashboard. Don't conflate their
+   settlement P&L with the post-disarm strategy P&L.
+
+3. **stat econ rules disabled pending recalibration.** All 9
+   active stat rules were econ markets (BRAZILINF, ECONSTATU3,
+   PAYROLLS, U3) — the audit said model_p calibration on these
+   is unproven. Re-enable a rule only after at least one print
+   cycle's worth of out-of-sample calibration data.
+
+4. **wx-stat is the highest-leverage strategy to watch.** New
+   defaults: `min_ask_cents=5` (skip lottery tickets) and
+   `max_notional_per_fire_cents=500` ($5/ticker cap). Active
+   exits remain settlement-only. If hit-rate × edge × size is
+   positive over 30+ closed trades, raise the per-fire cap.
+
+5. **cross-arb on probation.** `min_edge_cents` 1 → 3 fixes the
+   fee-floor bug. 18 venue-reconcile phantom rows purged from
+   the contract-cap accounting. Watch for actual fires post-
+   purge.
+
+6. **Disabled-strategy re-enable conditions** (per
+   `docs/AUDIT_2026-05-08.md`):
+   - `book-imbalance`: signal-quality study + same-ticker
+     both-side gate.
+   - `variance-fade`: news-suppression layer (depends on
+     news-trader classifier).
+   - `news-trader`: classifier service deployed and writing JSONL.
+   - `latency`: B4 FIX access + us-east-2 VPS.
+
+7. **Phase 4b (FIX)** remains blocked on Kalshi institutional
+   access. Email draft in `docs/KALSHI_FIX_REQUEST.md`.
+
+8. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.
+
+9. **Cap raises are gated on edge proof.** Don't raise
+   `PREDIGY_MAX_NOTIONAL_CENTS` / `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS`
+   in `~/.zprofile` until the surviving strategies show ≥30
+   *unforced* closed trades net positive after fees. Yesterday's
+   force-flatten makes the realized P&L data unreliable; that
+   resets the trade-count clock.
 
 ## Things to be careful about
 
