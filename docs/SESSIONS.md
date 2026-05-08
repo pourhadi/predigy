@@ -59,12 +59,11 @@ path before deletion.
 - **Kalshi production account**: ~$50 funded. `KALSHI_KEY_ID` in
   `~/.zprofile`; PEM at `~/.config/predigy/kalshi.pem`.
 - **Capital caps in the engine** (RiskCaps shake-down defaults):
-  - `max_notional_cents` per strategy: $5 ($500¢)
-  - `max_global_notional_cents`: $15 ($1500¢) — binds before
-    4×$5=$20 of per-strategy caps could.
-  - `max_daily_loss_cents`: $2
-  - `max_contracts_per_side`: 3
-  - `max_in_flight`: 10
+  - `max_notional_cents` per strategy: $40 ($4000¢)
+  - `max_global_notional_cents`: $120 ($12000¢)
+  - `max_daily_loss_cents`: $10
+  - `max_contracts_per_side`: 20
+  - `max_in_flight`: 40
   - Override per-strategy via env vars in `~/.zprofile`
     (`PREDIGY_MAX_NOTIONAL_CENTS`, `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS`,
     etc.).
@@ -136,9 +135,10 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    `docs/PROFITABILITY_AUDIT_PLAN.md` is now live, but it needs clean
    observation before caps increase.
 2. **Watch reconciliation drift.** The new REST reconciliation loop applies
-   missed fills/order terminal states and logs position mismatches. Current
-   live drift includes legacy/manual venue positions that are not fully
-   represented in the consolidated OMS DB.
+   missed fills/order terminal states and logs position mismatches. The REST
+   positions client now exhausts cursor pages; legacy/manual venue exposure from
+   the pre-engine era was imported as `strategy='venue-reconcile'` rows so DB
+   net exposure includes hidden account risk.
 3. **Watch mark availability.** `book_snapshots` are now persisted from WS
    books. The OMS fails closed for risk-increasing entries when a strategy
    has open positions without recent marks; exits/reductions still pass.

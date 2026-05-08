@@ -301,12 +301,38 @@ impl Client {
         })
     }
 
-    /// `GET /portfolio/positions` (auth required).
+    /// `GET /portfolio/positions` (auth required), exhausting cursor pages.
     pub async fn positions(&self) -> Result<PositionsResponse, Error> {
         if self.signer.is_none() {
             return Err(Error::Auth("positions endpoint requires a signer".into()));
         }
-        self.get_json("/portfolio/positions", &[]).await
+        let mut out = PositionsResponse {
+            market_positions: Vec::new(),
+            cursor: None,
+        };
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        loop {
+            let mut q = vec![("limit", "100".to_string())];
+            if let Some(c) = cursor.as_deref() {
+                q.push(("cursor", c.to_string()));
+            }
+            let page: PositionsResponse = self.get_json("/portfolio/positions", &q).await?;
+            out.market_positions.extend(page.market_positions);
+            let next = page.cursor.filter(|c| !c.is_empty());
+            let Some(next_cursor) = next else {
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(Error::Api {
+                    status: 500,
+                    body: format!("positions cursor repeated: {next_cursor}"),
+                });
+            }
+            cursor = Some(next_cursor);
+        }
+        out.cursor = cursor;
+        Ok(out)
     }
 
     /// `GET /portfolio/balance` (auth required). Returns cash balance,
