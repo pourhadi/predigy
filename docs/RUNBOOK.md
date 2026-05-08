@@ -95,9 +95,23 @@ Calibration evidence:
   --kalshi-key-id "$KALSHI_KEY_ID" --kalshi-pem "$KALSHI_PEM" \
   reconcile-venue-flat --limit 100
 
-# Compute/store reliability report.
+# Compute/store reliability report. wx-stat reports exclude legacy
+# prediction rows whose logged settlement date disagrees with the
+# ticker date suffix; those rows came from the pre-fix UTC/local-day
+# bug and should not be treated as current-model calibration evidence.
 ./target/release/predigy-calibration report --strategy stat --window-days 90
 ./target/release/predigy-calibration report --strategy wx-stat --window-days 90
+
+# Fit wx-stat calibration when enough clean settled samples exist.
+# Defaults are conservative: latest clean record per ticker,
+# date-mismatch legacy rows excluded, min 30 samples for exact/global
+# buckets, regularized monotone Platt scaling. Dry-run first.
+./target/release/wx-stat-fit-calibration \
+  --predictions-dir data/wx_stat_predictions \
+  --asos-cache data/asos_cache \
+  --user-agent "$NWS_USER_AGENT" \
+  --calibration-out data/wx_stat_calibration.json \
+  --dry-run
 
 # One-time/idempotent wx-stat prediction sidecar backfill.
 ./target/release/wx-stat-curator \

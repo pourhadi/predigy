@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use predigy_kalshi_rest::types::MarketDetail;
 use predigy_kalshi_rest::{Client as KalshiClient, Signer};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::{Postgres, Row, postgres::PgPoolOptions};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -78,7 +78,20 @@ enum Command {
 
 #[derive(Debug, Clone)]
 struct PredictionOutcome {
+    ticker: String,
     p: f64,
+    outcome: f64,
+    source: Option<String>,
+    detail: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotOutcomeRow {
+    ticker: String,
+    ts: DateTime<Utc>,
+    model_p: f64,
+    source: Option<String>,
+    detail: Option<Value>,
     outcome: f64,
 }
 
@@ -293,15 +306,19 @@ async fn build_report(pool: &sqlx::PgPool, strategy: &str, window_days: i64) -> 
 
     let rows = sqlx::query(
         r"
-        SELECT DISTINCT ON (s.strategy, s.ticker)
-               s.model_p, st.resolved_value
+        SELECT s.ticker,
+               s.ts,
+               s.model_p,
+               s.source,
+               s.detail,
+               st.resolved_value
         FROM model_p_snapshots s
         JOIN settlements st ON st.ticker = s.ticker
         WHERE s.strategy = $1
           AND s.ts >= $2
           AND s.ts <= $3
           AND st.resolved_value BETWEEN 0 AND 1
-        ORDER BY s.strategy, s.ticker, s.ts DESC
+        ORDER BY s.ticker, s.ts DESC
         ",
     )
     .bind(strategy)
@@ -310,23 +327,62 @@ async fn build_report(pool: &sqlx::PgPool, strategy: &str, window_days: i64) -> 
     .fetch_all(pool)
     .await?;
 
-    let mut samples = Vec::with_capacity(rows.len());
+    let mut excluded: HashMap<&'static str, usize> = HashMap::new();
+    let mut latest_by_ticker: BTreeMap<String, SnapshotOutcomeRow> = BTreeMap::new();
+    let raw_settled_snapshots = rows.len();
     for row in rows {
-        let p: f64 = row.try_get("model_p")?;
-        let outcome: f64 = row.try_get("resolved_value")?;
-        if (0.0..=1.0).contains(&p) && (0.0..=1.0).contains(&outcome) {
-            samples.push(PredictionOutcome { p, outcome });
+        let candidate = SnapshotOutcomeRow {
+            ticker: row.try_get("ticker")?,
+            ts: row.try_get("ts")?,
+            model_p: row.try_get("model_p")?,
+            source: row.try_get("source")?,
+            detail: row.try_get("detail")?,
+            outcome: row.try_get("resolved_value")?,
+        };
+        if let Some(reason) = snapshot_exclusion_reason(strategy, &candidate) {
+            *excluded.entry(reason).or_default() += 1;
+            continue;
         }
+        if !(0.0..=1.0).contains(&candidate.model_p) || !(0.0..=1.0).contains(&candidate.outcome) {
+            *excluded
+                .entry("probability_or_outcome_out_of_range")
+                .or_default() += 1;
+            continue;
+        }
+        latest_by_ticker
+            .entry(candidate.ticker.clone())
+            .and_modify(|existing| {
+                if candidate.ts > existing.ts {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
     }
 
+    let samples: Vec<PredictionOutcome> = latest_by_ticker
+        .into_values()
+        .map(|row| PredictionOutcome {
+            ticker: row.ticker,
+            p: row.model_p,
+            outcome: row.outcome,
+            source: row.source,
+            detail: row.detail,
+        })
+        .collect();
+
     let (brier, log_loss) = metrics(&samples);
+    let (baseline_brier, baseline_log_loss, base_rate) = baseline_metrics(&samples);
     let bins = serde_json::to_value(build_bins(&samples))?;
-    let diagnosis = json!({
-        "source": "predigy-calibration report",
-        "sample_method": "latest model_p snapshot per settled ticker in window",
-        "status": if samples.is_empty() { "no_settled_samples" } else { "ok" },
-        "selection_bias_note": "shadow predictions are preferred; traded fills alone are not enough",
-    });
+    let diagnosis = build_diagnosis(
+        strategy,
+        raw_settled_snapshots,
+        &samples,
+        &excluded,
+        brier,
+        baseline_brier,
+        baseline_log_loss,
+        base_rate,
+    )?;
 
     Ok(Report {
         strategy: strategy.to_string(),
@@ -751,6 +807,167 @@ fn binary_outcome_value(raw: &str) -> Option<f64> {
     }
 }
 
+fn snapshot_exclusion_reason(
+    strategy: &str,
+    candidate: &SnapshotOutcomeRow,
+) -> Option<&'static str> {
+    let detail = candidate.detail.as_ref()?;
+    if detail
+        .get("calibration_sample_eligible")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Some("calibration_sample_eligible_false");
+    }
+    if strategy == "wx-stat" {
+        let recorded_date = detail.get("settlement_date").and_then(Value::as_str);
+        let canonical_date = wx_stat_ticker_settlement_date(&candidate.ticker);
+        if let (Some(recorded), Some(canonical)) = (recorded_date, canonical_date.as_deref())
+            && recorded != canonical
+        {
+            return Some("wx_stat_settlement_date_mismatch");
+        }
+    }
+    None
+}
+
+fn wx_stat_ticker_settlement_date(ticker: &str) -> Option<String> {
+    let token = ticker.split('-').nth(1)?;
+    if token.len() != 7 {
+        return None;
+    }
+    let yy: u32 = token.get(..2)?.parse().ok()?;
+    let mon = token.get(2..5)?;
+    let dd: u32 = token.get(5..7)?.parse().ok()?;
+    if !(1..=31).contains(&dd) {
+        return None;
+    }
+    let mm = match mon.to_ascii_uppercase().as_str() {
+        "JAN" => 1,
+        "FEB" => 2,
+        "MAR" => 3,
+        "APR" => 4,
+        "MAY" => 5,
+        "JUN" => 6,
+        "JUL" => 7,
+        "AUG" => 8,
+        "SEP" => 9,
+        "OCT" => 10,
+        "NOV" => 11,
+        "DEC" => 12,
+        _ => return None,
+    };
+    Some(format!("20{yy:02}-{mm:02}-{dd:02}"))
+}
+
+fn baseline_metrics(samples: &[PredictionOutcome]) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if samples.is_empty() {
+        return (None, None, None);
+    }
+    let base_rate = samples.iter().map(|s| s.outcome).sum::<f64>() / samples.len() as f64;
+    let baseline: Vec<PredictionOutcome> = samples
+        .iter()
+        .map(|s| PredictionOutcome {
+            ticker: s.ticker.clone(),
+            p: base_rate,
+            outcome: s.outcome,
+            source: s.source.clone(),
+            detail: s.detail.clone(),
+        })
+        .collect();
+    let (brier, log_loss) = metrics(&baseline);
+    (brier, log_loss, Some(base_rate))
+}
+
+fn build_diagnosis(
+    strategy: &str,
+    raw_settled_snapshots: usize,
+    samples: &[PredictionOutcome],
+    excluded: &HashMap<&'static str, usize>,
+    brier: Option<f64>,
+    baseline_brier: Option<f64>,
+    baseline_log_loss: Option<f64>,
+    base_rate: Option<f64>,
+) -> Result<Value> {
+    let avg_p = if samples.is_empty() {
+        None
+    } else {
+        Some(samples.iter().map(|s| s.p).sum::<f64>() / samples.len() as f64)
+    };
+    let brier_skill_vs_base = match (brier, baseline_brier) {
+        (Some(model), Some(base)) if base > 0.0 => Some(1.0 - model / base),
+        _ => None,
+    };
+    let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_airport: BTreeMap<String, usize> = BTreeMap::new();
+    for sample in samples {
+        *by_source
+            .entry(
+                sample
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+            .or_default() += 1;
+        if let Some(airport) = sample
+            .detail
+            .as_ref()
+            .and_then(|d| d.get("airport"))
+            .and_then(Value::as_str)
+        {
+            *by_airport.entry(airport.to_string()).or_default() += 1;
+        }
+    }
+    let mut worst: Vec<_> = samples.iter().collect();
+    worst.sort_by(|a, b| {
+        let ea = (a.p - a.outcome).abs();
+        let eb = (b.p - b.outcome).abs();
+        eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let worst_errors: Vec<Value> = worst
+        .into_iter()
+        .take(10)
+        .map(|s| {
+            json!({
+                "ticker": s.ticker,
+                "p": s.p,
+                "outcome": s.outcome,
+                "abs_error": (s.p - s.outcome).abs(),
+                "source": s.source,
+                "airport": s.detail.as_ref().and_then(|d| d.get("airport")).and_then(Value::as_str),
+                "settlement_date": s.detail.as_ref().and_then(|d| d.get("settlement_date")).and_then(Value::as_str),
+            })
+        })
+        .collect();
+    let status = if samples.is_empty() {
+        "no_settled_samples"
+    } else if samples.len() < 30 {
+        "insufficient_clean_settled_samples"
+    } else if brier_skill_vs_base.is_some_and(|skill| skill < 0.0) {
+        "model_worse_than_base_rate"
+    } else {
+        "ok"
+    };
+    Ok(json!({
+        "source": "predigy-calibration report",
+        "strategy": strategy,
+        "sample_method": "latest eligible model_p snapshot per settled ticker in window",
+        "status": status,
+        "selection_bias_note": "shadow predictions are preferred; traded fills alone are not enough",
+        "raw_settled_snapshots": raw_settled_snapshots,
+        "eligible_settled_tickers": samples.len(),
+        "excluded_settled_snapshots_by_reason": excluded,
+        "base_rate": base_rate,
+        "avg_p": avg_p,
+        "baseline_brier": baseline_brier,
+        "baseline_log_loss": baseline_log_loss,
+        "brier_skill_vs_base": brier_skill_vs_base,
+        "samples_by_source": by_source,
+        "samples_by_airport": by_airport,
+        "worst_errors": worst_errors,
+    }))
+}
+
 fn metrics(samples: &[PredictionOutcome]) -> (Option<f64>, Option<f64>) {
     if samples.is_empty() {
         return (None, None);
@@ -932,16 +1149,7 @@ mod tests {
 
     #[test]
     fn metrics_are_reasonable_for_perfect_predictions() {
-        let samples = vec![
-            PredictionOutcome {
-                p: 0.99,
-                outcome: 1.0,
-            },
-            PredictionOutcome {
-                p: 0.01,
-                outcome: 0.0,
-            },
-        ];
+        let samples = vec![sample("KX-A", 0.99, 1.0), sample("KX-B", 0.01, 0.0)];
         let (brier, log_loss) = metrics(&samples);
         assert!(brier.unwrap() < 0.001);
         assert!(log_loss.unwrap() < 0.02);
@@ -949,12 +1157,62 @@ mod tests {
 
     #[test]
     fn bins_include_upper_endpoint() {
-        let bins = build_bins(&[PredictionOutcome {
-            p: 1.0,
-            outcome: 1.0,
-        }]);
+        let bins = build_bins(&[sample("KX-A", 1.0, 1.0)]);
         assert_eq!(bins[9].n, 1);
         assert_eq!(bins[9].hit_rate, Some(1.0));
+    }
+
+    #[test]
+    fn wx_stat_ticker_date_parser_handles_market_ticker() {
+        assert_eq!(
+            wx_stat_ticker_settlement_date("KXHIGHTBOS-26MAY07-T62"),
+            Some("2026-05-07".to_string())
+        );
+    }
+
+    #[test]
+    fn wx_stat_date_mismatch_is_excluded() {
+        let row = SnapshotOutcomeRow {
+            ticker: "KXHIGHTBOS-26MAY07-T62".to_string(),
+            ts: Utc::now(),
+            model_p: 0.98,
+            source: Some("test".to_string()),
+            detail: Some(json!({
+                "settlement_date": "2026-05-08",
+                "calibration_sample_eligible": true,
+            })),
+            outcome: 0.0,
+        };
+        assert_eq!(
+            snapshot_exclusion_reason("wx-stat", &row),
+            Some("wx_stat_settlement_date_mismatch")
+        );
+    }
+
+    #[test]
+    fn wx_stat_matching_ticker_date_is_eligible() {
+        let row = SnapshotOutcomeRow {
+            ticker: "KXHIGHTBOS-26MAY07-T62".to_string(),
+            ts: Utc::now(),
+            model_p: 0.98,
+            source: Some("test".to_string()),
+            detail: Some(json!({
+                "settlement_date": "2026-05-07",
+                "calibration_sample_eligible": true,
+            })),
+            outcome: 1.0,
+        };
+        assert_eq!(snapshot_exclusion_reason("wx-stat", &row), None);
+    }
+
+    fn sample(ticker: &str, p: f64, outcome: f64) -> PredictionOutcome {
+        PredictionOutcome {
+            ticker: ticker.to_string(),
+            p,
+            outcome,
+            source: None,
+            detail: None,
+        }
     }
 
     fn market_detail(

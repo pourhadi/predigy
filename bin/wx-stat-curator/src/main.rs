@@ -45,8 +45,8 @@ use wx_stat_curator::observed_gate::{
 mod shadow_db;
 
 use wx_stat_curator::{
-    Airport, ForecastDecision, ProbabilityConfig, TempMarket, TempStrikeKind, lookup_airport,
-    parse_temp_market, scan_temp_markets,
+    Airport, ForecastDecision, NBM_CURATION_MODEL_VERSION, ProbabilityConfig, TempMarket,
+    TempStrikeKind, lookup_airport, parse_temp_market, scan_temp_markets,
 };
 
 #[allow(clippy::struct_excessive_bools)]
@@ -751,6 +751,7 @@ fn shadow_record_from_nbm(
         "threshold": out.threshold,
         "side": side_label(out.side),
         "settlement_date": settlement_date,
+        "curation_model_version": NBM_CURATION_MODEL_VERSION,
         "raw_p": raw_p,
         "model_p": out.model_p,
         "quoted_ask_cents": out.quoted_ask_cents,
@@ -806,6 +807,7 @@ fn shadow_record_from_nws(
         "threshold": inspection.threshold,
         "side": side_label(inspection.side),
         "settlement_date": rule.settlement_date,
+        "curation_model_version": "nws-phase1-legacy",
         "raw_p": rule.model_p,
         "model_p": rule.model_p,
         "quoted_ask_cents": inspection.quoted_ask_cents,

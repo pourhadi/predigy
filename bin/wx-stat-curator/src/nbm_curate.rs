@@ -18,6 +18,7 @@
 //! Caching makes the second run within a 6h cycle window
 //! effectively free — only file reads, no decode.
 
+use crate::NBM_CURATION_MODEL_VERSION;
 use crate::airports::{Airport, lookup_airport};
 use crate::airports::{airport_utc_offset_hours, local_date_for_unix};
 use crate::calibration::{BucketKey, Calibration};
@@ -328,6 +329,7 @@ fn score_plan(
         .map(|k| (f64::from(k) - 273.15) * 9.0 / 5.0 + 32.0)
         .unwrap_or(0.0);
     let prediction = PredictionRecord {
+        curation_model_version: Some(NBM_CURATION_MODEL_VERSION.to_string()),
         run_ts_utc: run_ts_utc.to_string(),
         ticker: plan.market.ticker.clone(),
         airport: plan.airport.code.to_string(),

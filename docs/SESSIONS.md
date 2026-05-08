@@ -155,9 +155,14 @@ Implemented in the repo for the post-cleanup fill-growth plan:
   from the Kalshi event-ticker date suffix (`26MAY07`) rather than naive
   UTC `occurrence_datetime`, which can land on the following UTC date for
   US local-day temperature markets.
-- Latest live restart loaded 3 active `wx-stat` rules after curator output
-  regeneration. Keep watching this lane first; it remains the highest-
-  conviction directional strategy.
+- 2026-05-08 calibration error analysis: `wx-stat` shadow ingestion is live,
+  but most settled evidence came from the pre-fix UTC/local-day prediction
+  bug. Calibration reports now exclude date-mismatch legacy rows and mark the
+  lane `insufficient_clean_settled_samples` (latest: 11 clean settled tickers,
+  159 excluded settled snapshots). `wx-stat-fit-calibration` now defaults to
+  latest clean record per ticker plus regularized monotone Platt fits with
+  global fallbacks, but no calibration file should be written until at least
+  30 clean settled samples exist.
 
 ### `settlement` (sports tape-reading near close)
 

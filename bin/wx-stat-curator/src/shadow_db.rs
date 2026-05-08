@@ -9,6 +9,7 @@ use predigy_core::side::Side;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use wx_stat_curator::predictions::{PredictionMeasurement, PredictionRecord};
+use wx_stat_curator::ticker_parse::settlement_date_from_ticker;
 
 #[derive(Debug, Clone)]
 pub struct ShadowRuleRecord {
@@ -222,6 +223,10 @@ pub fn prediction_detail(record: &PredictionRecord, source: &str) -> Value {
         "ticker": record.ticker,
         "airport": record.airport,
         "settlement_date": record.settlement_date,
+        "canonical_settlement_date": settlement_date_from_ticker(&record.ticker),
+        "settlement_date_matches_ticker": settlement_date_from_ticker(&record.ticker)
+            .is_none_or(|date| date == record.settlement_date),
+        "curation_model_version": record.curation_model_version,
         "threshold_k": record.threshold_k,
         "yes_when_above": record.yes_when_above,
         "measurement": measurement_str(record.measurement),
@@ -252,6 +257,7 @@ mod tests {
 
     fn pred() -> PredictionRecord {
         PredictionRecord {
+            curation_model_version: Some(wx_stat_curator::NBM_CURATION_MODEL_VERSION.to_string()),
             run_ts_utc: "2026-05-08T12:00:00Z".to_string(),
             ticker: "KXHIGHDEN-26MAY08-T70".to_string(),
             airport: "DEN".to_string(),

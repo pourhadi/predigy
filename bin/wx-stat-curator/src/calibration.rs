@@ -1,8 +1,11 @@
 //! Platt-scaling calibration for NBM raw probabilities.
 //!
 //! Per-airport / per-month calibration coefficients live in a JSON
-//! file the curator loads at startup. Each (airport, month) bucket
-//! has two scalars `(a, b)` so calibrated probability is:
+//! file the curator loads at startup. Exact airport-month buckets can
+//! be backed by broader fallbacks (`__GLOBAL__:MM`, `AIRPORT:00`,
+//! `__GLOBAL__:00`) when the exact bucket does not yet have enough
+//! settled samples. Each bucket has two scalars `(a, b)` so calibrated
+//! probability is:
 //!
 //! ```text
 //! calibrated_p = sigmoid(a + b * logit(raw_p))
@@ -32,6 +35,13 @@ use std::path::Path;
 
 /// Identity coefficients — `apply()` is the identity function.
 pub const IDENTITY_COEFFS: PlattCoeffs = PlattCoeffs { a: 0.0, b: 1.0 };
+
+/// Synthetic airport key for a calibration fit pooled across all
+/// airports for one month or across all months.
+pub const GLOBAL_AIRPORT: &str = "__GLOBAL__";
+
+/// Synthetic month key for a calibration fit pooled across all months.
+pub const ALL_MONTHS: u8 = 0;
 
 /// Platt-scaling coefficients for one (airport, month) bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -76,7 +86,7 @@ impl BucketKey {
     fn from_serial(s: &str) -> Option<Self> {
         let (airport, month_s) = s.rsplit_once(':')?;
         let month: u8 = month_s.parse().ok()?;
-        if !(1..=12).contains(&month) {
+        if month != ALL_MONTHS && !(1..=12).contains(&month) {
             return None;
         }
         Some(Self::new(airport, month))
@@ -143,13 +153,20 @@ impl Calibration {
             .insert(key.to_serial(), BucketEntry { coeffs, n_samples });
     }
 
-    /// Lookup coefficients. Falls back to the identity if no
-    /// bucket exists for `(airport, month)`.
+    /// Lookup coefficients. Preference order:
+    ///
+    /// 1. exact airport-month bucket (`DEN:05`)
+    /// 2. global month bucket (`__GLOBAL__:05`)
+    /// 3. airport all-month bucket (`DEN:00`)
+    /// 4. global all-month bucket (`__GLOBAL__:00`)
+    /// 5. identity
     pub fn lookup(&self, key: &BucketKey) -> PlattCoeffs {
-        self.buckets
-            .get(&key.to_serial())
-            .map(|e| e.coeffs)
-            .unwrap_or(IDENTITY_COEFFS)
+        for candidate in lookup_candidates(key) {
+            if let Some(entry) = self.buckets.get(&candidate.to_serial()) {
+                return entry.coeffs;
+            }
+        }
+        IDENTITY_COEFFS
     }
 
     /// One-shot apply. If no bucket, returns `raw_p` unchanged.
@@ -166,8 +183,36 @@ impl Calibration {
     }
 }
 
+fn lookup_candidates(key: &BucketKey) -> Vec<BucketKey> {
+    let mut out = Vec::with_capacity(4);
+    out.push(key.clone());
+    if key.airport != GLOBAL_AIRPORT {
+        out.push(BucketKey::new(GLOBAL_AIRPORT, key.month));
+    }
+    if key.month != ALL_MONTHS {
+        out.push(BucketKey::new(key.airport.clone(), ALL_MONTHS));
+    }
+    if key.airport != GLOBAL_AIRPORT || key.month != ALL_MONTHS {
+        out.push(BucketKey::new(GLOBAL_AIRPORT, ALL_MONTHS));
+    }
+    out
+}
+
 fn sigmoid(z: f64) -> f64 {
-    1.0 / (1.0 + (-z).exp())
+    if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        let exp_z = z.exp();
+        exp_z / (1.0 + exp_z)
+    }
+}
+
+fn log1p_exp(z: f64) -> f64 {
+    if z > 0.0 {
+        z + (-z).exp().ln_1p()
+    } else {
+        z.exp().ln_1p()
+    }
 }
 
 /// Fit Platt coefficients for one bucket via Newton-Raphson on the
@@ -235,6 +280,87 @@ pub fn fit_platt(samples: &[(f64, f64)]) -> Option<PlattCoeffs> {
     }
 }
 
+/// Fit regularized Platt coefficients for small live samples.
+///
+/// The objective is negative log-likelihood plus an L2 prior toward
+/// identity calibration `(a=0, b=1)`. The slope is constrained to be
+/// non-negative so calibration can soften or shift probabilities but
+/// cannot invert the NBM ordering. This is intentionally more
+/// conservative than [`fit_platt`] for early production data where a
+/// dozen settled contracts can otherwise create extreme coefficients.
+pub fn fit_platt_l2(samples: &[(f64, f64)], l2: f64) -> Option<PlattCoeffs> {
+    if samples.len() < 10 {
+        return None;
+    }
+    let n_pos = samples.iter().filter(|(_, y)| *y > 0.5).count();
+    if n_pos == 0 || n_pos == samples.len() {
+        return None;
+    }
+
+    let logits: Vec<f64> = samples
+        .iter()
+        .map(|(p, _)| {
+            let pp = p.clamp(1e-6, 1.0 - 1e-6);
+            (pp / (1.0 - pp)).ln()
+        })
+        .collect();
+    let ys: Vec<f64> = samples.iter().map(|(_, y)| *y).collect();
+    let l2 = l2.max(0.0);
+    let mut a = 0.0;
+    let mut b = 1.0;
+    for _ in 0..2_000 {
+        let (obj, grad_a, grad_b) = regularized_platt_objective(a, b, l2, &logits, &ys);
+        let grad_norm = grad_a.hypot(grad_b);
+        if grad_norm < 1e-8 {
+            break;
+        }
+        let mut step = 1.0;
+        let mut accepted = false;
+        while step >= 1e-8 {
+            let next_a = a - step * grad_a;
+            let next_b = (b - step * grad_b).max(0.0);
+            let (next_obj, _, _) = regularized_platt_objective(next_a, next_b, l2, &logits, &ys);
+            if next_obj <= obj - 1e-4 * step * grad_norm * grad_norm {
+                a = next_a;
+                b = next_b;
+                accepted = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+
+    if a.is_finite() && b.is_finite() {
+        Some(PlattCoeffs { a, b })
+    } else {
+        None
+    }
+}
+
+fn regularized_platt_objective(
+    a: f64,
+    b: f64,
+    l2: f64,
+    logits: &[f64],
+    ys: &[f64],
+) -> (f64, f64, f64) {
+    let mut obj = 0.5 * l2 * a * a + 0.5 * l2 * (b - 1.0) * (b - 1.0);
+    let mut grad_a = l2 * a;
+    let mut grad_b = l2 * (b - 1.0);
+    for (x, y) in logits.iter().zip(ys) {
+        let z = a + b * x;
+        let p = sigmoid(z);
+        obj += log1p_exp(z) - y * z;
+        let err = p - y;
+        grad_a += err;
+        grad_b += err * x;
+    }
+    (obj, grad_a, grad_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +423,40 @@ mod tests {
         let cal = calibration_with(&[("DEN", 5, PlattCoeffs { a: -1.0, b: 1.5 })]);
         let coeffs = cal.lookup(&BucketKey::new("LAX", 5));
         assert_eq!(coeffs, IDENTITY_COEFFS);
+    }
+
+    #[test]
+    fn lookup_uses_global_month_before_identity() {
+        let global = PlattCoeffs { a: -0.7, b: 0.4 };
+        let cal = calibration_with(&[(GLOBAL_AIRPORT, 5, global)]);
+        assert_eq!(cal.lookup(&BucketKey::new("LAX", 5)), global);
+        assert_eq!(cal.lookup(&BucketKey::new("LAX", 6)), IDENTITY_COEFFS);
+    }
+
+    #[test]
+    fn lookup_uses_global_all_month_as_last_resort() {
+        let global = PlattCoeffs { a: -0.4, b: 0.2 };
+        let cal = calibration_with(&[(GLOBAL_AIRPORT, ALL_MONTHS, global)]);
+        assert_eq!(cal.lookup(&BucketKey::new("LAX", 5)), global);
+    }
+
+    #[test]
+    fn regularized_fit_softens_overconfident_sample_without_inverting() {
+        let samples = vec![
+            (0.98, 0.0),
+            (0.95, 0.0),
+            (0.90, 0.0),
+            (0.85, 1.0),
+            (0.80, 0.0),
+            (0.20, 0.0),
+            (0.15, 1.0),
+            (0.10, 0.0),
+            (0.05, 0.0),
+            (0.02, 0.0),
+        ];
+        let coeffs = fit_platt_l2(&samples, 0.5).unwrap();
+        assert!(coeffs.b >= 0.0);
+        assert!(coeffs.apply(0.98) < 0.98);
     }
 
     #[test]
@@ -375,7 +535,7 @@ mod tests {
     fn bucket_key_rejects_bad_serial() {
         assert!(BucketKey::from_serial("DEN").is_none());
         assert!(BucketKey::from_serial("DEN:13").is_none()); // month out of range
-        assert!(BucketKey::from_serial("DEN:00").is_none());
+        assert!(BucketKey::from_serial("DEN:00").is_some()); // all-month fallback bucket
         assert!(BucketKey::from_serial("DEN:abc").is_none());
     }
 

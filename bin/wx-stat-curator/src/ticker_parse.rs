@@ -161,9 +161,7 @@ fn parse_event_ticker(event_ticker: &str) -> Option<(TempMeasurement, String)> {
 /// Preference order: event-ticker date suffix `26MAY07` →
 /// `occurrence_datetime` fallback → fail.
 fn derive_settlement_date(occurrence_datetime: Option<&str>, event_ticker: &str) -> Option<String> {
-    if let Some(suffix) = event_ticker.split('-').nth(1)
-        && let Some(date) = parse_yymmmdd_to_iso(suffix)
-    {
+    if let Some(date) = settlement_date_from_ticker(event_ticker) {
         return Some(date);
     }
     if let Some(odt) = occurrence_datetime {
@@ -179,6 +177,15 @@ fn derive_settlement_date(occurrence_datetime: Option<&str>, event_ticker: &str)
         }
     }
     None
+}
+
+/// Extract the Kalshi local settlement date from a temperature market
+/// ticker or event ticker. Accepts both event tickers like
+/// `KXHIGHDEN-26MAY07` and market tickers like
+/// `KXHIGHDEN-26MAY07-T68`.
+pub fn settlement_date_from_ticker(ticker: &str) -> Option<String> {
+    let suffix = ticker.split('-').nth(1)?;
+    parse_yymmmdd_to_iso(suffix)
 }
 
 /// `"26MAY07"` → `"2026-05-07"`. Returns None on shape mismatch.
@@ -287,6 +294,14 @@ mod tests {
         let spec = parse_temp_market("KXHIGHDEN-26MAY07", Some("greater"), Some(68.0), None, None)
             .unwrap();
         assert_eq!(spec.settlement_date, "2026-05-07");
+    }
+
+    #[test]
+    fn extracts_settlement_date_from_market_ticker() {
+        assert_eq!(
+            settlement_date_from_ticker("KXHIGHDEN-26MAY07-T68"),
+            Some("2026-05-07".to_string())
+        );
     }
 
     #[test]

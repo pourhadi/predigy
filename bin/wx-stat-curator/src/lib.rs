@@ -12,6 +12,12 @@
 //!
 //! See `docs/WX_STAT_PLAN.md` for the full design.
 
+/// Version tag for the current NBM probability semantics. Bump when
+/// changing date derivation, probability aggregation, observation
+/// gates, or any other logic that makes historical prediction records
+/// non-comparable with newly emitted records.
+pub const NBM_CURATION_MODEL_VERSION: &str = "nbm-v2026-05-08-localdate-allhours-v1";
+
 pub mod airports;
 pub mod calibration;
 pub mod forecast_to_p;

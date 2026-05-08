@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 /// One per emitted rule. Operator-readable JSONL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PredictionRecord {
+    /// Version tag for the curator probability semantics that produced
+    /// this record. Older JSONL lines omit it and are treated as legacy
+    /// by fit/reporting tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curation_model_version: Option<String>,
     /// ISO-8601 UTC of the curator run that produced this prediction.
     pub run_ts_utc: String,
     /// Kalshi market ticker — joins back to the Kalshi-side outcome.
@@ -139,6 +144,7 @@ mod tests {
 
     fn rec(ticker: &str, run_ts: &str, raw_p: f64) -> PredictionRecord {
         PredictionRecord {
+            curation_model_version: Some(crate::NBM_CURATION_MODEL_VERSION.to_string()),
             run_ts_utc: run_ts.into(),
             ticker: ticker.into(),
             airport: "DEN".into(),

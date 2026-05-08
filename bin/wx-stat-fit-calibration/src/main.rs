@@ -24,22 +24,28 @@
 //!    extreme on the settlement date (cached on disk).
 //! 4. Compute `outcome ∈ {0.0, 1.0}` from the observed extreme
 //!    versus the threshold + side direction.
-//! 5. Group `(raw_p, outcome)` pairs by (airport, month-of-
-//!    settlement).
-//! 6. Fit Platt scaling per bucket where sample count meets the
-//!    floor. Write `calibration.json`.
+//! 5. Drop legacy records whose logged settlement date disagrees
+//!    with the Kalshi ticker date suffix unless explicitly told to
+//!    include them.
+//! 6. Group `(raw_p, outcome)` pairs into exact airport/month plus
+//!    broader global fallback buckets.
+//! 7. Fit regularized, monotone Platt scaling where sample counts
+//!    meet the configured floors. Write `calibration.json`.
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use wx_stat_curator::airports::lookup_airport;
-use wx_stat_curator::calibration::{BucketKey, Calibration, fit_platt};
+use wx_stat_curator::calibration::{
+    ALL_MONTHS, BucketKey, Calibration, GLOBAL_AIRPORT, fit_platt_l2,
+};
 use wx_stat_curator::observations::AsosClient;
 use wx_stat_curator::predictions::{PredictionMeasurement, PredictionRecord, read_dir_records};
+use wx_stat_curator::ticker_parse::settlement_date_from_ticker;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -68,12 +74,34 @@ struct Args {
     #[arg(long, default_value = "data/wx_stat_calibration.json")]
     calibration_out: PathBuf,
 
-    /// Minimum (raw_p, outcome) samples per bucket required for a
-    /// bucket fit to ship. Buckets below the floor stay
-    /// uncalibrated (identity at inference); the operator sees
-    /// the per-bucket sample histogram in the run summary.
-    #[arg(long, default_value_t = 10)]
+    /// Minimum (raw_p, outcome) samples required for an exact
+    /// airport/month bucket. Buckets below the floor fall back to
+    /// global month/all-month fits at inference.
+    #[arg(long, default_value_t = 30)]
     min_samples_per_bucket: u32,
+
+    /// Minimum samples required for a global fallback bucket.
+    #[arg(long, default_value_t = 30)]
+    min_global_samples: u32,
+
+    /// L2 regularization strength for Platt fits. The fit is
+    /// monotone and shrunk toward identity to avoid wild early-live
+    /// coefficients.
+    #[arg(long, default_value_t = 0.5)]
+    platt_l2: f64,
+
+    /// Include legacy records whose logged settlement_date disagrees
+    /// with the date encoded in the Kalshi ticker. Default false,
+    /// because those records were usually produced by the pre-fix UTC
+    /// date bug and are not comparable with current model semantics.
+    #[arg(long, default_value_t = false)]
+    include_legacy_date_mismatch: bool,
+
+    /// Treat every forecast issuance as a calibration sample. Default
+    /// false: use only the latest clean record per ticker so one market
+    /// cannot dominate early-live calibration by appearing in many runs.
+    #[arg(long, default_value_t = false)]
+    use_all_records: bool,
 
     /// Number of full days of slack to wait after a settlement
     /// date before trying to fetch the observation. ASOS publishes
@@ -88,6 +116,12 @@ struct Args {
     /// eyeballing before committing.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+}
+
+#[derive(Clone)]
+struct EligiblePrediction<'a> {
+    record: &'a PredictionRecord,
+    settlement_date: String,
 }
 
 #[tokio::main]
@@ -110,14 +144,52 @@ async fn main() -> Result<()> {
     }
 
     let cutoff_unix = now_unix() - args.settlement_lag_days.saturating_mul(86_400);
-    let eligible: Vec<&PredictionRecord> = predictions
-        .iter()
-        .filter(|p| settlement_unix(&p.settlement_date).is_some_and(|t| t <= cutoff_unix))
-        .collect();
+    let mut eligible: Vec<EligiblePrediction<'_>> = Vec::new();
+    let mut dropped_future_or_unparseable = 0_u32;
+    let mut dropped_date_mismatch = 0_u32;
+    for p in &predictions {
+        let ticker_date = settlement_date_from_ticker(&p.ticker);
+        if let Some(date) = ticker_date.as_deref()
+            && date != p.settlement_date
+            && !args.include_legacy_date_mismatch
+        {
+            dropped_date_mismatch += 1;
+            continue;
+        }
+        let settlement_date = ticker_date.unwrap_or_else(|| p.settlement_date.clone());
+        if settlement_unix(&settlement_date).is_some_and(|t| t <= cutoff_unix) {
+            eligible.push(EligiblePrediction {
+                record: p,
+                settlement_date,
+            });
+        } else {
+            dropped_future_or_unparseable += 1;
+        }
+    }
+    let n_eligible_records = eligible.len();
+    if !args.use_all_records {
+        let mut latest_by_ticker: BTreeMap<&str, EligiblePrediction<'_>> = BTreeMap::new();
+        for sample in eligible {
+            latest_by_ticker
+                .entry(&sample.record.ticker)
+                .and_modify(|existing| {
+                    if sample.record.run_ts_utc.as_str() > existing.record.run_ts_utc.as_str() {
+                        *existing = sample.clone();
+                    }
+                })
+                .or_insert(sample);
+        }
+        eligible = latest_by_ticker.into_values().collect();
+    }
     info!(
         n_eligible = eligible.len(),
+        n_eligible_records,
         n_total = predictions.len(),
-        "filtered to predictions whose settlement is past the lag cutoff"
+        n_dropped_date_mismatch = dropped_date_mismatch,
+        n_dropped_future_or_unparseable = dropped_future_or_unparseable,
+        include_legacy_date_mismatch = args.include_legacy_date_mismatch,
+        use_all_records = args.use_all_records,
+        "filtered to clean predictions whose settlement is past the lag cutoff"
     );
 
     let asos = AsosClient::new(&args.user_agent).map_err(|e| anyhow!("asos client: {e}"))?;
@@ -129,18 +201,20 @@ async fn main() -> Result<()> {
     let mut buckets: HashMap<BucketKey, Vec<(f64, f64)>> = HashMap::new();
     let mut dropped = 0u32;
 
-    for p in &eligible {
+    for eligible_prediction in &eligible {
+        let p = eligible_prediction.record;
+        let settlement_date = &eligible_prediction.settlement_date;
         let Some(airport) = lookup_airport(&p.airport) else {
             warn!(airport = %p.airport, "no airport entry; dropping prediction");
             dropped += 1;
             continue;
         };
         let station = airport.asos_station_or_code().to_string();
-        let key = (station.clone(), p.settlement_date.clone());
+        let key = (station.clone(), settlement_date.clone());
         let extremes = match obs_cache.get(&key) {
             Some(e) => e.clone(),
             None => match asos
-                .fetch_daily_extremes(&args.asos_cache, &station, &p.settlement_date)
+                .fetch_daily_extremes(&args.asos_cache, &station, settlement_date)
                 .await
             {
                 Ok(e) => {
@@ -151,7 +225,7 @@ async fn main() -> Result<()> {
                     warn!(
                         airport = %p.airport,
                         station = %station,
-                        date = %p.settlement_date,
+                        date = %settlement_date,
                         error = %e,
                         "asos fetch failed; dropping prediction"
                     );
@@ -173,16 +247,22 @@ async fn main() -> Result<()> {
         } else {
             0.0_f64
         };
-        let month = settlement_month(&p.settlement_date).unwrap_or(0);
+        let month = settlement_month(settlement_date).unwrap_or(0);
         if month == 0 {
             dropped += 1;
             continue;
         }
-        let bucket_key = BucketKey::new(airport.code, month);
-        buckets
-            .entry(bucket_key)
-            .or_default()
-            .push((p.raw_p, outcome));
+        for bucket_key in [
+            BucketKey::new(airport.code, month),
+            BucketKey::new(GLOBAL_AIRPORT, month),
+            BucketKey::new(airport.code, ALL_MONTHS),
+            BucketKey::new(GLOBAL_AIRPORT, ALL_MONTHS),
+        ] {
+            buckets
+                .entry(bucket_key)
+                .or_default()
+                .push((p.raw_p, outcome));
+        }
     }
 
     info!(
@@ -192,7 +272,9 @@ async fn main() -> Result<()> {
         "joined predictions with observations"
     );
 
-    // Fit per bucket where sample count meets floor.
+    // Fit exact and fallback buckets where sample count meets the
+    // configured floor. The calibration lookup path chooses exact
+    // first, then global month/all-month fallbacks.
     let mut cal = Calibration::empty();
     let mut fit_summary: Vec<(
         BucketKey,
@@ -201,11 +283,12 @@ async fn main() -> Result<()> {
     )> = Vec::new();
     for (bucket, samples) in &buckets {
         let n: u32 = u32::try_from(samples.len()).unwrap_or(u32::MAX);
-        if n < args.min_samples_per_bucket {
+        let required = min_samples_for_bucket(bucket, &args);
+        if n < required {
             fit_summary.push((bucket.clone(), n, None));
             continue;
         }
-        match fit_platt(samples) {
+        match fit_platt_l2(samples, args.platt_l2) {
             Some(coeffs) => {
                 cal.set(bucket.clone(), coeffs, n);
                 fit_summary.push((bucket.clone(), n, Some(coeffs)));
@@ -216,9 +299,11 @@ async fn main() -> Result<()> {
 
     cal.fitted_at_iso = Some(format_now_utc_iso());
     cal.source = Some(format!(
-        "wx-stat-fit-calibration: {} eligible predictions, {} buckets fitted",
+        "wx-stat-fit-calibration: {} clean eligible predictions, {} date-mismatch legacy records dropped, {} buckets fitted, l2={:.3}",
         eligible.len(),
-        cal.buckets.len()
+        dropped_date_mismatch,
+        cal.buckets.len(),
+        args.platt_l2
     ));
 
     print_summary(&fit_summary);
@@ -235,6 +320,14 @@ async fn main() -> Result<()> {
         args.calibration_out.display()
     );
     Ok(())
+}
+
+fn min_samples_for_bucket(bucket: &BucketKey, args: &Args) -> u32 {
+    if bucket.airport == GLOBAL_AIRPORT || bucket.month == ALL_MONTHS {
+        args.min_global_samples
+    } else {
+        args.min_samples_per_bucket
+    }
 }
 
 fn print_summary(
