@@ -89,6 +89,12 @@ Calibration evidence:
 # Backfill public settled outcomes for predicted tickers.
 ./target/release/predigy-calibration sync-settlements --window-days 90 --limit 200
 
+# Dry-run settled venue-flat DB reconciliation. Requires Kalshi auth but
+# never submits/cancels orders. It only writes with explicit --write.
+./target/release/predigy-calibration \
+  --kalshi-key-id "$KALSHI_KEY_ID" --kalshi-pem "$KALSHI_PEM" \
+  reconcile-venue-flat --limit 100
+
 # Compute/store reliability report.
 ./target/release/predigy-calibration report --strategy stat --window-days 90
 ./target/release/predigy-calibration report --strategy wx-stat --window-days 90
@@ -141,8 +147,11 @@ launchctl bootout "gui/$(id -u)/com.predigy.engine"
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.engine.plist
 ```
 
-Scanner/calibration launchd jobs are observation jobs (`opportunity-scanner`
-currently every 15m, `calibration` hourly). Install/reload:
+Scanner/calibration launchd jobs are non-order-entry jobs (`opportunity-scanner`
+currently every 15m, `calibration` hourly). The calibration job now runs
+`reconcile-venue-flat --write` after settlement sync; it can close DB-only
+stale positions only when authenticated venue exposure is flat and Kalshi
+market detail has a final binary outcome. Install/reload:
 
 ```sh
 cp deploy/macos/com.predigy.opportunity-scanner.plist ~/Library/LaunchAgents/
@@ -215,8 +224,23 @@ non-zero `open_positions[].contracts` with:
 psql -d predigy -c "SELECT ticker, SUM(CASE WHEN side='yes' THEN current_qty ELSE -current_qty END) AS db_qty FROM positions WHERE closed_at IS NULL GROUP BY ticker ORDER BY ticker;"
 ```
 
-The 2026-05-08 cleanup manually aligned stale force-flatten DB rows to
-Kalshi `/portfolio/positions`; repeat that only after a fresh DB backup.
+For settled venue-flat stale DB rows, use the calibrated reconciliation
+command instead of hand-editing positions:
+
+```sh
+# Dry-run first; prints JSON with candidate tickers and expected P&L deltas.
+./target/release/predigy-calibration \
+  --kalshi-key-id "$KALSHI_KEY_ID" --kalshi-pem "$KALSHI_PEM" \
+  reconcile-venue-flat --limit 100
+
+# Write only after the report shows final settled outcomes.
+./target/release/predigy-calibration \
+  --kalshi-key-id "$KALSHI_KEY_ID" --kalshi-pem "$KALSHI_PEM" \
+  reconcile-venue-flat --limit 100 --write
+```
+
+This command never submits/cancels orders. It upserts the market/settlement
+record and closes matching Postgres `positions` rows at the settled side value.
 
 ### "Dashboard or engine is producing many Kalshi 429s"
 

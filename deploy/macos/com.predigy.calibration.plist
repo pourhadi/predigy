@@ -2,8 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Calibration evidence tick. Backfills public settlement outcomes for
-         predicted tickers and writes calibration_reports. Does not enable rules. -->
+    <!-- Calibration evidence tick. Backfills public settlement outcomes,
+         reconciles settled venue-flat stale DB positions, and writes
+         calibration_reports. Does not enable rules or submit orders. -->
     <key>Label</key>
     <string>com.predigy.calibration</string>
 

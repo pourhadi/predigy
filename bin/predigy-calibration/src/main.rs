@@ -4,11 +4,13 @@
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
-use predigy_kalshi_rest::Client as KalshiClient;
 use predigy_kalshi_rest::types::MarketDetail;
+use predigy_kalshi_rest::{Client as KalshiClient, Signer};
 use serde::Serialize;
 use serde_json::json;
-use sqlx::{Row, postgres::PgPoolOptions};
+use sqlx::{Postgres, Row, postgres::PgPoolOptions};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -21,9 +23,17 @@ struct Args {
     #[arg(long, env = "DATABASE_URL", default_value = "postgresql:///predigy")]
     database_url: String,
 
-    /// Optional Kalshi REST endpoint override for public settlement sync.
+    /// Optional Kalshi REST endpoint override.
     #[arg(long, env = "KALSHI_REST_ENDPOINT")]
     kalshi_rest_endpoint: Option<String>,
+
+    /// Kalshi key id. Required only for authenticated venue-position reconciliation.
+    #[arg(long, env = "KALSHI_KEY_ID")]
+    kalshi_key_id: Option<String>,
+
+    /// Path to Kalshi private key PEM. Required only for authenticated venue-position reconciliation.
+    #[arg(long, env = "KALSHI_PEM")]
+    kalshi_pem: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Command,
@@ -51,6 +61,16 @@ enum Command {
         limit: i64,
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+    },
+    /// Close stale DB-open rows for settled markets where authenticated venue exposure is flat.
+    ReconcileVenueFlat {
+        #[arg(long)]
+        strategy: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+        /// Actually mutate positions/settlements. Default is a read-only dry run.
+        #[arg(long, default_value_t = false)]
+        write: bool,
     },
     /// Placeholder for future stat shadow-rule writer.
     ShadowStat,
@@ -86,12 +106,59 @@ struct Report {
     diagnosis: serde_json::Value,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct OpenPositionRow {
+    id: i64,
+    ticker: String,
+    side: String,
+    current_qty: i32,
+    avg_entry_cents: i32,
+}
+
+#[derive(Debug)]
+struct VenueFlatCandidate {
+    ticker: String,
+    db_qty: i32,
+    rows: Vec<OpenPositionRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct VenueFlatReport {
+    mode: &'static str,
+    strategy: Option<String>,
+    db_open_tickers: usize,
+    venue_open_tickers: usize,
+    venue_flat_candidates: usize,
+    checked_candidates: usize,
+    eligible_settled: usize,
+    closed_tickers: usize,
+    closed_position_rows: usize,
+    realized_pnl_delta_cents: i64,
+    tickers: Vec<VenueFlatTickerReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct VenueFlatTickerReport {
+    ticker: String,
+    db_qty: i32,
+    venue_qty: i32,
+    n_position_rows: usize,
+    status: String,
+    outcome: Option<f64>,
+    settled_at: Option<DateTime<Utc>>,
+    action: &'static str,
+    realized_pnl_delta_cents: i64,
+    reason: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let Args {
         database_url,
         kalshi_rest_endpoint,
+        kalshi_key_id,
+        kalshi_pem,
         cmd,
     } = Args::parse();
     let pool = PgPoolOptions::new()
@@ -139,11 +206,7 @@ async fn main() -> Result<()> {
             if limit <= 0 {
                 return Err(anyhow!("--limit must be positive"));
             }
-            let rest = if let Some(base) = kalshi_rest_endpoint.as_deref() {
-                KalshiClient::with_base(base, None).context("build public Kalshi REST client")?
-            } else {
-                KalshiClient::public().context("build public Kalshi REST client")?
-            };
+            let rest = build_public_rest(kalshi_rest_endpoint.as_deref())?;
             let n = sync_settlements(
                 &pool,
                 &rest,
@@ -159,6 +222,23 @@ async fn main() -> Result<()> {
                 n
             );
         }
+        Command::ReconcileVenueFlat {
+            strategy,
+            limit,
+            write,
+        } => {
+            if limit <= 0 {
+                return Err(anyhow!("--limit must be positive"));
+            }
+            let rest = build_authed_rest(
+                kalshi_rest_endpoint.as_deref(),
+                kalshi_key_id.as_deref(),
+                kalshi_pem.as_deref(),
+            )?;
+            let report =
+                reconcile_venue_flat(&pool, &rest, strategy.as_deref(), limit, write).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Command::ShadowStat => {
             println!(
                 "shadow-stat is not wired yet; keep stat rules disabled and collect model_p snapshots"
@@ -166,6 +246,32 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn build_public_rest(endpoint: Option<&str>) -> Result<KalshiClient> {
+    if let Some(base) = endpoint {
+        KalshiClient::with_base(base, None).context("build public Kalshi REST client")
+    } else {
+        KalshiClient::public().context("build public Kalshi REST client")
+    }
+}
+
+fn build_authed_rest(
+    endpoint: Option<&str>,
+    key_id: Option<&str>,
+    pem_path: Option<&Path>,
+) -> Result<KalshiClient> {
+    let key_id = key_id.context("KALSHI_KEY_ID is required for reconcile-venue-flat")?;
+    let pem_path = pem_path.context("KALSHI_PEM is required for reconcile-venue-flat")?;
+    let pem = std::fs::read_to_string(pem_path)
+        .with_context(|| format!("read PEM at {}", pem_path.display()))?;
+    let signer = Signer::from_pem(key_id, &pem).map_err(|e| anyhow!("signer: {e}"))?;
+    if let Some(base) = endpoint {
+        KalshiClient::with_base(base, Some(signer))
+            .context("build authenticated Kalshi REST client")
+    } else {
+        KalshiClient::authed(signer).context("build authenticated Kalshi REST client")
+    }
 }
 
 async fn build_report(pool: &sqlx::PgPool, strategy: &str, window_days: i64) -> Result<Report> {
@@ -286,12 +392,23 @@ async fn upsert_market_and_settlement(
     detail: &MarketDetail,
     outcome: f64,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    upsert_market_and_settlement_tx(&mut tx, detail, outcome).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_market_and_settlement_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    detail: &MarketDetail,
+    outcome: f64,
+) -> Result<DateTime<Utc>> {
     let close_time = parse_rfc3339_utc(Some(detail.close_time.as_str()));
     let settled_at = parse_rfc3339_utc(detail.settled_time.as_deref()).unwrap_or_else(Utc::now);
     let settlement_ts =
         Some(settled_at).or_else(|| parse_rfc3339_utc(detail.expected_expiration_time.as_deref()));
     let payload = json!({
-        "source": "predigy-calibration sync-settlements",
+        "source": "predigy-calibration settlement-sync",
         "event_ticker": detail.event_ticker,
         "status": detail.status,
         "result": detail.result,
@@ -324,7 +441,7 @@ async fn upsert_market_and_settlement(
         "calibration".to_string(),
     ])
     .bind(&payload)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     sqlx::query(
@@ -342,9 +459,270 @@ async fn upsert_market_and_settlement(
     .bind(outcome)
     .bind(settled_at)
     .bind(payload)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(settled_at)
+}
+
+async fn reconcile_venue_flat(
+    pool: &sqlx::PgPool,
+    rest: &KalshiClient,
+    strategy: Option<&str>,
+    limit: i64,
+    write: bool,
+) -> Result<VenueFlatReport> {
+    let open_rows = fetch_open_positions(pool, strategy).await?;
+    let venue_by_ticker = fetch_venue_positions(rest).await?;
+    let (db_open_tickers, candidates) = venue_flat_candidates(open_rows, &venue_by_ticker);
+    let venue_flat_candidates = candidates.len();
+
+    let mut report = VenueFlatReport {
+        mode: if write { "write" } else { "dry-run" },
+        strategy: strategy.map(ToOwned::to_owned),
+        db_open_tickers,
+        venue_open_tickers: venue_by_ticker.len(),
+        venue_flat_candidates,
+        checked_candidates: 0,
+        eligible_settled: 0,
+        closed_tickers: 0,
+        closed_position_rows: 0,
+        realized_pnl_delta_cents: 0,
+        tickers: Vec::new(),
+    };
+
+    for candidate in candidates.into_iter().take(limit as usize) {
+        report.checked_candidates += 1;
+        let detail = rest
+            .market_detail(&candidate.ticker)
+            .await
+            .with_context(|| format!("fetch market detail {}", candidate.ticker))?
+            .market;
+        let venue_qty = venue_by_ticker.get(&candidate.ticker).copied().unwrap_or(0);
+        let status = detail.status.clone();
+        let outcome = market_outcome_value(&detail);
+        let settled = final_settlement_outcome(&detail);
+        let Some((outcome_value, settled_at)) = settled else {
+            report.tickers.push(VenueFlatTickerReport {
+                ticker: candidate.ticker,
+                db_qty: candidate.db_qty,
+                venue_qty,
+                n_position_rows: candidate.rows.len(),
+                status,
+                outcome,
+                settled_at: None,
+                action: "skipped",
+                realized_pnl_delta_cents: 0,
+                reason: "venue flat but market detail has no final settled binary outcome"
+                    .to_string(),
+            });
+            continue;
+        };
+
+        report.eligible_settled += 1;
+        let expected_pnl = candidate_settlement_pnl(&candidate, outcome_value)?;
+        if write {
+            let (closed_rows, realized_delta) =
+                close_settled_venue_flat_ticker(pool, &candidate, &detail, outcome_value).await?;
+            report.closed_tickers += usize::from(closed_rows > 0);
+            report.closed_position_rows += closed_rows;
+            report.realized_pnl_delta_cents += realized_delta;
+            report.tickers.push(VenueFlatTickerReport {
+                ticker: candidate.ticker,
+                db_qty: candidate.db_qty,
+                venue_qty,
+                n_position_rows: candidate.rows.len(),
+                status,
+                outcome: Some(outcome_value),
+                settled_at: Some(settled_at),
+                action: "closed",
+                realized_pnl_delta_cents: realized_delta,
+                reason: format!(
+                    "closed {closed_rows} DB-open rows against settled venue-flat market"
+                ),
+            });
+        } else {
+            report.tickers.push(VenueFlatTickerReport {
+                ticker: candidate.ticker,
+                db_qty: candidate.db_qty,
+                venue_qty,
+                n_position_rows: candidate.rows.len(),
+                status,
+                outcome: Some(outcome_value),
+                settled_at: Some(settled_at),
+                action: "would_close",
+                realized_pnl_delta_cents: expected_pnl,
+                reason: "dry run: would close DB-open rows against settled venue-flat market"
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(report)
+}
+
+async fn fetch_open_positions(
+    pool: &sqlx::PgPool,
+    strategy: Option<&str>,
+) -> Result<Vec<OpenPositionRow>> {
+    let rows = sqlx::query_as::<_, OpenPositionRow>(
+        r"
+        SELECT id, ticker, side, current_qty, avg_entry_cents
+        FROM positions
+        WHERE closed_at IS NULL
+          AND ($1::TEXT IS NULL OR strategy = $1)
+        ORDER BY ticker, strategy, side, id
+        ",
+    )
+    .bind(strategy)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+async fn fetch_venue_positions(rest: &KalshiClient) -> Result<HashMap<String, i32>> {
+    let positions = rest.positions().await.context("fetch Kalshi positions")?;
+    let mut by_ticker = HashMap::new();
+    for position in positions.market_positions {
+        let qty = venue_position_qty(position.position_contracts);
+        if qty != 0 {
+            *by_ticker.entry(position.ticker).or_insert(0) += qty;
+        }
+    }
+    Ok(by_ticker)
+}
+
+fn venue_position_qty(position_contracts: Option<f64>) -> i32 {
+    let Some(qty) = position_contracts else {
+        return 0;
+    };
+    if qty.is_finite() {
+        qty.round() as i32
+    } else {
+        0
+    }
+}
+
+fn venue_flat_candidates(
+    open_rows: Vec<OpenPositionRow>,
+    venue_by_ticker: &HashMap<String, i32>,
+) -> (usize, Vec<VenueFlatCandidate>) {
+    let mut grouped: BTreeMap<String, Vec<OpenPositionRow>> = BTreeMap::new();
+    for row in open_rows {
+        grouped.entry(row.ticker.clone()).or_default().push(row);
+    }
+    let db_open_tickers = grouped.len();
+    let mut candidates = Vec::new();
+    for (ticker, rows) in grouped {
+        if venue_by_ticker.get(&ticker).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        let db_qty = signed_db_qty(&rows);
+        candidates.push(VenueFlatCandidate {
+            ticker,
+            db_qty,
+            rows,
+        });
+    }
+    (db_open_tickers, candidates)
+}
+
+fn signed_db_qty(rows: &[OpenPositionRow]) -> i32 {
+    rows.iter()
+        .map(|row| {
+            if row.side == "yes" {
+                row.current_qty
+            } else {
+                -row.current_qty
+            }
+        })
+        .sum()
+}
+
+fn final_settlement_outcome(detail: &MarketDetail) -> Option<(f64, DateTime<Utc>)> {
+    let outcome = market_outcome_value(detail)?;
+    if !(0.0..=1.0).contains(&outcome) || !outcome.is_finite() {
+        return None;
+    }
+    if let Some(settled_at) = parse_rfc3339_utc(detail.settled_time.as_deref()) {
+        return Some((outcome, settled_at));
+    }
+    if market_status_is_final(&detail.status) {
+        return Some((outcome, Utc::now()));
+    }
+    None
+}
+
+fn market_status_is_final(status: &str) -> bool {
+    let normalized: String = status
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "settled" | "finalized" | "resolved" | "closed"
+    )
+}
+
+fn candidate_settlement_pnl(candidate: &VenueFlatCandidate, outcome: f64) -> Result<i64> {
+    candidate
+        .rows
+        .iter()
+        .map(|row| position_settlement_pnl(row, outcome))
+        .sum()
+}
+
+fn position_settlement_pnl(row: &OpenPositionRow, yes_outcome: f64) -> Result<i64> {
+    let settlement_price_cents = settlement_price_for_side(&row.side, yes_outcome)
+        .with_context(|| format!("unknown position side {:?} for {}", row.side, row.ticker))?;
+    Ok(i64::from(settlement_price_cents - row.avg_entry_cents)
+        * i64::from(row.current_qty.signum())
+        * i64::from(row.current_qty.abs()))
+}
+
+fn settlement_price_for_side(side: &str, yes_outcome: f64) -> Option<i32> {
+    match side {
+        "yes" => Some((yes_outcome * 100.0).round() as i32),
+        "no" => Some(((1.0 - yes_outcome) * 100.0).round() as i32),
+        _ => None,
+    }
+}
+
+async fn close_settled_venue_flat_ticker(
+    pool: &sqlx::PgPool,
+    candidate: &VenueFlatCandidate,
+    detail: &MarketDetail,
+    outcome: f64,
+) -> Result<(usize, i64)> {
+    let mut tx = pool.begin().await?;
+    let settled_at = upsert_market_and_settlement_tx(&mut tx, detail, outcome).await?;
+    let mut closed_rows = 0_usize;
+    let mut realized_delta = 0_i64;
+    for row in &candidate.rows {
+        let pnl_delta = position_settlement_pnl(row, outcome)?;
+        let result = sqlx::query(
+            r"
+            UPDATE positions
+            SET current_qty = 0,
+                closed_at = $2,
+                last_fill_at = $2,
+                realized_pnl_cents = realized_pnl_cents + $3
+            WHERE id = $1
+              AND closed_at IS NULL
+            ",
+        )
+        .bind(row.id)
+        .bind(settled_at)
+        .bind(pnl_delta)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() > 0 {
+            closed_rows += 1;
+            realized_delta += pnl_delta;
+        }
+    }
+    tx.commit().await?;
+    Ok((closed_rows, realized_delta))
 }
 
 fn parse_rfc3339_utc(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -486,6 +864,73 @@ mod tests {
     }
 
     #[test]
+    fn final_outcome_requires_settlement_marker() {
+        let mut detail = market_detail("settled", Some("yes"), None);
+        assert!(final_settlement_outcome(&detail).is_some());
+
+        detail.status = "active".to_string();
+        assert!(final_settlement_outcome(&detail).is_none());
+
+        detail.settled_time = Some("2026-05-08T12:00:00Z".to_string());
+        assert!(final_settlement_outcome(&detail).is_some());
+    }
+
+    #[test]
+    fn settlement_pnl_uses_side_domain_price() {
+        let yes_long = OpenPositionRow {
+            id: 1,
+            ticker: "KX".to_string(),
+            side: "yes".to_string(),
+            current_qty: 3,
+            avg_entry_cents: 60,
+        };
+        let no_long = OpenPositionRow {
+            id: 2,
+            ticker: "KX".to_string(),
+            side: "no".to_string(),
+            current_qty: 3,
+            avg_entry_cents: 20,
+        };
+        let no_short = OpenPositionRow {
+            id: 3,
+            ticker: "KX".to_string(),
+            side: "no".to_string(),
+            current_qty: -3,
+            avg_entry_cents: 20,
+        };
+
+        assert_eq!(position_settlement_pnl(&yes_long, 1.0).unwrap(), 120);
+        assert_eq!(position_settlement_pnl(&yes_long, 0.0).unwrap(), -180);
+        assert_eq!(position_settlement_pnl(&no_long, 0.0).unwrap(), 240);
+        assert_eq!(position_settlement_pnl(&no_short, 0.0).unwrap(), -240);
+    }
+
+    #[test]
+    fn venue_flat_candidates_include_net_zero_db_gross() {
+        let rows = vec![
+            OpenPositionRow {
+                id: 1,
+                ticker: "KX".to_string(),
+                side: "yes".to_string(),
+                current_qty: 2,
+                avg_entry_cents: 50,
+            },
+            OpenPositionRow {
+                id: 2,
+                ticker: "KX".to_string(),
+                side: "no".to_string(),
+                current_qty: 2,
+                avg_entry_cents: 50,
+            },
+        ];
+        let venue = HashMap::new();
+        let (db_open, candidates) = venue_flat_candidates(rows, &venue);
+        assert_eq!(db_open, 1);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].db_qty, 0);
+    }
+
+    #[test]
     fn metrics_are_reasonable_for_perfect_predictions() {
         let samples = vec![
             PredictionOutcome {
@@ -510,5 +955,31 @@ mod tests {
         }]);
         assert_eq!(bins[9].n, 1);
         assert_eq!(bins[9].hit_rate, Some(1.0));
+    }
+
+    fn market_detail(
+        status: &str,
+        result: Option<&str>,
+        settled_time: Option<&str>,
+    ) -> MarketDetail {
+        MarketDetail {
+            ticker: "KX".to_string(),
+            event_ticker: "EV".to_string(),
+            title: "test".to_string(),
+            status: status.to_string(),
+            close_time: "2026-05-08T12:00:00Z".to_string(),
+            expected_expiration_time: None,
+            can_close_early: None,
+            yes_bid_dollars: None,
+            yes_ask_dollars: None,
+            liquidity_dollars: None,
+            volume: None,
+            result: result.map(ToOwned::to_owned),
+            market_result: None,
+            settled_time: settled_time.map(ToOwned::to_owned),
+            floor_strike: None,
+            cap_strike: None,
+            strike_type: None,
+        }
     }
 }
