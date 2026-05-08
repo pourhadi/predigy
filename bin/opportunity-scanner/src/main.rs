@@ -574,13 +574,13 @@ async fn maybe_write(database_url: &str, write: bool, observations: &[Observatio
 async fn insert_observations(pool: &sqlx::PgPool, observations: &[Observation]) -> Result<()> {
     for obs in observations {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO opportunity_observations (
                 strategy, opportunity_key, tickers, kind,
                 raw_edge_cents, net_edge_cents, max_size,
                 would_fire, reason, payload
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            "#,
+            ",
         )
         .bind(obs.strategy)
         .bind(&obs.opportunity_key)

@@ -236,13 +236,13 @@ async fn shadow_write_rules(database_url: &str, rules: &[StatRule]) -> Result<()
     for rule in rules {
         let ticker = rule.kalshi_market.as_str();
         sqlx::query(
-            r#"
+            r"
             INSERT INTO markets (ticker, venue, market_type, title, tags, payload)
             VALUES ($1, 'kalshi', 'binary', $2, $3, $4)
             ON CONFLICT (ticker) DO UPDATE
             SET last_updated_at = now(),
                 payload = COALESCE(markets.payload, EXCLUDED.payload)
-            "#,
+            ",
         )
         .bind(ticker)
         .bind(format!("stat shadow {ticker}"))
@@ -255,10 +255,10 @@ async fn shadow_write_rules(database_url: &str, rules: &[StatRule]) -> Result<()
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             INSERT INTO model_p_snapshots (strategy, ticker, raw_p, model_p, source, detail)
             VALUES ('stat', $1, $2, $2, 'stat-curator-shadow', $3)
-            "#,
+            ",
         )
         .bind(ticker)
         .bind(rule.model_p)
@@ -273,7 +273,7 @@ async fn shadow_write_rules(database_url: &str, rules: &[StatRule]) -> Result<()
         .await?;
 
         sqlx::query(
-            r#"
+            r"
             INSERT INTO rules (
                 strategy, ticker, side, model_p, min_edge_cents,
                 expires_at, source, enabled
@@ -285,7 +285,7 @@ async fn shadow_write_rules(database_url: &str, rules: &[StatRule]) -> Result<()
                 source = EXCLUDED.source,
                 fitted_at = now(),
                 enabled = false
-            "#,
+            ",
         )
         .bind(ticker)
         .bind(side_str(rule.side))

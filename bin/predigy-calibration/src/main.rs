@@ -173,11 +173,11 @@ async fn build_report(pool: &sqlx::PgPool, strategy: &str, window_days: i64) -> 
     let window_start = window_end - Duration::days(window_days);
 
     let n_predictions_i64: i64 = sqlx::query_scalar(
-        r#"
+        r"
         SELECT COUNT(*)
         FROM model_p_snapshots
         WHERE strategy = $1 AND ts >= $2 AND ts <= $3
-        "#,
+        ",
     )
     .bind(strategy)
     .bind(window_start)
@@ -186,7 +186,7 @@ async fn build_report(pool: &sqlx::PgPool, strategy: &str, window_days: i64) -> 
     .await?;
 
     let rows = sqlx::query(
-        r#"
+        r"
         SELECT DISTINCT ON (s.strategy, s.ticker)
                s.model_p, st.resolved_value
         FROM model_p_snapshots s
@@ -196,7 +196,7 @@ async fn build_report(pool: &sqlx::PgPool, strategy: &str, window_days: i64) -> 
           AND s.ts <= $3
           AND st.resolved_value BETWEEN 0 AND 1
         ORDER BY s.strategy, s.ticker, s.ts DESC
-        "#,
+        ",
     )
     .bind(strategy)
     .bind(window_start)
@@ -245,7 +245,7 @@ async fn sync_settlements(
 ) -> Result<usize> {
     let window_start = Utc::now() - Duration::days(window_days);
     let tickers: Vec<String> = sqlx::query_scalar(
-        r#"
+        r"
         SELECT DISTINCT s.ticker
         FROM model_p_snapshots s
         LEFT JOIN settlements st ON st.ticker = s.ticker
@@ -254,7 +254,7 @@ async fn sync_settlements(
           AND ($2::TEXT IS NULL OR s.strategy = $2)
         ORDER BY s.ticker
         LIMIT $3
-        "#,
+        ",
     )
     .bind(window_start)
     .bind(strategy)
@@ -302,7 +302,7 @@ async fn upsert_market_and_settlement(
         "strike_type": detail.strike_type,
     });
     sqlx::query(
-        r#"
+        r"
         INSERT INTO markets (
             ticker, venue, market_type, title, settlement_ts,
             close_time, tags, payload
@@ -313,7 +313,7 @@ async fn upsert_market_and_settlement(
             close_time = COALESCE(EXCLUDED.close_time, markets.close_time),
             payload = EXCLUDED.payload,
             last_updated_at = now()
-        "#,
+        ",
     )
     .bind(&detail.ticker)
     .bind(&detail.title)
@@ -328,7 +328,7 @@ async fn upsert_market_and_settlement(
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO settlements (ticker, resolved_value, settled_at, source, payload)
         VALUES ($1, $2, $3, 'kalshi-market-detail', $4)
         ON CONFLICT (ticker) DO UPDATE
@@ -336,7 +336,7 @@ async fn upsert_market_and_settlement(
             settled_at = EXCLUDED.settled_at,
             source = EXCLUDED.source,
             payload = EXCLUDED.payload
-        "#,
+        ",
     )
     .bind(&detail.ticker)
     .bind(outcome)
@@ -443,13 +443,13 @@ fn build_bins(samples: &[PredictionOutcome]) -> Vec<BinReport> {
 
 async fn insert_report(pool: &sqlx::PgPool, report: &Report) -> Result<()> {
     sqlx::query(
-        r#"
+        r"
         INSERT INTO calibration_reports (
             strategy, window_start, window_end, n_predictions,
             n_settled, brier, log_loss, net_pnl_cents,
             baseline, bins, diagnosis
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-        "#,
+        ",
     )
     .bind(&report.strategy)
     .bind(report.window_start)
