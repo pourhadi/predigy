@@ -123,6 +123,11 @@ pub struct WxStatConfig {
     /// used to suppress predictable cap rejects before creating an
     /// intent. Risk remains authoritative; this only saves churn.
     pub max_open_contracts_per_side: i32,
+    /// Mirror of the OMS per-strategy notional cap. The strategy
+    /// uses this only to suppress predictable cap rejects before
+    /// constructing intents; the OMS remains authoritative. `0`
+    /// disables the local pre-check.
+    pub max_notional_cents: i64,
     /// Mirror of the risk engine's daily-loss cap. When the local
     /// conservative mark-to-market is already below this breaker,
     /// wx-stat stops constructing new entry intents and lets open
@@ -144,6 +149,8 @@ impl WxStatConfig {
     /// - `PREDIGY_WX_STAT_RULE_REFRESH_MS` (u64)
     /// - `PREDIGY_WX_STAT_MAX_OPEN_CONTRACTS_PER_SIDE` (i32,
     ///   default mirrors `PREDIGY_MAX_CONTRACTS_PER_SIDE` or 20)
+    /// - `PREDIGY_WX_STAT_MAX_NOTIONAL_CENTS` (i64,
+    ///   default mirrors `PREDIGY_MAX_NOTIONAL_CENTS` or disabled)
     /// - `PREDIGY_WX_STAT_MAX_DAILY_LOSS_CENTS` (i64,
     ///   default mirrors `PREDIGY_MAX_DAILY_LOSS_CENTS` or disabled)
     #[must_use]
@@ -167,6 +174,10 @@ impl WxStatConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20),
+            max_notional_cents: std::env::var("PREDIGY_MAX_NOTIONAL_CENTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             max_daily_loss_cents: std::env::var("PREDIGY_MAX_DAILY_LOSS_CENTS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -222,6 +233,11 @@ impl WxStatConfig {
         {
             c.max_open_contracts_per_side = n;
         }
+        if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MAX_NOTIONAL_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.max_notional_cents = n;
+        }
         if let Ok(v) = std::env::var("PREDIGY_WX_STAT_MAX_DAILY_LOSS_CENTS")
             && let Ok(n) = v.parse()
         {
@@ -262,6 +278,7 @@ pub struct WxStatStrategy {
     /// rejects before creating an intent.
     positions: HashMap<String, i32>,
     daily_pnl_cents: Option<i64>,
+    strategy_notional_cents: Option<i64>,
     last_position_refresh: Option<Instant>,
     /// Tickers we've already self-subscribed to. Bounded growth
     /// (one per market the curator has ever proposed since boot).
@@ -278,6 +295,7 @@ impl WxStatStrategy {
             last_rule_refresh: None,
             positions: HashMap::new(),
             daily_pnl_cents: None,
+            strategy_notional_cents: None,
             last_position_refresh: None,
             subscribed: HashSet::new(),
         }
@@ -455,13 +473,8 @@ impl WxStatStrategy {
             return None;
         }
         let (ask_cents, available_qty) = derive_ask(book, rule.side)?;
-        let position_key = position_key(market.as_str(), rule.side);
-        let open_qty = self
-            .positions
-            .get(&position_key)
-            .copied()
-            .unwrap_or(0)
-            .max(0);
+        let pos_key = position_key(market.as_str(), rule.side);
+        let open_qty = self.positions.get(&pos_key).copied().unwrap_or(0).max(0);
         let remaining = self.config.max_open_contracts_per_side - open_qty;
         if remaining <= 0 {
             debug!(
@@ -473,8 +486,49 @@ impl WxStatStrategy {
             );
             return None;
         }
-        let available_qty = available_qty.min(u32::try_from(remaining).ok()?);
+        let mut available_qty = available_qty.min(u32::try_from(remaining).ok()?);
+        if self.config.max_notional_cents > 0
+            && let Some(current_notional) = self.strategy_notional_cents
+        {
+            let remaining_notional = self.config.max_notional_cents - current_notional;
+            if remaining_notional <= 0 {
+                debug!(
+                    ticker = %market.as_str(),
+                    current_notional_cents = current_notional,
+                    cap_cents = self.config.max_notional_cents,
+                    "wx-stat: entry blocked by local strategy notional cap"
+                );
+                return None;
+            }
+            let by_notional = u32::try_from(remaining_notional / i64::from(ask_cents)).ok()?;
+            if by_notional == 0 {
+                debug!(
+                    ticker = %market.as_str(),
+                    ask_cents,
+                    remaining_notional_cents = remaining_notional,
+                    cap_cents = self.config.max_notional_cents,
+                    "wx-stat: entry blocked by local strategy notional headroom"
+                );
+                return None;
+            }
+            available_qty = available_qty.min(by_notional);
+        }
         let intent = build_intent(market, rule, &self.config, ask_cents, available_qty)?;
+        // Reserve the locally-projected exposure immediately. The
+        // authoritative OMS/DB position updates arrive asynchronously
+        // through the venue/fill path, and multiple book events can
+        // otherwise construct intents inside that short window even
+        // though the first accepted order already consumed the
+        // strategy notional/side-cap headroom.
+        let added_notional = i64::from(intent.price_cents.unwrap_or(i32::from(ask_cents)))
+            * i64::from(intent.qty.max(0));
+        if let Some(current) = self.strategy_notional_cents.as_mut() {
+            *current += added_notional;
+        }
+        self.positions
+            .entry(position_key(intent.market.as_str(), intent.side))
+            .and_modify(|q| *q += intent.qty.max(0))
+            .or_insert(intent.qty.max(0));
         self.last_fire_at.insert(key, now);
         Some(intent)
     }
@@ -501,6 +555,8 @@ impl WxStatStrategy {
             state.subscribe_to_markets(added);
         }
         self.daily_pnl_cents = Some(state.db.daily_pnl_with_marks(STRATEGY_ID.0).await?);
+        self.strategy_notional_cents =
+            Some(state.db.strategy_open_notional_cents(STRATEGY_ID.0).await?);
         self.positions = next;
         self.last_position_refresh = Some(Instant::now());
         Ok(())
@@ -728,6 +784,7 @@ mod tests {
             max_notional_per_fire_cents: 500,
             min_ask_cents: 5,
             max_open_contracts_per_side: 20,
+            max_notional_cents: 0,
             max_daily_loss_cents: 0,
         }
     }
@@ -853,6 +910,61 @@ mod tests {
         let market = MarketTicker::new("KX-LOSS");
         let book = book_with_quotes(Some(20), Some(30));
         assert!(s.evaluate(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn entry_blocked_when_local_strategy_notional_cap_reached() {
+        let mut cfg = cfg(PathBuf::from("/dev/null"));
+        cfg.max_notional_cents = 4_000;
+        let mut s = WxStatStrategy::new(cfg);
+        s.rules
+            .insert("KX-NOTIONAL".into(), cached_rule(Side::Yes, 0.95, 3));
+        s.strategy_notional_cents = Some(4_000);
+        let market = MarketTicker::new("KX-NOTIONAL");
+        let book = book_with_quotes(Some(20), Some(30));
+        assert!(s.evaluate(&market, &book, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn local_notional_reservation_blocks_burst_after_fire() {
+        let mut cfg = cfg(PathBuf::from("/dev/null"));
+        cfg.max_notional_cents = 4_000;
+        cfg.max_size = 10;
+        let mut s = WxStatStrategy::new(cfg);
+        s.strategy_notional_cents = Some(3_860);
+        s.rules
+            .insert("KX-NOTIONAL-A".into(), cached_rule(Side::Yes, 0.95, 3));
+        s.rules
+            .insert("KX-NOTIONAL-B".into(), cached_rule(Side::Yes, 0.95, 3));
+        let book = book_with_quotes(Some(20), Some(30)); // YES ask 70
+        let first = s
+            .evaluate(&MarketTicker::new("KX-NOTIONAL-A"), &book, Instant::now())
+            .expect("headroom allows two contracts");
+        assert_eq!(first.qty, 2);
+        assert!(
+            s.evaluate(&MarketTicker::new("KX-NOTIONAL-B"), &book, Instant::now())
+                .is_none(),
+            "local reservation should consume notional headroom before DB refresh"
+        );
+    }
+
+    #[test]
+    fn entry_size_reduced_to_remaining_local_strategy_notional_cap() {
+        let mut cfg = cfg(PathBuf::from("/dev/null"));
+        cfg.max_notional_cents = 4_000;
+        cfg.max_size = 10;
+        let mut s = WxStatStrategy::new(cfg);
+        s.rules
+            .insert("KX-NOTIONAL-ROOM".into(), cached_rule(Side::Yes, 0.95, 3));
+        // YES ask = 70c; 150c headroom allows two contracts, not
+        // the ten contracts Kelly/max_size would otherwise permit.
+        s.strategy_notional_cents = Some(3_850);
+        let market = MarketTicker::new("KX-NOTIONAL-ROOM");
+        let book = book_with_quotes(Some(20), Some(30));
+        let intent = s
+            .evaluate(&market, &book, Instant::now())
+            .expect("notional headroom allows reduced entry");
+        assert_eq!(intent.qty, 2);
     }
 
     #[test]

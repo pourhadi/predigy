@@ -82,6 +82,24 @@ impl Db {
         Ok(rows)
     }
 
+    /// Current open-position notional for one strategy using the same
+    /// basis shape as the live OMS notional cap: sum of
+    /// `ABS(current_qty) * avg_entry_cents` across open rows. Used by
+    /// strategies only to avoid constructing intents that the OMS is
+    /// guaranteed to reject; the OMS remains authoritative.
+    pub async fn strategy_open_notional_cents(&self, strategy: &str) -> Result<i64, sqlx::Error> {
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(ABS(current_qty)::BIGINT * avg_entry_cents::BIGINT)::BIGINT
+               FROM positions
+              WHERE strategy = $1
+                AND closed_at IS NULL",
+        )
+        .bind(strategy)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total.unwrap_or(0))
+    }
+
     /// Per-strategy daily P&L using the same conservative mark logic
     /// as the live OMS risk check. Used by strategies only to avoid
     /// repeatedly constructing intents that the OMS daily-loss breaker
