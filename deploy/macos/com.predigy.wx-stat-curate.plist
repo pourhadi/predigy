@@ -15,11 +15,14 @@
          Same-day/past temperature markets are gated through ASOS
          observed extremes before forecast/NBM scoring.
 
-         Cadence: every 3h. NBM qmd publishes only at 00/06/12/18
-         UTC (4 cycles/day), but with the 13h lookback the curator
-         lands in a fully-published cycle every tick. The 3h cron
-         schedule means every cycle gets re-run twice as fresh
-         observations / Kalshi quotes come in.
+         Cadence: hourly. NBM qmd publishes only at 00/06/12/18
+         UTC (4 cycles/day), but the curator's 13h lookback lands
+         in a fully-published cycle every tick. Hourly means each
+         NBM cycle gets re-run ~6 times as observed-extreme gating
+         and Kalshi quotes refresh; same-day temperature markets
+         that hit observation extremes mid-day get re-evaluated
+         within an hour rather than waiting for the next 3h cron.
+         A no-change tick is cheap — pure REST + S3 + DB writes.
 
          Pre-flight: the script refuses to start if NWS_USER_AGENT
          isn't set in ~/.zprofile (NOAA's bucket doesn't gate on
@@ -38,18 +41,15 @@
         <string>exec /Users/dan/code/predigy/deploy/scripts/wx-stat-curate.sh</string>
     </array>
 
-    <!-- Every 3h: 03/06/09/12/15/18/21/00 local. -->
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
-    </array>
+    <!-- Hourly. StartInterval rather than StartCalendarInterval
+         keeps it simple. Combined with RunAtLoad below, the rule
+         file is never more than ~1h stale (and is fresh
+         immediately after a re-install / boot). -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
 
     <!-- Re-curate immediately on enable so the rule file is fresh
          the moment the operator flips Disabled=false. -->

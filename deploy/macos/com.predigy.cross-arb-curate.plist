@@ -20,13 +20,17 @@
     </array>
 
     <!-- Run once 30 s after load (catches up after a reboot) and
-         then every 10 min. The seen-set keeps the LLM call free
-         when nothing new surfaces. -->
+         then every 2 min. The incremental seen-set keeps the LLM
+         call free when nothing new has surfaced — most ticks are
+         a pair of cheap REST polls and zero Anthropic tokens.
+         Tightened from the previous 10-min cadence so newly-
+         listed Polymarket markets flow into the pair file with
+         < 2 min latency. -->
     <key>RunAtLoad</key>
     <true/>
 
     <key>StartInterval</key>
-    <integer>600</integer>
+    <integer>120</integer>
 
     <key>ThrottleInterval</key>
     <integer>30</integer>
