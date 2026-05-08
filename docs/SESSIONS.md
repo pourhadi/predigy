@@ -168,7 +168,8 @@ Engine + dashboard both poll the file every 5 seconds. Engine logs
    all strategy entries because unrelated held positions have stale marks; stale
    marks are valued conservatively for daily-loss checks, while `stat` and
    `wx-stat` self-subscribe held-position tickers so marks can recover after
-   rules roll off.
+   rules roll off. Follow-up: leg-group submits now use the same conservative
+   stale/missing-mark daily-loss valuation instead of refusing the whole group.
 8. **Latency stale-replay guard is fixed.** NWS alerts now require fresh onset
    or effective timestamps, reject expired or missing-timestamp alerts, and use
    a stable full-alert SHA-256 hash in cids instead of a shared short prefix.

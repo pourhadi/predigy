@@ -218,7 +218,6 @@ impl DbBackedOms {
             in_flight: i32::try_from(in_flight.0).unwrap_or(i32::MAX),
             orders_in_rate_window: u32::try_from(rate_count.0).unwrap_or(u32::MAX),
             daily_pnl_cents: daily.pnl_cents,
-            missing_recent_mark: daily.missing_recent_mark,
         })
     }
 
@@ -472,17 +471,6 @@ impl Oms for DbBackedOms {
             return Ok(SubmitGroupOutcome::Rejected {
                 reason: RejectionReason::DailyLossExceeded {
                     strategy: first.strategy,
-                },
-                failing_client_id: first.client_id.clone(),
-            });
-        }
-        if baseline.missing_recent_mark {
-            return Ok(SubmitGroupOutcome::Rejected {
-                reason: RejectionReason::InvalidIntent {
-                    reason: format!(
-                        "missing recent mark for open {} positions; refusing leg group",
-                        first.strategy
-                    ),
                 },
                 failing_client_id: first.client_id.clone(),
             });
@@ -901,7 +889,6 @@ struct ExposureSnapshot {
     in_flight: i32,
     orders_in_rate_window: u32,
     daily_pnl_cents: i64,
-    missing_recent_mark: bool,
 }
 
 #[derive(Debug)]
@@ -913,7 +900,6 @@ struct PositionProjection {
 #[derive(Debug)]
 struct DailyPnlSnapshot {
     pnl_cents: i64,
-    missing_recent_mark: bool,
 }
 
 async fn lock_submit_section(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> EngineResult<()> {
@@ -980,7 +966,6 @@ async fn daily_pnl_with_marks(
     .await?;
 
     let mut pnl = 0_i64;
-    let mut missing_recent_mark = false;
     let now = chrono::Utc::now();
     for (qty, side, avg_entry, realized, fees, bid, ask, mark_ts) in rows {
         pnl += realized - fees;
@@ -988,18 +973,12 @@ async fn daily_pnl_with_marks(
             continue;
         }
         let recent = mark_ts.is_some_and(|ts| now.signed_duration_since(ts).num_seconds() <= 120);
-        if !recent {
-            missing_recent_mark = true;
-            continue;
-        }
-        let (mark_cents, conservative) = risk_mark_cents(&side, qty, bid, ask, recent);
-        missing_recent_mark |= conservative;
+        // Stale or missing marks are valued pessimistically instead of bypassing
+        // the daily-loss gate.
+        let (mark_cents, _conservative) = risk_mark_cents(&side, qty, bid, ask, recent);
         pnl += i64::from(mark_cents - avg_entry) * i64::from(qty.signum()) * i64::from(qty.abs());
     }
-    Ok(DailyPnlSnapshot {
-        pnl_cents: pnl,
-        missing_recent_mark,
-    })
+    Ok(DailyPnlSnapshot { pnl_cents: pnl })
 }
 
 fn domain_mark_cents(
