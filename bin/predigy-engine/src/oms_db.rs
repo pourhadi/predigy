@@ -1558,7 +1558,7 @@ mod tests {
             market_ticker: Some("KX-TEST".into()),
             ticker: None,
             side: "yes".into(),
-            action: "".into(),
+            action: String::new(),
             count_fp: "1.00".into(),
             yes_price_dollars: "0.84".into(),
             no_price_dollars: "0.16".into(),

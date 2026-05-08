@@ -56,6 +56,7 @@ use predigy_engine_core::strategy::{Strategy, StrategyId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -554,7 +555,10 @@ fn alert_hash(alert_id: &str, rule_idx: usize, ticker: &str) -> String {
     hasher.update(b"|");
     hasher.update(ticker.as_bytes());
     let digest = hasher.finalize();
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest[..8].iter().fold(String::new(), |mut out, b| {
+        let _ = write!(&mut out, "{b:02x}");
+        out
+    })
 }
 
 fn alert_is_fresh(
