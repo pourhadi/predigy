@@ -33,6 +33,7 @@ launchctl list | grep predigy
 | `com.predigy.opportunity-scanner` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. | scheduled every **5m** (post-2026-05-09) |
 | `com.predigy.calibration` | Settlement sync + reliability report writer. | scheduled hourly |
 | `com.predigy.arb-config-curate` | Validates implication-arb / internal-arb configs against Kalshi state, drops settled, seeds new active ladders + 2-leg families. | scheduled every 30m + RunAtLoad (post-2026-05-08) |
+| `com.predigy.paper-trader` | Shadow-executes stat-curator rules vs live Kalshi prices into `paper_trades`; reconciles on settlement. **No orders submitted.** Evidence layer gating `stat` re-enable. | scheduled every 5m (post-2026-05-09) |
 
 `com.predigy.import` is intentionally **disabled**. With legacy traders
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from

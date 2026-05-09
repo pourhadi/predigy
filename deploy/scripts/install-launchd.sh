@@ -65,11 +65,13 @@ require_file "${PREDIGY_HOME}/target/release/predigy-engine" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p predigy-engine)"
 require_file "${PREDIGY_HOME}/target/release/arb-config-curator" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p arb-config-curator)"
+require_file "${PREDIGY_HOME}/target/release/predigy-paper-trader" \
+    "build with: (cd $PREDIGY_HOME && cargo build --release -p predigy-paper-trader)"
 [[ "$fail" -eq 0 ]] || { echo ""; echo "preflight failed; fix the FAILs above"; exit 1; }
 
 echo ""
 echo "=== installing plists ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader com.predigy.wx-stat-curate com.predigy.arb-config-curate com.predigy.engine; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader com.predigy.wx-stat-curate com.predigy.arb-config-curate com.predigy.paper-trader com.predigy.engine; do
     src="${PLIST_SRC}/${name}.plist"
     dst="${LAUNCH_AGENTS}/${name}.plist"
     cp "$src" "$dst"
@@ -82,7 +84,7 @@ done
 
 echo ""
 echo "=== status ==="
-for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader com.predigy.wx-stat-curate com.predigy.arb-config-curate com.predigy.engine; do
+for name in com.predigy.latency-trader com.predigy.wx-curate com.predigy.dashboard com.predigy.cross-arb com.predigy.cross-arb-curate com.predigy.settlement com.predigy.stat-curate com.predigy.stat-trader com.predigy.wx-stat-curate com.predigy.arb-config-curate com.predigy.paper-trader com.predigy.engine; do
     if launchctl print "gui/$(id -u)/${name}" >/dev/null 2>&1; then
         state=$(launchctl print "gui/$(id -u)/${name}" | grep -E "state\s*=" | head -1 | xargs || true)
         echo "  ${name}: ${state:-loaded}"
