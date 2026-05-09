@@ -37,6 +37,6 @@ exec "./target/release/stat-curator" \
     --output        "${CONFIG_DIR}/stat-rules.json" \
     --batch-size         "${PREDIGY_STAT_CURATE_BATCH:-25}" \
     --max-batches        "${PREDIGY_STAT_CURATE_MAX_BATCHES:-4}" \
-    --max-days-to-settle "${PREDIGY_STAT_CURATE_MAX_DAYS:-14}" \
+    --max-days-to-settle "${PREDIGY_STAT_CURATE_MAX_DAYS:-3}" \
     --shadow-db \
     --write
