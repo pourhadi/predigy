@@ -824,7 +824,9 @@ mod tests {
             &book_with_yes_ask(30, 100),
         );
         // Without exposure: fires.
-        let group = s.evaluate_family(0, Instant::now()).expect("baseline fires");
+        let group = s
+            .evaluate_family(0, Instant::now())
+            .expect("baseline fires");
         assert_eq!(group.intents.len(), 2);
 
         // Now mark the cheap leg as already exposed (the leftover
