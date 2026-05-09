@@ -14,6 +14,70 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-09 01:53 UTC — internal-arb anti-legging gate
+
+**Why**: the post-cap-raise audit at ~01:25 UTC found
+internal-arb was systematically legging in production. Across the
+prior 30 min, 9 families were re-firing every minute (tighter than
+the 60s cooldown should have allowed because the cooldown timer is
+per-family but there's no "still working a prior group" gate). The
+cheap-leg IOC kept lifting (BUF@2, BAL@8, KC@18 etc.), the
+expensive-leg IOC kept getting cancelled by the venue (no
+liquidity at the offered price), and we accumulated naked
+underdog YES contracts: 9 BUF, 19 BAL, 6 KC, 11 CWS, 18 MTL — none
+of these are arbs, all are coin-flip directional EV-zero lottery
+tickets that bleed double fees per cycle.
+
+The strategy doc at the top of `crates/strategies/internal-arb`
+explicitly listed "no partial-fill recovery" as a known gap. The
+cap raise put the binding constraint on opportunity stacking
+rather than on firing rate, which is what surfaced it.
+
+**Fix landed**:
+
+- `internal-arb` now maintains an `exposed_tickers: HashSet<String>`
+  rebuilt from `Db::open_positions(strategy)` +
+  `Db::active_intents(strategy)` on every BookUpdate that lands on
+  a configured ticker (matching `implication-arb`'s already-shipped
+  inventory-refresh pattern at `crates/strategies/implication-arb/src/lib.rs:731`).
+- `evaluate_family` returns `None` if any leg ticker is in the set.
+- After enqueueing a leg group in `on_event`, the about-to-submit
+  legs are reserved into `exposed_tickers` so a second BookUpdate
+  in the same loop tick can't double-fire.
+- New test `skips_family_when_any_leg_has_existing_exposure` proves
+  the gate. All 11 unit tests pass.
+
+**Operational sequence**:
+
+1. 01:30–01:44 UTC — diagnosed legging via fills query
+2. 01:45 UTC — commented out `PREDIGY_INTERNAL_ARB_CONFIG` in
+   `~/.zprofile` and bounced engine to halt the bleed
+3. ~01:50 UTC — fix coded + tested
+4. 01:52:56 UTC — re-enabled env var, bounced engine
+5. 01:53:01 UTC — internal-arb registered (122 markets, 61
+   families); first exposure refresh logged
+   `n_exposed_tickers=11`
+6. Zero new internal-arb intents post-bounce; 52 unlegged families
+   remain free to fire when fresh edge appears
+
+**Naked positions left to settle naturally**: ~$1.50 entered cost
+across 9 sports families (all settle tonight 2026-05-08
+21:40–22:15 PDT). EV ≈ 0 at entry price; selling now would lock a
+small loss + double fees. Holding.
+
+**Deliberate non-goals for this PR**:
+- The OMS-side cancellation cascade still only fires on
+  `Rejected | Expired` (`bin/predigy-engine/src/oms_db.rs:679`).
+  Extending it to fire on `Filled` to cancel siblings the
+  *moment* the cheap leg lifts would prevent the venue ever
+  seeing the unhedged sibling. Strategy-side gate is enough to
+  stop the stacking pathology; OMS cascade extension is a
+  follow-up.
+- The gate is conservative — it blocks **balanced** re-fires too
+  (COLPHI 7+7 is a real arb pair we could scale further). Refining
+  to "block only when unbalanced" is a follow-up if throughput
+  proves constraining.
+
 ## 2026-05-09 01:05 UTC — arb scaling raise
 
 **Why**: math-proven arbs (`internal-arb`, `implication-arb`) lock

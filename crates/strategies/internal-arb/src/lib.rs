@@ -50,6 +50,7 @@ use async_trait::async_trait;
 use predigy_book::OrderBook;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
+use predigy_engine_core::db::Db;
 use predigy_engine_core::events::Event;
 use predigy_engine_core::intent::{
     Intent, IntentAction, LegGroup, OrderType, Tif, cid_safe_ticker,
@@ -57,7 +58,7 @@ use predigy_engine_core::intent::{
 use predigy_engine_core::state::StrategyState;
 use predigy_engine_core::strategy::{Strategy, StrategyId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -291,6 +292,17 @@ pub struct InternalArbStrategy {
     last_fire_at: HashMap<String, Instant>,
     last_config_refresh: Option<Instant>,
     pending_groups: Vec<LegGroup>,
+    /// 2026-05-09 anti-legging gate. Tickers where this strategy
+    /// has either an open position (`current_qty != 0`) or an
+    /// in-flight non-terminal intent. Rebuilt from
+    /// `Db::open_positions` + `Db::active_intents` on every
+    /// BookUpdate that lands on a configured ticker (matching the
+    /// implication-arb inventory-refresh pattern). Any family
+    /// whose tickers overlap this set is skipped in
+    /// `evaluate_family`, preventing the "cheap leg lifts every
+    /// minute, expensive leg never lifts, underdog YES exposure
+    /// stacks" pathology that the audit found post-cap-raise.
+    exposed_tickers: HashSet<String>,
 }
 
 impl InternalArbStrategy {
@@ -304,6 +316,7 @@ impl InternalArbStrategy {
             last_fire_at: HashMap::new(),
             last_config_refresh: None,
             pending_groups: Vec::new(),
+            exposed_tickers: HashSet::new(),
         }
     }
 
@@ -313,6 +326,34 @@ impl InternalArbStrategy {
 
     pub fn subscribed_tickers(&self) -> Vec<String> {
         self.ticker_to_families.keys().cloned().collect()
+    }
+
+    /// Rebuild `exposed_tickers` from current open positions +
+    /// in-flight intents. Two small DB reads. Called from
+    /// `on_event` on every BookUpdate that lands on a configured
+    /// ticker.
+    async fn refresh_exposure(
+        &mut self,
+        db: &Db,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut set = HashSet::new();
+        for p in db.open_positions(Some(STRATEGY_ID.0)).await? {
+            if p.current_qty != 0 {
+                set.insert(p.ticker);
+            }
+        }
+        for i in db.active_intents(Some(STRATEGY_ID.0)).await? {
+            set.insert(i.ticker);
+        }
+        if set != self.exposed_tickers {
+            info!(
+                n_exposed_tickers = set.len(),
+                prior = self.exposed_tickers.len(),
+                "internal-arb: exposure set refreshed"
+            );
+        }
+        self.exposed_tickers = set;
+        Ok(())
     }
 
     fn reload_families(&mut self) {
@@ -411,6 +452,24 @@ impl InternalArbStrategy {
             return None;
         }
         if !family.directions.contains(&InternalArbDirection::YesBasket) {
+            return None;
+        }
+        // Anti-legging gate. If any leg of this family already has
+        // open exposure or an in-flight intent, refuse to fire.
+        // Otherwise we'd compound legging — the cheap leg lifts
+        // again, the expensive leg fails again, and we accumulate
+        // naked underdog YES contracts. See `exposed_tickers` doc
+        // for the failure mode.
+        if let Some(exposed) = family
+            .tickers
+            .iter()
+            .find(|t| self.exposed_tickers.contains(*t))
+        {
+            debug!(
+                family = family.family_id,
+                exposed_ticker = exposed,
+                "internal-arb: skip family (existing leg exposure)"
+            );
             return None;
         }
 
@@ -525,7 +584,7 @@ impl Strategy for InternalArbStrategy {
     async fn on_event(
         &mut self,
         ev: &Event,
-        _state: &mut StrategyState,
+        state: &mut StrategyState,
     ) -> Result<Vec<Intent>, Box<dyn std::error::Error + Send + Sync>> {
         let needs_refresh = self
             .last_config_refresh
@@ -542,9 +601,28 @@ impl Strategy for InternalArbStrategy {
                     .get(&key)
                     .cloned()
                     .unwrap_or_default();
+                if candidate_indexes.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // Refresh exposure on every BookUpdate that lands
+                // on a configured ticker. Two small DB reads — the
+                // legging pathology we're guarding against fires
+                // every minute, so 30s-cached exposure data is too
+                // stale (we'd legged a second naked contract before
+                // the cache caught up). The implication-arb
+                // strategy uses the same per-event inventory
+                // refresh pattern.
+                self.refresh_exposure(&state.db).await?;
                 let now = Instant::now();
                 for idx in candidate_indexes {
                     if let Some(group) = self.evaluate_family(idx, now) {
+                        // Reserve the legs we're about to submit so
+                        // a second BookUpdate in the same loop tick
+                        // can't double-fire on the same family.
+                        for intent in &group.intents {
+                            self.exposed_tickers
+                                .insert(intent.market.as_str().to_string());
+                        }
                         self.pending_groups.push(group);
                     }
                 }
@@ -718,6 +796,51 @@ mod tests {
         s.record_book(&MarketTicker::new("KX-P"), &book_with_yes_ask(20, 100));
         // KX-Q never has a book.
         assert!(s.evaluate_family(0, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn skips_family_when_any_leg_has_existing_exposure() {
+        // 2026-05-09 anti-legging gate. After a prior cycle's
+        // cheap leg filled and expensive leg cancelled, the
+        // family has unbalanced exposure. We must not re-fire
+        // the same family — that's how naked underdog YES
+        // contracts stack up.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("families.json");
+        let rules = serde_json::json!({
+            "families": [{
+                "family_id": "LEGGED",
+                "tickers": ["KX-CHEAP", "KX-EXPENSIVE"]
+            }]
+        });
+        std::fs::write(&path, serde_json::to_string(&rules).unwrap()).unwrap();
+
+        let mut s = InternalArbStrategy::new(cfg(path));
+        s.reload_families();
+        // Edge clears comfortably (5¢ + 30¢ = 35¢ for $1 settle).
+        s.record_book(&MarketTicker::new("KX-CHEAP"), &book_with_yes_ask(5, 100));
+        s.record_book(
+            &MarketTicker::new("KX-EXPENSIVE"),
+            &book_with_yes_ask(30, 100),
+        );
+        // Without exposure: fires.
+        let group = s.evaluate_family(0, Instant::now()).expect("baseline fires");
+        assert_eq!(group.intents.len(), 2);
+
+        // Now mark the cheap leg as already exposed (the leftover
+        // from a prior partial-fill cycle) and confirm we refuse.
+        let mut s = InternalArbStrategy::new(cfg(s.config.config_file.clone()));
+        s.reload_families();
+        s.record_book(&MarketTicker::new("KX-CHEAP"), &book_with_yes_ask(5, 100));
+        s.record_book(
+            &MarketTicker::new("KX-EXPENSIVE"),
+            &book_with_yes_ask(30, 100),
+        );
+        s.exposed_tickers.insert("KX-CHEAP".to_string());
+        assert!(
+            s.evaluate_family(0, Instant::now()).is_none(),
+            "should refuse to re-fire family with existing leg exposure"
+        );
     }
 
     #[test]
