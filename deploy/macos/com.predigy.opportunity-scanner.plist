@@ -14,8 +14,11 @@
         <string>exec /Users/dan/code/predigy/deploy/scripts/opportunity-scanner-run.sh</string>
     </array>
 
+    <!-- 2026-05-08 arb-scaling: cadence tightened 15m → 5m so
+         candidate observations refresh before the arb-config-
+         curator's 30m tick can stale on them. -->
     <key>StartInterval</key>
-    <integer>900</integer>
+    <integer>300</integer>
 
     <key>RunAtLoad</key>
     <true/>
