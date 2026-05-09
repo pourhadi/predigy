@@ -16,7 +16,7 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-08, post-audit ops cleanup)
+## What is running RIGHT NOW (2026-05-09, post arb-scaling raise)
 
 ```
 launchctl list | grep predigy
@@ -30,8 +30,9 @@ launchctl list | grep predigy
 | `com.predigy.wx-curate` | NWS-state-aware weather rule curator. (Was for the now-disabled latency strategy; kept running so rules don't go stale if latency is re-enabled later.) | scheduled |
 | `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. Hourly post-Phase-A. | scheduled |
 | `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080; includes `/calibration`. | running |
-| `com.predigy.opportunity-scanner` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. | scheduled every 15m |
+| `com.predigy.opportunity-scanner` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. | scheduled every **5m** (post-2026-05-09) |
 | `com.predigy.calibration` | Settlement sync + reliability report writer. | scheduled hourly |
+| `com.predigy.arb-config-curate` | Validates implication-arb / internal-arb configs against Kalshi state, drops settled, seeds new active ladders + 2-leg families. | scheduled every 30m + RunAtLoad (post-2026-05-08) |
 
 `com.predigy.import` is intentionally **disabled**. With legacy traders
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
@@ -72,18 +73,22 @@ Plists still on disk under `deploy/macos/`; Phase 7 will delete them once
 
 ## Where money lives
 
-- **Kalshi production account**: $100 deposited, account value roughly
-  mid-$70s after the shake-down / force-flatten period. `KALSHI_KEY_ID`
-  in `~/.zprofile`; PEM at `~/.config/predigy/kalshi.pem`.
-- **Capital caps in the engine** (RiskCaps shake-down defaults):
-  - `max_notional_cents` per strategy: $40 ($4000¢)
-  - `max_global_notional_cents`: $120 ($12000¢)
-  - `max_daily_loss_cents`: $10
-  - `max_contracts_per_side`: 20
-  - `max_in_flight`: 40
-  - Override per-strategy via env vars in `~/.zprofile`
-    (`PREDIGY_MAX_NOTIONAL_CENTS`, `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS`,
-    etc.).
+- **Kalshi production account**: $100 deposited, ~$83 cash as of
+  2026-05-09 01:00 UTC. `KALSHI_KEY_ID` in `~/.zprofile`; PEM at
+  `~/.config/predigy/kalshi.pem`.
+- **Capital caps (2026-05-09 arb-scaling raise)**:
+  - `max_notional_cents` per strategy: **$80** ($8000¢) — was $40
+  - `max_global_notional_cents`: **$200** ($20000¢) — was $120
+  - `max_daily_loss_cents`: **$20** — was $10
+  - `max_contracts_per_side`: **100** — was 20
+  - `max_in_flight`: **80** — was 40
+- **Per-strategy override clamps** (calibration-unproven strategies
+  pinned at the prior shake-down sizing):
+  - `wx-stat`: `MAX_NOTIONAL_CENTS=4000`, `MAX_OPEN_CONTRACTS_PER_SIDE=20`,
+    `MAX_DAILY_LOSS_CENTS=1000`
+  - **Lift these once Brier/log-loss reports show wx-stat
+    positive-EV after fees over ≥30 unforced closed trades.**
+- See `docs/STATE_LOG.md` for the full timeline of cap changes.
 
 ## Kill switch (panic button)
 
@@ -114,8 +119,22 @@ Implemented in the repo for the post-cleanup fill-growth plan:
   `model_p_snapshots`; this starts collecting evidence without
   re-enabling live `stat` trading.
 - `com.predigy.opportunity-scanner` and `com.predigy.calibration` are
-  bootstrapped. Scanner cadence is 15m with paced public orderbook
-  fetches to avoid spending live REST rate budget.
+  bootstrapped. Scanner cadence **5m** (post-2026-05-09; was 15m) with
+  paced public orderbook fetches to avoid spending live REST rate budget.
+- `com.predigy.arb-config-curate` (post-2026-05-08, PR #38) refreshes
+  `implication-arb-config.json` and `internal-arb-config.json` from
+  live Kalshi `status=open` snapshots every 30m, drops settled
+  tickers, seeds new monotonic-ladder pairs and 2-leg families.
+  Strategies hot-reload via mtime poll. Initial bootstrap expanded
+  implication-arb 12 → 248 pairs; internal-arb 2 → 60 families.
+
+## Auto-refresh + scaling timeline
+
+See **`docs/STATE_LOG.md`** for the append-only chronological record
+of every operational change to the running fleet (cap raises, plist
+edits, daemon adds/removes). That doc is the durable signal for
+"what changed and why"; this file (SESSIONS.md) is the "now"
+snapshot.
 
 ## Strategy-by-strategy state
 
@@ -293,12 +312,27 @@ is roughly mid-$70s ($100 deposited net minus shake-down losses).
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.
 
-9. **Cap raises are gated on edge proof.** Don't raise
-   `PREDIGY_MAX_NOTIONAL_CENTS` / `PREDIGY_MAX_GLOBAL_NOTIONAL_CENTS`
-   in `~/.zprofile` until the surviving strategies show ≥30
-   *unforced* closed trades net positive after fees. Yesterday's
-   force-flatten makes the realized P&L data unreliable; that
-   resets the trade-count clock.
+9. **Cap raises — math-proven arbs scaled 2026-05-09.** Updated rule:
+   the original gate ("≥30 unforced closed trades after fees") still
+   holds for **calibration-dependent strategies** (`wx-stat`, `stat`,
+   `cross-arb`, `settlement`). It does **not** hold for
+   `internal-arb` / `implication-arb` — those lock cash spreads and
+   need throughput, not calibration evidence. As of 2026-05-09 01:05
+   UTC the global caps were doubled (see top "Where money lives"
+   section); `wx-stat` was simultaneously pinned at the prior
+   shake-down sizing via `PREDIGY_WX_STAT_*` env clamps so it does
+   not auto-scale. Lift the wx-stat clamp once Brier reports show
+   positive after-fee EV over ≥30 unforced closed trades. The
+   `stat` strategy remains gated (only 1 residual rule active).
+
+10. **News-trader rebuild plan drafted (deferred).** See
+    `plans/2026-05-08-news-trader-implementation.md`. Research
+    showed the breaking-news speed race is unwinnable from a
+    laptop without enterprise wires; plan pivots to scheduled
+    macro releases (free BLS/Fed/Treasury RSS, Claude Haiku 4.5
+    classifier with cached prompt), slow news, and long-tail
+    markets where institutional desks aren't competing. Phase 1 is
+    not yet implemented — arb scaling has priority until proven.
 
 ## Things to be careful about
 
