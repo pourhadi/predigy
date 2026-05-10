@@ -67,6 +67,48 @@ flatten.
 rule). Implication-arb has ~$1+ of locked floor profit waiting on
 PAYROLLS calendar dates (June–October).
 
+## 2026-05-09 03:30 UTC — calibration cron 1h → 15m
+
+**Why**: the engine's internal `reconcile_positions` runs every
+minute and only OBSERVES drift — it doesn't auto-resolve. The
+hourly `predigy-calibration reconcile-venue-flat --write` is the
+auto-resolver. That meant every settled-but-DB-still-open phantom
+generated up to 60 min of "position_mismatches" drift warnings
+before getting cleaned up.
+
+The phantom problem self-fixed at 03:21 UTC when the hourly cron
+ran and closed all 7 stale rows from tonight's MLB/NHL games
+(same families described in the 01:53 UTC anti-legging entry
+below):
+
+| Game | Outcome | Realized delta |
+|---|---|---:|
+| COLPHI-COL YES @41 | COL won | +$4.13 |
+| COLPHI-PHI YES @36 | PHI lost | -$2.52 |
+| MINCLE-CLE YES @89 | CLE won | +$0.11 |
+| DETKC-KC YES @17 | KC won | +$4.98 |
+| SEACWS-CWS YES @27 | CWS lost | -$2.97 |
+| CHCTEX-TEX YES @19 | TEX lost | -$0.19 |
+| MTLBUF-BUF YES @1 | BUF lost | -$0.18 |
+| **Net** | | **+$3.36** |
+
+The legging incident was actually neutral-to-positive on
+settlement — three underdogs we'd accumulated naked YES on
+actually won.
+
+**Changed**: `deploy/macos/com.predigy.calibration.plist`
+`StartInterval` 3600 → 900. Now the engine reconciler's drift
+warnings clear within ≤15 min of a settlement instead of ≤60 min.
+Reloaded via `launchctl bootout` + `bootstrap`; the script
+(sync-settlements + reconcile-venue-flat + reports) is light
+enough to run 4×/hour without strain.
+
+**Deferred**: a tighter long-term fix would have the engine's own
+`reconcile_positions` do the close-against-settled-outcome work
+itself, eliminating the duplication of "two reconcilers, one
+observation-only and one writing." Cadence tighten is the
+pragmatic v1.
+
 ## 2026-05-09 01:53 UTC — internal-arb anti-legging gate
 
 **Why**: the post-cap-raise audit at ~01:25 UTC found
@@ -116,7 +158,8 @@ rather than on firing rate, which is what surfaced it.
 **Naked positions left to settle naturally**: ~$1.50 entered cost
 across 9 sports families (all settle tonight 2026-05-08
 21:40–22:15 PDT). EV ≈ 0 at entry price; selling now would lock a
-small loss + double fees. Holding.
+small loss + double fees. Holding. (Confirmed +$3.36 net at
+settlement — see the 03:30 UTC entry above.)
 
 **Deliberate non-goals for this PR**:
 - The OMS-side cancellation cascade still only fires on
