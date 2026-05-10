@@ -15,8 +15,15 @@
         <string>exec /Users/dan/code/predigy/deploy/scripts/predigy-calibration-run.sh</string>
     </array>
 
+    <!-- 2026-05-09: cadence 1h → 15m. The bundled `reconcile-venue-flat
+         --write` step is the auto-resolver for phantom DB rows that the
+         engine's internal reconciler observes-only. At 1h cadence the
+         engine spams "position_mismatches" drift warnings for up to 60
+         min after each game settles. 15 min cuts that to ≤15 min. The
+         sync-settlements + report steps are wider work but light enough
+         to also run 4x/hour without strain. -->
     <key>StartInterval</key>
-    <integer>3600</integer>
+    <integer>900</integer>
 
     <key>RunAtLoad</key>
     <true/>

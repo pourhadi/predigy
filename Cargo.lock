@@ -1944,6 +1944,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "predigy-paper-trader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "predigy-core",
+ "predigy-kalshi-rest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "stat-trader",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "predigy-poly-md"
 version = "0.1.0"
 dependencies = [

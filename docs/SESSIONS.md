@@ -33,20 +33,27 @@ launchctl list | grep predigy
 | `com.predigy.opportunity-scanner` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. | scheduled every **5m** (post-2026-05-09) |
 | `com.predigy.calibration` | Settlement sync + reliability report writer. | scheduled hourly |
 | `com.predigy.arb-config-curate` | Validates implication-arb / internal-arb configs against Kalshi state, drops settled, seeds new active ladders + 2-leg families. | scheduled every 30m + RunAtLoad (post-2026-05-08) |
+| `com.predigy.paper-trader` | Shadow-executes stat-curator rules vs live Kalshi prices into `paper_trades`; reconciles on settlement. **No orders submitted.** Evidence layer gating `stat` re-enable. | scheduled every 5m (post-2026-05-09) |
 
 `com.predigy.import` is intentionally **disabled**. With legacy traders
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
 `stat-rules.json` on every import tick.
 
-**Active engine strategies (6, post-2026-05-08 mechanism audit):**
-`stat`, `wx-stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
+**Active engine strategies (5, post-2026-05-09 wx-stat halt):**
+`stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
 
-**Disabled engine strategies (4):** `book-imbalance`, `variance-fade`,
-`latency`, `news-trader`. Disabled by unsetting their config env
-vars in `~/.zprofile` (engine skips registration when
-`PREDIGY_*_CONFIG` / `PREDIGY_*_RULE_FILE` /
+**Disabled engine strategies (5):** `wx-stat`, `book-imbalance`,
+`variance-fade`, `latency`, `news-trader`. Disabled by unsetting
+their config env vars in `~/.zprofile` (engine skips registration
+when `PREDIGY_*_CONFIG` / `PREDIGY_*_RULE_FILE` /
 `PREDIGY_*_ITEMS_FILE` is unset). See `docs/AUDIT_2026-05-08.md`
 for verdicts and re-enable conditions.
+
+`wx-stat` was halted 2026-05-09 17:45 UTC after the first 11
+cleanly settled trades came in 3W/8L (realized -$17.21). YES-side
+hit 0/5 — strategy is structurally negative-EV in production at
+current calibration. Re-enable only after a paper-trading run
+shows positive after-fee EV over ≥30 trades.
 
 Retired (post-cutover): `latency-trader`, `settlement-trader`,
 `stat-trader`, `cross-arb-trader`. As of the 2026-05-08 ops cleanup they
