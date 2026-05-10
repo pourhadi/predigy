@@ -87,6 +87,101 @@ is a ticking measurement apparatus):
 This is the apparatus. The model_p quality is now measured
 continuously — once a category proves itself, we promote.
 
+## 2026-05-09 17:45 UTC — wx-stat HALTED (structurally negative-EV)
+
+**Why**: overnight settlement of wx-stat positions delivered the
+clean evidence we'd been waiting for. **The strategy is
+structurally losing.** Halting before more capital bleeds.
+
+**11 cleanly-settled wx-stat trades since the 2026-05-07 force-flatten** (window
+2026-05-08 19:00 UTC → 2026-05-09 17:00 UTC):
+
+| | Wins | Losses | Realized |
+|---|---:|---:|---:|
+| YES side (5 trades) | 0 | 5 | **-$18.09** |
+| NO side (6 trades) | 3 | 3 | +$2.11 |
+| **Total** | **3** | **8** | **-$15.98** + $1.23 fees = **-$17.21** |
+
+Worst losses concentrated on YES-side overnight low temperatures
+that didn't break the threshold:
+
+- KXLOWTLAX-T59 yes @45 × 20 → -$9.00 (LAX low actual was
+  below 59°F threshold — predicted YES was wrong)
+- KXLOWTOKC-T54 yes @57 × 12 → -$6.84 (OKC low above threshold)
+- KXHIGHTHOU-T76 yes @12 × 15 → -$1.80
+- KXHIGHTSEA-T65 no @22 × 10 → -$2.20
+
+**Account impact**: total liquid moved $73.87 (last night) →
+**$55.48** (now). 18.4% of the drop is wx-stat realized; the rest
+is the natural mark-to-market move on positions that closed at
+$0 vs. an aspirational mark.
+
+**Action**: commented out `PREDIGY_WX_STAT_RULE_FILE` in
+`~/.zprofile`. Engine bounced; 5 strategies registered (no
+wx-stat). Existing wx-stat positions are all closed; nothing to
+flatten.
+
+**Re-enable conditions** (per `docs/AUDIT_2026-05-08.md` updated
+2026-05-09):
+
+1. NBM-quantile model demonstrates positive after-fee EV in a
+   **paper-trading run** (shadow only, no real cash) over ≥30
+   trades.
+2. Brier score better than the naive
+   "always predict 50%" baseline.
+3. YES-side bias root-caused. The current data shows YES is the
+   loser. Either the model systematically over-predicts the long
+   side, or the curator's threshold rounding is off, or
+   intraday weather drift makes morning predictions stale by
+   close. None of those are diagnosed yet.
+
+**What this leaves running**: the math-proven arbs (`internal-arb`,
+`implication-arb`) plus settlement, cross-arb, stat (1 residual
+rule). Implication-arb has ~$1+ of locked floor profit waiting on
+PAYROLLS calendar dates (June–October).
+
+## 2026-05-09 03:30 UTC — calibration cron 1h → 15m
+
+**Why**: the engine's internal `reconcile_positions` runs every
+minute and only OBSERVES drift — it doesn't auto-resolve. The
+hourly `predigy-calibration reconcile-venue-flat --write` is the
+auto-resolver. That meant every settled-but-DB-still-open phantom
+generated up to 60 min of "position_mismatches" drift warnings
+before getting cleaned up.
+
+The phantom problem self-fixed at 03:21 UTC when the hourly cron
+ran and closed all 7 stale rows from tonight's MLB/NHL games
+(same families described in the 01:53 UTC anti-legging entry
+below):
+
+| Game | Outcome | Realized delta |
+|---|---|---:|
+| COLPHI-COL YES @41 | COL won | +$4.13 |
+| COLPHI-PHI YES @36 | PHI lost | -$2.52 |
+| MINCLE-CLE YES @89 | CLE won | +$0.11 |
+| DETKC-KC YES @17 | KC won | +$4.98 |
+| SEACWS-CWS YES @27 | CWS lost | -$2.97 |
+| CHCTEX-TEX YES @19 | TEX lost | -$0.19 |
+| MTLBUF-BUF YES @1 | BUF lost | -$0.18 |
+| **Net** | | **+$3.36** |
+
+The legging incident was actually neutral-to-positive on
+settlement — three underdogs we'd accumulated naked YES on
+actually won.
+
+**Changed**: `deploy/macos/com.predigy.calibration.plist`
+`StartInterval` 3600 → 900. Now the engine reconciler's drift
+warnings clear within ≤15 min of a settlement instead of ≤60 min.
+Reloaded via `launchctl bootout` + `bootstrap`; the script
+(sync-settlements + reconcile-venue-flat + reports) is light
+enough to run 4×/hour without strain.
+
+**Deferred**: a tighter long-term fix would have the engine's own
+`reconcile_positions` do the close-against-settled-outcome work
+itself, eliminating the duplication of "two reconcilers, one
+observation-only and one writing." Cadence tighten is the
+pragmatic v1.
+
 ## 2026-05-09 01:53 UTC — internal-arb anti-legging gate
 
 **Why**: the post-cap-raise audit at ~01:25 UTC found
@@ -136,7 +231,8 @@ rather than on firing rate, which is what surfaced it.
 **Naked positions left to settle naturally**: ~$1.50 entered cost
 across 9 sports families (all settle tonight 2026-05-08
 21:40–22:15 PDT). EV ≈ 0 at entry price; selling now would lock a
-small loss + double fees. Holding.
+small loss + double fees. Holding. (Confirmed +$3.36 net at
+settlement — see the 03:30 UTC entry above.)
 
 **Deliberate non-goals for this PR**:
 - The OMS-side cancellation cascade still only fires on

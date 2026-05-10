@@ -39,15 +39,21 @@ launchctl list | grep predigy
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
 `stat-rules.json` on every import tick.
 
-**Active engine strategies (6, post-2026-05-08 mechanism audit):**
-`stat`, `wx-stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
+**Active engine strategies (5, post-2026-05-09 wx-stat halt):**
+`stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
 
-**Disabled engine strategies (4):** `book-imbalance`, `variance-fade`,
-`latency`, `news-trader`. Disabled by unsetting their config env
-vars in `~/.zprofile` (engine skips registration when
-`PREDIGY_*_CONFIG` / `PREDIGY_*_RULE_FILE` /
+**Disabled engine strategies (5):** `wx-stat`, `book-imbalance`,
+`variance-fade`, `latency`, `news-trader`. Disabled by unsetting
+their config env vars in `~/.zprofile` (engine skips registration
+when `PREDIGY_*_CONFIG` / `PREDIGY_*_RULE_FILE` /
 `PREDIGY_*_ITEMS_FILE` is unset). See `docs/AUDIT_2026-05-08.md`
 for verdicts and re-enable conditions.
+
+`wx-stat` was halted 2026-05-09 17:45 UTC after the first 11
+cleanly settled trades came in 3W/8L (realized -$17.21). YES-side
+hit 0/5 — strategy is structurally negative-EV in production at
+current calibration. Re-enable only after a paper-trading run
+shows positive after-fee EV over ≥30 trades.
 
 Retired (post-cutover): `latency-trader`, `settlement-trader`,
 `stat-trader`, `cross-arb-trader`. As of the 2026-05-08 ops cleanup they
