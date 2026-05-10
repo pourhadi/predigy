@@ -390,6 +390,22 @@ pub struct BookMakerStrategy {
     /// others we leave it None and run without time-aware
     /// behavior. Populated lazily.
     settle_unix: HashMap<String, Option<i64>>,
+    /// Per-ticker cooldown for exit emissions. Without this the
+    /// strategy emits an IOC exit on every BookUpdate that hits
+    /// a ticker with an open underwater position — generating
+    /// thousands of redundant emissions per minute. The OMS
+    /// dedupes on cid (price+minute embedded), so most never
+    /// reach the venue, but the wasted work + log spam is
+    /// significant. Cooldown caps emissions to one per N
+    /// seconds per ticker.
+    last_exit_at: HashMap<String, Instant>,
+    /// Per-ticker cooldown for quote re-emissions. Same idea as
+    /// `last_exit_at` but for the maker's bid/ask churn. With
+    /// 70+ live markets, sub-cent book micro-moves trigger
+    /// constant cancel+repost cycles that blow through the OMS
+    /// in-flight cap. This cooldown bounds re-quote frequency
+    /// to one per N seconds per ticker.
+    last_quote_at: HashMap<String, Instant>,
     last_config_refresh: Option<Instant>,
     pending_intents: Vec<Intent>,
     pending_cancels: Vec<String>,
@@ -406,6 +422,8 @@ impl BookMakerStrategy {
             inventory: HashMap::new(),
             open_legs: HashMap::new(),
             settle_unix: HashMap::new(),
+            last_exit_at: HashMap::new(),
+            last_quote_at: HashMap::new(),
             last_config_refresh: None,
             pending_intents: Vec::new(),
             pending_cancels: Vec::new(),
@@ -548,6 +566,26 @@ impl BookMakerStrategy {
             .map(|s| s >= 0 && s < self.config.pre_settle_flatten_secs)
             .unwrap_or(false);
 
+        // Per-ticker cooldown. The OMS dedupes on cid (price +
+        // minute embedded) so most repeat emissions never reach
+        // the venue — but the strategy work + log spam is
+        // wasteful. 3s default; suspended inside the flatten
+        // window where we want every-tick aggression.
+        let cooldown = if in_flatten_window {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(3)
+        };
+        if let Some(&last) = self.last_exit_at.get(ticker)
+            && last.elapsed() < cooldown
+        {
+            return;
+        }
+        // Track that we considered an exit; even if no threshold
+        // fires this tick we still want the cooldown applied
+        // (otherwise we'd consider every BookUpdate forever).
+        let mut emitted_any = false;
+
         for leg in legs {
             if leg.signed_qty == 0 {
                 continue;
@@ -651,7 +689,14 @@ impl BookMakerStrategy {
                 )),
                 post_only: false,
             });
+            emitted_any = true;
         }
+        // Cooldown timestamp records "we evaluated this ticker
+        // for exit," not just "we emitted." That way a ticker
+        // whose position isn't threshold-tripping yet doesn't
+        // get re-evaluated every BookUpdate either.
+        let _ = emitted_any; // suppress unused-var warning
+        self.last_exit_at.insert(ticker.to_string(), Instant::now());
     }
 
     /// For one configured market, emit any cancels for stale
@@ -700,7 +745,25 @@ impl BookMakerStrategy {
             return;
         }
 
-        // ── 3. Normal quote computation with dynamic skew ──
+        // ── 3. Per-ticker quote cooldown ──
+        // Sub-second book micro-moves trigger constant
+        // cancel+repost churn across 70+ markets, blowing
+        // through the OMS in-flight cap. Limit one re-quote
+        // cycle per ticker per 2s. Inside the flatten window
+        // we skip the cooldown so urgent flatten attempts go
+        // through.
+        let in_flatten = secs_to_settle
+            .map(|s| s >= 0 && s < self.config.pre_settle_flatten_secs)
+            .unwrap_or(false);
+        if !in_flatten
+            && let Some(&last) = self.last_quote_at.get(&ticker)
+            && last.elapsed() < Duration::from_secs(2)
+        {
+            return;
+        }
+        self.last_quote_at.insert(ticker.clone(), Instant::now());
+
+        // ── 4. Normal quote computation with dynamic skew ──
         let inv = self.inventory.get(&ticker).copied().unwrap_or(0);
         let effective_skew = self.effective_skew_for(secs_to_settle);
         let Some((desired_bid, desired_ask)) = compute_desired_quotes(
