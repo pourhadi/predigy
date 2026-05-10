@@ -14,6 +14,59 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-09 17:45 UTC — wx-stat HALTED (structurally negative-EV)
+
+**Why**: overnight settlement of wx-stat positions delivered the
+clean evidence we'd been waiting for. **The strategy is
+structurally losing.** Halting before more capital bleeds.
+
+**11 cleanly-settled wx-stat trades since the 2026-05-07 force-flatten** (window
+2026-05-08 19:00 UTC → 2026-05-09 17:00 UTC):
+
+| | Wins | Losses | Realized |
+|---|---:|---:|---:|
+| YES side (5 trades) | 0 | 5 | **-$18.09** |
+| NO side (6 trades) | 3 | 3 | +$2.11 |
+| **Total** | **3** | **8** | **-$15.98** + $1.23 fees = **-$17.21** |
+
+Worst losses concentrated on YES-side overnight low temperatures
+that didn't break the threshold:
+
+- KXLOWTLAX-T59 yes @45 × 20 → -$9.00 (LAX low actual was
+  below 59°F threshold — predicted YES was wrong)
+- KXLOWTOKC-T54 yes @57 × 12 → -$6.84 (OKC low above threshold)
+- KXHIGHTHOU-T76 yes @12 × 15 → -$1.80
+- KXHIGHTSEA-T65 no @22 × 10 → -$2.20
+
+**Account impact**: total liquid moved $73.87 (last night) →
+**$55.48** (now). 18.4% of the drop is wx-stat realized; the rest
+is the natural mark-to-market move on positions that closed at
+$0 vs. an aspirational mark.
+
+**Action**: commented out `PREDIGY_WX_STAT_RULE_FILE` in
+`~/.zprofile`. Engine bounced; 5 strategies registered (no
+wx-stat). Existing wx-stat positions are all closed; nothing to
+flatten.
+
+**Re-enable conditions** (per `docs/AUDIT_2026-05-08.md` updated
+2026-05-09):
+
+1. NBM-quantile model demonstrates positive after-fee EV in a
+   **paper-trading run** (shadow only, no real cash) over ≥30
+   trades.
+2. Brier score better than the naive
+   "always predict 50%" baseline.
+3. YES-side bias root-caused. The current data shows YES is the
+   loser. Either the model systematically over-predicts the long
+   side, or the curator's threshold rounding is off, or
+   intraday weather drift makes morning predictions stale by
+   close. None of those are diagnosed yet.
+
+**What this leaves running**: the math-proven arbs (`internal-arb`,
+`implication-arb`) plus settlement, cross-arb, stat (1 residual
+rule). Implication-arb has ~$1+ of locked floor profit waiting on
+PAYROLLS calendar dates (June–October).
+
 ## 2026-05-09 03:30 UTC — calibration cron 1h → 15m
 
 **Why**: the engine's internal `reconcile_positions` runs every
