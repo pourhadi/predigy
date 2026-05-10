@@ -110,7 +110,7 @@ async fn submitter_task(pool: PgPool, rest: Arc<RestClient>, poll_interval: Dura
 async fn drain_submits(pool: &PgPool, rest: &Arc<RestClient>) -> Result<()> {
     let rows: Vec<SubmittedIntent> = sqlx::query_as::<_, SubmittedIntent>(
         "SELECT i.client_id, i.strategy, i.ticker, i.side, i.action,
-                i.price_cents, i.qty, i.order_type, i.tif,
+                i.price_cents, i.qty, i.order_type, i.tif, i.post_only,
                 EXISTS (
                     SELECT 1
                       FROM positions p
@@ -370,7 +370,7 @@ fn build_create_request(row: &SubmittedIntent) -> Result<CreateOrderRequest> {
     let qty: u32 = u32::try_from(row.qty)
         .map_err(|_| anyhow::anyhow!("intent qty out of range: {}", row.qty))?;
 
-    let (tif, post_only) = map_tif(&row.tif);
+    let (tif, _legacy_post_only) = map_tif(&row.tif);
     Ok(CreateOrderRequest {
         ticker: row.ticker.clone(),
         client_order_id: row.client_id.clone(),
@@ -380,7 +380,11 @@ fn build_create_request(row: &SubmittedIntent) -> Result<CreateOrderRequest> {
         price: format_cents_to_dollars(yes_equiv_cents),
         time_in_force: tif,
         self_trade_prevention_type: SelfTradePreventionV2::TakerAtCross,
-        post_only,
+        // Driven from the Intent now that it has its own
+        // `post_only` field. The intents.post_only column is the
+        // source of truth — see migration 0005 + the maker
+        // strategy spec in `plans/2026-05-10-strategic-roadmap.md`.
+        post_only: row.post_only.then_some(true),
         reduce_only: row.reduce_only.then_some(true),
     })
 }
@@ -507,6 +511,7 @@ struct SubmittedIntent {
     qty: i32,
     order_type: String,
     tif: String,
+    post_only: bool,
     reduce_only: bool,
 }
 
@@ -525,6 +530,7 @@ mod tests {
             qty: 2,
             order_type: "limit".into(),
             tif: tif.into(),
+            post_only: false,
             reduce_only: false,
         }
     }

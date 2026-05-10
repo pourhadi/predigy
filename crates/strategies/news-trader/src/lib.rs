@@ -299,6 +299,7 @@ impl NewsTraderStrategy {
                 "news-trader: source={} confidence={:?} headline={:?}",
                 item.source, item.confidence, item.headline
             )),
+            post_only: false,
         };
         info!(
             item_id = item.item_id,

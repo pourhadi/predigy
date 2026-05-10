@@ -328,8 +328,8 @@ impl Oms for DbBackedOms {
         sqlx::query(
             "INSERT INTO intents
                 (client_id, strategy, ticker, side, action, price_cents,
-                 qty, order_type, tif, status, cumulative_qty, reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11, 0, $10)",
+                 qty, order_type, tif, status, cumulative_qty, reason, post_only)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11, 0, $10, $12)",
         )
         .bind(&intent.client_id)
         .bind(intent.strategy)
@@ -342,6 +342,7 @@ impl Oms for DbBackedOms {
         .bind(tif_to_str(intent.tif))
         .bind(intent.reason.as_deref())
         .bind(initial_status)
+        .bind(intent.post_only)
         .execute(&mut *tx)
         .await?;
 
@@ -548,8 +549,8 @@ impl Oms for DbBackedOms {
                 "INSERT INTO intents
                     (client_id, strategy, ticker, side, action, price_cents,
                      qty, order_type, tif, status, cumulative_qty, reason,
-                     leg_group_id)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11, 0, $10, $12)",
+                     leg_group_id, post_only)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $11, 0, $10, $12, $13)",
             )
             .bind(&intent.client_id)
             .bind(intent.strategy)
@@ -563,6 +564,7 @@ impl Oms for DbBackedOms {
             .bind(intent.reason.as_deref())
             .bind(initial_status)
             .bind(group.group_id)
+            .bind(intent.post_only)
             .execute(&mut *tx)
             .await?;
 

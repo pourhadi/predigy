@@ -39,6 +39,14 @@ pub struct Intent {
     pub tif: Tif,
     /// Free-form rationale. Persisted to `intents.reason`.
     pub reason: Option<String>,
+    /// When true, Kalshi rejects the order if it would cross the
+    /// book at submit time. Required for maker-mode quoting where
+    /// accidentally taking blows up the economic case (taker fees
+    /// vs. 0¢ maker fee on standard markets). Default `false`.
+    /// IOC + post_only together is degenerate — the IOC engine
+    /// has no resting order to be a maker for; in practice
+    /// post_only=true should pair with `Tif::Gtc`.
+    pub post_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

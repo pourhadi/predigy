@@ -1,0 +1,11 @@
+{
+  "_comment": "Sample book-maker config. Operator copies to ~/.config/predigy/book-maker-config.json and edits the markets list. Each entry quotes a single Kalshi binary market with two-sided post-only YES quotes (1¢ inside the touch).",
+  "markets": [
+    {
+      "ticker": "KXMLBGAME-26MAY101335ATHBAL-ATH",
+      "max_inventory_contracts": 5,
+      "quote_size": 1,
+      "min_spread_cents": 2
+    }
+  ]
+}

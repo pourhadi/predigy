@@ -258,6 +258,17 @@ async fn run_one_lifecycle(
                         warn!(error = %e, "supervisor: oms submit_group error");
                     }
                 }
+                // Maker-mode: drain any cancel requests the
+                // strategy queued (e.g. `book-maker` re-quoting
+                // when its resting orders go stale). Default
+                // impl returns empty — IOC strategies never
+                // need this.
+                let cancels = strategy.drain_pending_cancels();
+                for client_id in cancels {
+                    if let Err(e) = oms.cancel(&client_id).await {
+                        warn!(error = %e, %client_id, "supervisor: oms cancel error");
+                    }
+                }
             }
             Err(e) => {
                 return LoopOutcome::Crashed(e.to_string());

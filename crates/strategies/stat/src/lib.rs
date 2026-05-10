@@ -631,6 +631,7 @@ impl StatStrategy {
                      hours_held={hours_held} effective_tp={effective_tp}¢",
                     pos.avg_entry_cents, mark_cents, pnl_per
                 )),
+                post_only: false,
             };
             info!(
                 market = %market.as_str(),
@@ -919,6 +920,7 @@ fn build_intent(
             "stat fire: model_p={:.3} ask={}c edge={:.1}c size={}",
             rule.model_p, ask_cents, raw_edge_cents, size
         )),
+        post_only: false,
     })
 }
 

@@ -22,6 +22,7 @@ members = [
     "crates/strategies/internal-arb",
     "crates/strategies/implication-arb",
     "crates/strategies/book-imbalance",
+    "crates/strategies/book-maker",
     "crates/strategies/variance-fade",
     "crates/strategies/news-trader",
     "crates/eval",
@@ -169,6 +170,7 @@ predigy-strategy-wx-stat = { path = "crates/strategies/wx-stat" }
 predigy-strategy-internal-arb = { path = "crates/strategies/internal-arb" }
 predigy-strategy-implication-arb = { path = "crates/strategies/implication-arb" }
 predigy-strategy-book-imbalance = { path = "crates/strategies/book-imbalance" }
+predigy-strategy-book-maker = { path = "crates/strategies/book-maker" }
 predigy-strategy-variance-fade = { path = "crates/strategies/variance-fade" }
 predigy-strategy-news-trader = { path = "crates/strategies/news-trader" }
 predigy-eval-lib = { path = "crates/eval" }

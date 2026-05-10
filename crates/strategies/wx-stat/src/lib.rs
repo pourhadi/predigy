@@ -748,6 +748,7 @@ fn build_intent(
             rule.settlement_date,
             rule.generated_at_utc
         )),
+        post_only: false,
     })
 }
 

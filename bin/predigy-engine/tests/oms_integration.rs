@@ -96,6 +96,7 @@ fn buy_yes(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent 
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: Some("integration test".into()),
+        post_only: false,
     }
 }
 
@@ -111,6 +112,7 @@ fn sell_yes(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: Some("integration test".into()),
+        post_only: false,
     }
 }
 
@@ -356,6 +358,7 @@ async fn short_position_close_realised_pnl_correct_sign() {
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: None,
+        post_only: false,
     };
     oms.submit(open).await.unwrap();
     oms.apply_execution(ExecutionUpdate {
@@ -566,6 +569,7 @@ async fn fill_then_close_settles_realised_pnl() {
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: None,
+        post_only: false,
     };
     oms.submit(close).await.unwrap();
     oms.apply_execution(ExecutionUpdate {
@@ -878,6 +882,7 @@ fn buy_no(client_id: &str, ticker: &str, qty: i32, price_cents: i32) -> Intent {
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: Some("integration test (no leg)".into()),
+        post_only: false,
     }
 }
 
@@ -1115,6 +1120,7 @@ async fn partial_close_preserves_avg_entry_cents() {
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: Some("partial close".into()),
+        post_only: false,
     };
     oms.submit(exit).await.unwrap();
     oms.apply_execution(ExecutionUpdate {
@@ -1200,6 +1206,7 @@ async fn position_reversal_resets_avg_to_fill_price() {
         order_type: OrderType::Limit,
         tif: Tif::Ioc,
         reason: Some("reversal".into()),
+        post_only: false,
     };
     oms.submit(exit).await.unwrap();
     oms.apply_execution(ExecutionUpdate {

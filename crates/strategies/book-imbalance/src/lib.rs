@@ -429,6 +429,7 @@ impl ImbalanceStrategy {
                 "book-imbalance fade: imbalance={:.2} yes_qty={} no_qty={}",
                 imbalance, yes_qty, no_qty
             )),
+            post_only: false,
         };
         info!(
             ticker = %key,
@@ -490,6 +491,7 @@ impl ImbalanceStrategy {
             order_type: OrderType::Limit,
             tif: Tif::Ioc,
             reason: Some("book-imbalance flatten before reversal".into()),
+            post_only: false,
         })
     }
 }
