@@ -14,6 +14,49 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-10 22:12 UTC — book-maker config trimmed to pre-game tickers only
+
+**Why**: first 4 hours of the 94-ticker book-maker run produced
+net **-$2.75 on book-maker**, offset by **+$1.71** of
+variance-favorable internal-arb settlements (from before the
+halt). Net account move: roughly flat. But the book-maker bleed
+is structural and needs to stop.
+
+**Diagnosis**: most of the -$2.75 came from a small number of
+big single-name losses where the maker posted on both legs of a
+2-leg family, ONE leg got hit, and we held it to settlement
+where the game outcome dominated:
+
+| Game | Entry | Loss |
+|---|---|---:|
+| MAY10 LAATOR-LAA | 30¢ | -$1.40 |
+| MAY10 MINCLE-MIN | 40¢ | -$1.27 |
+| MAY10 ATHBAL-BAL | 52¢ | -$0.48 |
+| MAY10 ATHBAL-ATH | 50¢ | -$0.45 |
+
+Spread captures on clean round-trips were *positive* (a dozen
++1¢ to +5¢ wins, ~+14¢ total), but the four game-outcome
+losses overwhelmed them. **A maker isn't supposed to hold to
+settlement.** That's the failure mode.
+
+**Fix**: filtered all `26MAY10` (today-settles) tickers out of
+`~/.config/predigy/book-maker-config.json`. Of the 94 expansion
+tickers, 34 settled today and were the source of the losses.
+The remaining 60 are May 11-13 games — pre-game books, less
+volatile, more likely to round-trip cleanly long before
+settlement.
+
+Engine bounced; `book-maker: config loaded n_markets=60`.
+
+**Follow-up** (NOT in this entry): auto-cancel-before-settlement
+logic for the strategy. For each leg, cancel quotes at T-30min
+before the market's `expected_expiration_time`. That would make
+it safe to quote on same-day games too. Until then,
+pre-game-only is the operating policy.
+
+**Live evidence (post-trim)**: 60 markets registered, will
+re-evaluate after 12h to confirm the bleed stops.
+
 ## 2026-05-10 18:34 UTC — internal-arb HALTED, book-maker takes the family alpha
 
 **Why**: PR #40's anti-legging gate prevents internal-arb from
