@@ -466,6 +466,19 @@ impl BookMakerStrategy {
         //     the strategy's state yet
         let mut orders = HashMap::new();
         for i in db.active_intents(Some(STRATEGY_ID.0)).await? {
+            // Skip rows the strategy has already asked to cancel.
+            // `Db::active_intents` returns anything non-terminal,
+            // which includes `cancel_requested`. If we left those
+            // in our active_orders view, the next BookUpdate
+            // would see them as "live at price X", queue ANOTHER
+            // cancel, and loop forever — especially for orders
+            // that never got a venue_order_id (so the cancel-at-
+            // venue path defers indefinitely). Treating
+            // cancel_requested as already-gone aligns the
+            // maker's view with reality.
+            if i.status == "cancel_requested" {
+                continue;
+            }
             // Decode side from cid tag (more reliable than the
             // intents.action column for our specific cid format).
             let side = if i.client_id.contains(":B:") {

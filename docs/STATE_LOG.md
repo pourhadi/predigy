@@ -14,6 +14,70 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-10 05:55 UTC — book-maker LIVE (3 markets, post-only)
+
+**Why**: per the 2026-05-10 strategy audit, maker mode is the
+single biggest missing alpha source. Kalshi pays 0% maker fee on
+standard binary markets vs the taker fee of ceil(0.07×N×P×(1-P)).
+Whelan UCD 2026: pure-taker strategies are structurally
+unprofitable. PR #45 shipped the strategy + supporting infra
+(post_only flag, drain_pending_cancels). This entry documents
+the live-deploy step.
+
+**Config** at `~/.config/predigy/book-maker-config.json`:
+
+| Ticker | Initial bid/ask | Spread |
+|---|---|---|
+| KXNHLGAME-26MAY12ANAVGK-ANA | 38/44 | 6¢ |
+| KXMLBGAME-26MAY112005AZTEX-AZ | 47/52 | 5¢ |
+| KXMLBGAME-26MAY111835NYYBAL-NYY | 55/59 | 4¢ |
+
+Max inventory 2 contracts/market, quote size 1, min_spread 2¢.
+
+**Per-strategy clamps** in `~/.zprofile`:
+- `PREDIGY_BOOK_MAKER_MAX_NOTIONAL_CENTS=1000` ($10 cap)
+- `PREDIGY_BOOK_MAKER_MAX_OPEN_CONTRACTS_PER_SIDE=10`
+- `PREDIGY_BOOK_MAKER_MAX_DAILY_LOSS_CENTS=500`
+
+**Validation evidence (first 10 minutes)**:
+- Strategy registered (`n_markets=3` confirmed in supervisor log).
+- Multiple post-only quotes posted; Kalshi accepted them
+  (e.g., `venue_rest: order acked client_id=book-maker:...
+  venue_order_id=...`). Confirms post-only is supported on
+  standard MLB/NHL markets.
+- Cancel + replace flow worked when book moved (e.g., A:59 →
+  A:43 → cancel_requested as touches drifted).
+- Strategy correctly stopped quoting when configured markets
+  all tightened to ≤3¢ (step-inside spread would be <2¢
+  min_spread).
+
+**Bug fix applied during live test**:
+The first 10 minutes surfaced a state-machine gap. When the
+strategy queued a cancel for an order that had not yet reached
+the venue (still in `submitted` / `acked` race), the row got
+stuck in `cancel_requested` indefinitely (venue cancel-path
+defers waiting for `venue_order_id`; nothing ever fills it
+in). The strategy's `refresh_state_from_db` was still seeing
+those rows via `Db::active_intents` and treating them as
+"live at price X", causing redundant cancel-loops. Fix
+landed: book-maker now skips `cancel_requested` rows in its
+view, treating them as already-gone. Pre-existing orphans are
+flagged by the engine reconciler as `orders_only_in_db`; a
+cleanup-reaper for those is a follow-up.
+
+**Open work**:
+1. Watch first 24h on these 3 markets — confirm post-only
+   stays honored, no unexpected fills, no quote-flapping
+   pathologies.
+2. Build an orphan-reaper for `cancel_requested` rows that
+   never got a `venue_order_id` (currently they sit forever
+   in DB as `orders_only_in_db` reconcile drift).
+3. Once stable, expand from 3 → 10-20 markets; current 3 are
+   conservative. The book-maker scales with breadth, not depth.
+4. Per the strategic roadmap (Priority 2), add a Vegas-line
+   curator to feed `model_p` for sports markets where Claude
+   has no edge.
+
 ## 2026-05-09 22:00 UTC — paper-trader apparatus shipped
 
 **Why**: the `stat` strategy (Claude Sonnet → `model_p` per

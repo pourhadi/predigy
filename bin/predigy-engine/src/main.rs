@@ -700,6 +700,14 @@ fn strategy_factory(
                 path.clone(),
             ))) as Box<dyn Strategy>
         })
+    } else if id == predigy_strategy_book_maker::STRATEGY_ID {
+        let path = book_maker_config_from_env()
+            .expect("book-maker registered without a config-file path; engine startup invariant");
+        Box::new(move || {
+            Box::new(BookMakerStrategy::new(BookMakerConfig::from_env(
+                path.clone(),
+            ))) as Box<dyn Strategy>
+        })
     } else {
         Box::new(move || panic!("no factory wired for strategy {id:?}"))
     }
