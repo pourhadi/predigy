@@ -14,6 +14,77 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-10 18:34 UTC — internal-arb HALTED, book-maker takes the family alpha
+
+**Why**: PR #40's anti-legging gate prevents internal-arb from
+*re-firing* a family that already has exposure, but **the FIRST
+fire of each new family still produces a naked single leg.** Live
+evidence today: 7/7 first-fires across 7 different MLB games each
+produced one naked YES position (cheap leg lifts at venue,
+expensive leg IOC-cancels because liquidity at the offered price
+isn't there). Average price ~42¢ — these are roughly EV-zero
+directional bets minus 2¢ round-trip fees.
+
+The fundamental issue: **IOC two-leg execution at retail latency
+can't atomically fill both legs.** The same problem the strategy's
+own doc-comment listed as "no partial-fill recovery" back at
+shake-down.
+
+**Halted**: commented out `PREDIGY_INTERNAL_ARB_CONFIG` in
+`~/.zprofile`. Engine bounced; `internal-arb` no longer
+registered. Last intent at 18:15:20 UTC; nothing fires after the
+bounce. The 7 naked legs settle today as games end — they're
+roughly EV-zero at entry price so the loss is bounded to ~2¢ of
+fees per position.
+
+**Replacement path**: book-maker now quotes on **94 tickers** —
+every leg of every internal-arb sum-to-1 family, plus the
+original 3 explicit test markets. Same alpha source (Kalshi
+sum-to-1 family math) but harvested as a maker:
+
+- For each leg: post a YES bid 1¢ inside the touch + a YES ask 1¢
+  inside the touch, post_only=true, Tif=Gtc.
+- When both legs of a 2-leg family fill long, the arb captures
+  at settlement (exactly one leg wins → $1 from the winner; cost
+  was bid_A + bid_B; profit = $1 - (bid_A + bid_B)).
+- Each leg also independently captures the maker spread on
+  unrelated takers.
+- 0% Kalshi maker fee vs ~1¢/contract taker fee — fee economics
+  are 4× better than the IOC version.
+
+**Bug fix shipped during the rollout**: Kalshi rejects
+`reduce_only=true` on non-IOC orders. The engine's venue_rest
+SQL was setting `reduce_only` based on existing-position EXISTS
+checks; for IOC takers this was meaningful, but for resting
+GTC quotes it was both wrong semantically and venue-illegal.
+Patched `build_create_request` to only forward `reduce_only`
+when `tif == "ioc"`. After the patch: zero `reduce_only can
+only be used with IoC orders` errors.
+
+**Live evidence (first 30 minutes after switch)**:
+
+- book-maker: **14 fills, +$0.04 realized, $0.02 fees → +$0.02 net**.
+  Most fills got the 0% maker fee (otherwise fees would be ~14¢
+  on 14 fills).
+- 0 `reduce_only` errors after the patch.
+- 8 net open positions (some round-trips closed, others holding
+  to settlement).
+- Account: $54.59 (down ~$0.40 from earlier snapshot, all
+  natural mark-to-market drift).
+
+**Dashboard updated**: active-tests banner reflects internal-arb
+HALTED, book-maker LIVE on 94 tickers.
+
+**Re-enable conditions for internal-arb**:
+1. Kalshi institutional FIX access (true multi-leg package
+   orders).
+2. OR: a sub-millisecond IOC racing infrastructure (NY4
+   colocation) that meaningfully reduces the cheap-leg-only
+   fill rate. Not viable on a laptop.
+
+The IOC version is **dead until then**. The maker variant
+captures the same alpha better.
+
 ## 2026-05-10 05:55 UTC — book-maker LIVE (3 markets, post-only)
 
 **Why**: per the 2026-05-10 strategy audit, maker mode is the

@@ -135,17 +135,24 @@
 
   <h2>active tests <small style="color: var(--muted)">(2026-05-10 status)</small></h2>
   <div class="card" style="margin-bottom: 8px;">
-    <div class="ev"><span class="pill warn">test</span> <strong>book-maker</strong>
-      <span class="meta">— first maker strategy. 0% Kalshi maker fee target.
-        Posts 1¢-inside-touch YES quotes, post_only=true, Tif=Gtc. Configured
-        markets in <span class="market">~/.config/predigy/book-maker-config.json</span>.
-        Caps clamped to $10 notional / 10 contracts / $5 daily loss for the MVP run.
+    <div class="ev"><span class="pill good">live</span> <strong>book-maker</strong>
+      <span class="meta">— first maker strategy. Now quoting on 94 tickers
+        (every leg of every internal-arb sum-to-1 family). Posts 1¢-inside-touch
+        YES bids + asks, post_only=true, Tif=Gtc. When both legs of a 2-leg
+        family fill long, the arb captures at settlement; each leg also
+        independently captures the maker spread. 0% maker fee on standard markets.
+        Caps: $10 notional / 10 contracts / $5 daily loss.
       </span>
     </div>
-    <div class="ev meta" style="margin-top: 6px;">
-      Validation focus: post_only honored, cancel+replace cycles cleanly, no
-      runaway quote-flapping, inventory skew applied on fills. Watch the
-      <em>resting orders</em> panel below for live quote state.
+  </div>
+  <div class="card" style="margin-bottom: 8px;">
+    <div class="ev"><span class="pill bad">halted</span> <strong>internal-arb</strong>
+      <span class="meta">— IOC two-leg approach is structurally broken at retail
+        latency. Live evidence: 7/7 first-fires today produced naked single legs
+        (cheap leg lifts immediately, expensive leg IOC-cancels at venue). The
+        same alpha is now harvested by book-maker as a maker. Re-enable only
+        with proper multi-leg atomicity (FIX package orders).
+      </span>
     </div>
   </div>
   <div class="card" style="margin-bottom: 8px;">

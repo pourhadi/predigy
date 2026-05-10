@@ -385,7 +385,16 @@ fn build_create_request(row: &SubmittedIntent) -> Result<CreateOrderRequest> {
         // source of truth — see migration 0005 + the maker
         // strategy spec in `plans/2026-05-10-strategic-roadmap.md`.
         post_only: row.post_only.then_some(true),
-        reduce_only: row.reduce_only.then_some(true),
+        // Kalshi rejects `reduce_only` on non-IOC orders with
+        // `invalid_order: reduce_only can only be used with IoC
+        // orders`. The SQL EXISTS clause that derives this from
+        // current positions is meaningful for IOC takers (where
+        // a strategy might explicitly want to refuse adds), but
+        // for resting GTC quotes the maker WANTS to flip
+        // inventory direction freely — so reduce_only would be
+        // both wrong semantically and venue-illegal. Only forward
+        // it when the intent is IOC.
+        reduce_only: (row.reduce_only && row.tif == "ioc").then_some(true),
     })
 }
 
