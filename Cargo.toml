@@ -42,6 +42,7 @@ members = [
     "bin/opportunity-scanner",
     "bin/arb-config-curator",
     "bin/predigy-calibration",
+    "bin/predigy-paper-trader",
     "bin/predigy-import",
     "bin/predigy-engine",
 ]

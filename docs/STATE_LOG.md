@@ -14,6 +14,79 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-09 22:00 UTC — paper-trader apparatus shipped
+
+**Why**: the `stat` strategy (Claude Sonnet → `model_p` per
+market) is the most promising path to **same-day-settling** alpha
+in production — sports games, daily macro releases, news
+markets, political events. Unlike `wx-stat`, which depends on
+one fragile NBM model on one task, `stat` is flexible across
+categories. But: enabling it without proven calibration is
+exactly what blew up `wx-stat` (3W/8L overnight, halted in
+companion PR). We need a way to prove model_p is positive-EV
+after fees on a per-category basis BEFORE risking real cash.
+
+**What landed**:
+
+- New `paper_trades` table (migration `0004_paper_trades.sql`).
+  Each row: ticker, side, entry-price-at-decision, model_p,
+  edge-at-entry, fee, settlement_date. After settlement:
+  outcome, paper_pnl_cents. Idempotent on
+  (strategy, ticker, side, settlement_date).
+- New `bin/predigy-paper-trader/` binary with three subcommands:
+  - `record --rules-file ...` — read curator output, fetch live
+    Kalshi orderbook for each ticker, compute the same edge the
+    `stat-trader` strategy would, insert paper_trades when it
+    clears `min_edge_cents`. Mirrors `stat-trader::derive_ask`
+    (YES ask = 100 - best NO bid; NO ask = 100 - best YES bid)
+    and the after-fee edge logic in `build_intent`. Falls back
+    to `market_detail.expected_expiration_time` /
+    `close_time` when curator omits `settlement_date` (which
+    the current curator output does for many rules).
+  - `reconcile` — for each unsettled paper_trade past its
+    settlement_date, fetch market_detail and (if resolved) fill
+    in `settlement_outcome` + `paper_pnl_cents`.
+  - `report --days 14` — aggregate metrics by source / category /
+    settlement_date: n_trades, win rate, after-fee EV per trade,
+    Brier vs side-adjusted prediction.
+- `com.predigy.paper-trader.plist` runs every 5 minutes
+  (record + reconcile back-to-back). Cron is **observation-only**
+  — never submits orders.
+- Wired into `deploy/scripts/install-launchd.sh` preflight + load
+  loop.
+
+**First live tick** (right after deploy): 17 rules in current
+`stat-rules.json`. Of those, 2 had expired settlement dates
+(skipped) and 15 were below the after-fee edge threshold. Zero
+paper_trades inserted on first tick. **This is itself
+informative**: at the current model_p outputs from Claude
+Sonnet, the curator's predictions don't have positive
+after-fee edge against live touch prices in the econ
+categories that dominate the current rules file. The market is
+pricing those events more confidently than our model. We
+either need:
+1. A different prompting strategy for Claude (more
+   non-econ markets — sports, politics)
+2. Markets with higher implied uncertainty where the model has
+   genuine edge
+3. To accept that Claude doesn't beat efficient pricing on
+   threshold econ markets and focus stat elsewhere
+
+**Re-enable conditions for live `stat` trading** (now that there
+is a ticking measurement apparatus):
+
+1. `predigy-paper-trader report --days 30` shows ≥30 paper
+   trades settled on a given (category, source) bucket.
+2. After-fee EV per trade is positive in that bucket.
+3. Brier score in that bucket is better than 0.25 (the
+   coin-flip baseline).
+4. The category-specific bucket gets a separate live-rules file
+   (or a `rules.category` filter in the engine) so we don't
+   enable the bad categories along with the good.
+
+This is the apparatus. The model_p quality is now measured
+continuously — once a category proves itself, we promote.
+
 ## 2026-05-09 17:45 UTC — wx-stat HALTED (structurally negative-EV)
 
 **Why**: overnight settlement of wx-stat positions delivered the
