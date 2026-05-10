@@ -67,6 +67,17 @@ require_file "${PREDIGY_HOME}/target/release/arb-config-curator" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p arb-config-curator)"
 require_file "${PREDIGY_HOME}/target/release/predigy-paper-trader" \
     "build with: (cd $PREDIGY_HOME && cargo build --release -p predigy-paper-trader)"
+
+# Book-maker doesn't have its own binary — it runs inside predigy-engine
+# when PREDIGY_BOOK_MAKER_CONFIG is set. The config file itself is
+# operator-curated; preflight just warns if the env var is set but
+# the file is missing.
+if [[ -n "${PREDIGY_BOOK_MAKER_CONFIG:-}" && ! -f "$PREDIGY_BOOK_MAKER_CONFIG" ]]; then
+    echo "FAIL: PREDIGY_BOOK_MAKER_CONFIG is set ($PREDIGY_BOOK_MAKER_CONFIG) but file does not exist"
+    fail=1
+elif [[ -n "${PREDIGY_BOOK_MAKER_CONFIG:-}" ]]; then
+    echo "OK:   PREDIGY_BOOK_MAKER_CONFIG present"
+fi
 [[ "$fail" -eq 0 ]] || { echo ""; echo "preflight failed; fix the FAILs above"; exit 1; }
 
 echo ""

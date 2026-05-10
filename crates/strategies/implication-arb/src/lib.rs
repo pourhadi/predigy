@@ -619,6 +619,7 @@ impl ImplicationArbStrategy {
                     "implication-arb {} parent_leg edge={net_edge}c",
                     pair.pair_id
                 )),
+                post_only: false,
             },
             Intent {
                 client_id: child_cid,
@@ -634,6 +635,7 @@ impl ImplicationArbStrategy {
                     "implication-arb {} child_leg edge={net_edge}c",
                     pair.pair_id
                 )),
+                post_only: false,
             },
         ];
         info!(

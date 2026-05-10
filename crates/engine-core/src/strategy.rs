@@ -82,6 +82,20 @@ pub trait Strategy: Send + Sync {
     fn drain_pending_groups(&mut self) -> Vec<LegGroup> {
         Vec::new()
     }
+
+    /// **Maker-mode primitive** — drain any buffered cancel
+    /// requests queued by `on_event`. The supervisor calls this
+    /// after `on_event` and routes each `client_id` through
+    /// `Oms::cancel`.
+    ///
+    /// Default returns empty. Maker strategies (`book-maker`)
+    /// override to express "I want this resting order gone so I
+    /// can re-quote." Strategies emitting only IOC orders never
+    /// need this — IOC fills/cancels itself at the venue and
+    /// nothing rests for the strategy to reap.
+    fn drain_pending_cancels(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 // Suppress dead-code warning during the migration; ExternalEvent

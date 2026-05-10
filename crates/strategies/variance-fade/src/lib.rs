@@ -353,6 +353,7 @@ impl VarianceFadeStrategy {
                 "variance-fade: mid={current_mid}c median={median}c move={move_cents}c samples={}",
                 samples.len()
             )),
+            post_only: false,
         };
         info!(
             ticker = %key,

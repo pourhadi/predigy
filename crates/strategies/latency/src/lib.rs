@@ -355,6 +355,7 @@ impl LatencyStrategy {
                     "latency: rule[{idx}] event={:?} severity={:?}",
                     rule.event_substring, rule.min_severity
                 )),
+                post_only: false,
             };
             state.armed = false;
             info!(
@@ -516,6 +517,7 @@ impl LatencyStrategy {
                     "latency-flat:{tier_tag} held_{age_secs}s entry={}¢ limit={}¢ {pnl_str}",
                     pos.avg_entry_cents, limit_cents
                 )),
+                post_only: false,
             };
             info!(
                 ticker,

@@ -536,6 +536,7 @@ impl InternalArbStrategy {
                     fee = opp.per_unit_taker_fee_cents,
                     edge = opp.edge_cents,
                 )),
+                post_only: false,
             });
         }
         info!(

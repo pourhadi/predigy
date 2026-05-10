@@ -394,6 +394,7 @@ impl SettlementStrategy {
                 self.config.bid_to_ask_ratio,
                 secs_to_close,
             )),
+            post_only: false,
         })
     }
 
@@ -478,6 +479,7 @@ impl SettlementStrategy {
                  ratio≥{} ttc={secs_to_close}s",
                 self.config.fade_ask_to_bid_ratio,
             )),
+            post_only: false,
         })
     }
 
@@ -621,6 +623,7 @@ impl SettlementStrategy {
                      secs_to_close={secs_to_close}",
                     pos.avg_entry_cents, mark_cents, pnl_per
                 )),
+                post_only: false,
             };
             info!(
                 market = %market.as_str(),

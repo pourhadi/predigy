@@ -48,6 +48,9 @@ use predigy_kalshi_rest::{Client as RestClient, Signer};
 use predigy_strategy_book_imbalance::{
     ImbalanceConfig, ImbalanceStrategy, config_file_from_env as book_imbalance_config_from_env,
 };
+use predigy_strategy_book_maker::{
+    BookMakerConfig, BookMakerStrategy, config_file_from_env as book_maker_config_from_env,
+};
 use predigy_strategy_cross_arb::{CrossArbConfig, CrossArbStrategy};
 use predigy_strategy_implication_arb::{
     ImplicationArbConfig, ImplicationArbStrategy,
@@ -573,6 +576,22 @@ async fn register_strategies(registry: &StrategyRegistry) {
         registry
             .register(StrategyHandle::new(IMBALANCE_ID, move || {
                 Box::new(ImbalanceStrategy::new(ImbalanceConfig::from_env(
+                    path.clone(),
+                ))) as Box<dyn Strategy>
+            }))
+            .await;
+    }
+
+    // Book-maker: post-only two-sided quoting on a curated market
+    // set. Captures the YES bid-ask spread at Kalshi's 0% maker
+    // fee — the structural edge identified in the 2026-05-10
+    // strategy audit. See `plans/2026-05-10-strategic-roadmap.md`
+    // part 4. Skip if the markets-config env var is unset.
+    use predigy_strategy_book_maker::STRATEGY_ID as BOOK_MAKER_ID;
+    if let Some(path) = book_maker_config_from_env() {
+        registry
+            .register(StrategyHandle::new(BOOK_MAKER_ID, move || {
+                Box::new(BookMakerStrategy::new(BookMakerConfig::from_env(
                     path.clone(),
                 ))) as Box<dyn Strategy>
             }))

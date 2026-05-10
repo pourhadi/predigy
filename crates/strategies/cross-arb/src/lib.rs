@@ -558,6 +558,7 @@ impl CrossArbStrategy {
                     "cross-arb-exit: {reason_tag} entry={}¢ mark={}¢ pnl={}¢/contract",
                     pos.avg_entry_cents, mark_cents, pnl_per
                 )),
+                post_only: false,
             };
             info!(
                 market = %market.as_str(),
@@ -749,6 +750,7 @@ fn build_intent(
         reason: Some(format!(
             "cross-arb: poly_mid={poly_mid_cents}¢ k_ask={kalshi_ask_cents}¢ edge={net_edge}¢"
         )),
+        post_only: false,
     })
 }
 
