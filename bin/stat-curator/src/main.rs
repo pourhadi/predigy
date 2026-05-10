@@ -61,10 +61,17 @@ struct Args {
     max_batches: usize,
 
     /// Settlement-horizon filter: only consider markets settling
-    /// within this many days.  Statistical bets compound poorly
+    /// within this many days. Statistical bets compound poorly
     /// when held longer because the curator's daily re-run can't
     /// re-calibrate against intra-trade news.
-    #[arg(long, default_value_t = 14)]
+    ///
+    /// **2026-05-09: default tightened from 14 → 3.** The
+    /// operational objective is same-day or next-settlement
+    /// returns. Multi-week horizons mostly produce econ-calendar
+    /// markets that Claude has no edge on (paper-trader evidence).
+    /// Sports, daily politics, and breaking-news markets all
+    /// settle within 1-3 days.
+    #[arg(long, default_value_t = 3)]
     max_days_to_settle: i64,
 
     /// Restart the named launchd job after a successful write.

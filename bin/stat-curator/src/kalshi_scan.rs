@@ -24,17 +24,30 @@ use predigy_kalshi_rest::types::MarketSummary;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
-/// Categories the curator scans.  Excludes "Climate and Weather"
-/// (owned by `wx-curator`).  The list is small enough to enumerate;
-/// adding more would mean wider coverage but bigger Anthropic prompts.
-pub const DEFAULT_CATEGORIES: &[&str] = &[
-    "Sports",
-    "Politics",
-    "Elections",
-    "World",
-    "Economics",
-    "Culture",
-];
+/// Categories the curator scans. Excludes "Climate and Weather"
+/// (owned by `wx-curator`).
+///
+/// **2026-05-09 narrowing**: removed `Economics`, `Elections`,
+/// and `Culture`. Paper-trader evidence (the first live tick after
+/// `predigy-paper-trader` shipped) showed every economic-threshold
+/// market (KXCHCPIYOY, KXDECPIPREL, KXBRAZILINF, KXDEZEW, etc.)
+/// had **negative** after-fee edge — Claude's `model_p` consistently
+/// landed at-or-below the market price. The market integrates
+/// macro-desk consensus that Claude has no information advantage
+/// over. `Elections` and `Culture` settle on multi-week horizons
+/// that miss the same-day-settlement objective and don't compound
+/// the curator's daily re-calibration budget.
+///
+/// Remaining categories where Claude plausibly has edge:
+/// - **Sports** — same-day settlements, deep training data on
+///   teams + matchups, retail flow that doesn't pre-integrate
+///   Claude's reasoning depth.
+/// - **Politics** — same-day political events (vote outcomes,
+///   speech outcomes, daily polling thresholds) where Claude can
+///   parse context faster than retail.
+/// - **World** — breaking news / international event markets,
+///   typically less efficient than US-finance markets.
+pub const DEFAULT_CATEGORIES: &[&str] = &["Sports", "Politics", "World"];
 
 #[derive(Debug, Clone)]
 pub struct StatMarket {
