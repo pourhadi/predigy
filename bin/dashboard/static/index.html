@@ -133,8 +133,44 @@
     </div>
   </div>
 
-  <h2>strategies</h2>
-  <div id="strats-wrap"></div>
+  <h2>active tests <small style="color: var(--muted)">(2026-05-10 status)</small></h2>
+  <div class="card" style="margin-bottom: 8px;">
+    <div class="ev"><span class="pill warn">test</span> <strong>book-maker</strong>
+      <span class="meta">— first maker strategy. 0% Kalshi maker fee target.
+        Posts 1¢-inside-touch YES quotes, post_only=true, Tif=Gtc. Configured
+        markets in <span class="market">~/.config/predigy/book-maker-config.json</span>.
+        Caps clamped to $10 notional / 10 contracts / $5 daily loss for the MVP run.
+      </span>
+    </div>
+    <div class="ev meta" style="margin-top: 6px;">
+      Validation focus: post_only honored, cancel+replace cycles cleanly, no
+      runaway quote-flapping, inventory skew applied on fills. Watch the
+      <em>resting orders</em> panel below for live quote state.
+    </div>
+  </div>
+  <div class="card" style="margin-bottom: 8px;">
+    <div class="ev"><span class="pill bad">halted</span> <strong>wx-stat</strong>
+      <span class="meta">— 3W/8L (-$17.21 realized) on first 11 cleanly-settled
+        trades. Structurally negative-EV; YES-side bias root-cause unknown.
+        Re-enable only after paper-trading shows positive after-fee EV ≥30
+        trades.
+      </span>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom: 8px;">
+    <div class="ev"><span class="pill muted">measuring</span> <strong>predigy-paper-trader</strong>
+      <span class="meta">— 5-min cron records what stat-curator's rules
+        <em>would</em> have done at live touch. No orders submitted. Gates the
+        <code>stat</code> re-enable. Per-category Brier reports drive promotion.
+      </span>
+    </div>
+  </div>
+
+  <h2>engine strategies <small style="color: var(--muted)">(today + currently open)</small></h2>
+  <div id="engine-strats-wrap"></div>
+
+  <h2>resting orders <small style="color: var(--muted)">(alive at venue right now)</small></h2>
+  <div id="resting-wrap"></div>
 
   <h2>kill switch</h2>
   <div class="card">
@@ -200,38 +236,40 @@ function escapeHtml(s) {
     }[c]));
 }
 
-function renderStrategies(strats) {
+function renderEngineStrategies(strats) {
     if (!strats || strats.length === 0) {
-        setHTML("strats-wrap", `<div class="card"><div class="empty">no strategies configured</div></div>`);
+        setHTML("engine-strats-wrap",
+          `<div class="card"><div class="empty">no engine strategy activity yet today</div></div>`);
+        setText("m-inflight", 0);
         return;
     }
-    const totalInFlight = strats.reduce((a, s) => a + (s.oms_in_flight_orders || 0), 0);
-    setText("m-inflight", totalInFlight);
+    const totalResting = strats.reduce((a, s) => a + (s.resting_orders | 0), 0);
+    setText("m-inflight", totalResting);
     const cards = strats.map(s => {
-        let healthPill = `<span class="pill muted">no log</span>`;
-        if (s.log_age_secs != null) {
-            if (s.log_age_secs < 90) healthPill = `<span class="pill good">live · ${s.log_age_secs}s</span>`;
-            else if (s.log_age_secs < 600) healthPill = `<span class="pill warn">stale · ${Math.round(s.log_age_secs / 60)}m</span>`;
-            else healthPill = `<span class="pill bad">down · ${Math.round(s.log_age_secs / 60)}m</span>`;
-        }
-        const killPill = s.oms_kill_switch ? `<span class="pill bad">kill armed</span>` : "";
-        const pnl = s.oms_daily_realized_pnl_cents | 0;
-        const pnlClass = pnl > 0 ? "num-pos" : (pnl < 0 ? "num-neg" : "");
+        const realized = s.realized_today_cents | 0;
+        const fees = s.fees_today_cents | 0;
+        const net = realized - fees;
+        const netClass = net > 0 ? "num-pos" : (net < 0 ? "num-neg" : "");
+        const restPill = s.resting_orders > 0
+          ? `<span class="pill good">${s.resting_orders} resting</span>`
+          : `<span class="pill muted">no quotes</span>`;
+        const openPill = s.open_positions > 0
+          ? `<span class="pill warn">${s.open_positions} open</span>` : "";
         return `
           <div class="card" style="margin-bottom: 8px;">
             <div class="strategy-row">
-              <span class="strategy-name">${escapeHtml(s.name)}</span>
-              ${healthPill}
-              ${killPill}
+              <span class="strategy-name">${escapeHtml(s.strategy)}</span>
+              ${restPill}
+              ${openPill}
             </div>
             <div class="ev meta" style="margin-top: 6px;">
-              P&amp;L <span class="${pnlClass}">${fmtCents(pnl, true)}</span>
-              · in-flight <strong>${s.oms_in_flight_orders}</strong>
-              ${s.oms_state_present ? "" : " · <em>no state file</em>"}
+              today: <strong>${s.fills_today}</strong> fills ·
+              realized <span class="${netClass}">${fmtCents(net, true)}</span>
+              <span style="color: var(--muted)">(gross ${fmtCents(realized, true)} − fees ${fmtCents(fees)})</span>
             </div>
           </div>`;
     }).join("");
-    setHTML("strats-wrap", cards);
+    setHTML("engine-strats-wrap", cards);
 }
 
 function renderEvents(events) {
@@ -320,29 +358,30 @@ function render(s) {
         setNumClass(unrEl, unr);
     }
 
-    // overall health pill is derived from all strategy log ages.
-    const ages = (s.strategies || []).map(x => x.log_age_secs).filter(x => x != null);
-    const oldest = ages.length ? Math.max(...ages) : null;
+    // Health pill = age of the snapshot itself. Snapshot is
+    // refreshed on a cron (~15s); if `refreshed_at` falls
+    // behind, the dashboard's own background refresh is stuck.
+    const age = Math.max(0, Math.round(Date.now()/1000 - (s.refreshed_at || 0)));
     const pill = document.getElementById("health-pill");
     pill.classList.remove("good", "warn", "bad", "muted");
-    if (oldest == null) {
+    if (!s.refreshed_at) {
         pill.classList.add("muted");
-        pill.textContent = "no logs";
-    } else if (oldest < 90) {
+        pill.textContent = "no data";
+    } else if (age < 60) {
         pill.classList.add("good");
-        pill.textContent = `live · ${oldest}s`;
-    } else if (oldest < 600) {
+        pill.textContent = `live · ${age}s`;
+    } else if (age < 300) {
         pill.classList.add("warn");
-        pill.textContent = `stale · ${Math.round(oldest / 60)}m`;
+        pill.textContent = `stale · ${Math.round(age / 60)}m`;
     } else {
         pill.classList.add("bad");
-        pill.textContent = `down · ${Math.round(oldest / 60)}m`;
+        pill.textContent = `down · ${Math.round(age / 60)}m`;
     }
 
     setText("status-line", `refreshed ${fmtUnixAge(s.refreshed_at)}`);
     setText("d-err", s.last_refresh_error || "ok");
 
-    renderStrategies(s.strategies);
+    renderEngineStrategies(s.engine_strategies || []);
     renderKill(s);
 
     const positions = s.open_positions || [];
@@ -378,10 +417,70 @@ function render(s) {
           </div>`);
     }
 
+    renderResting(s.resting_orders || []);
     renderEnginePositions(s.engine_positions || []);
     renderExits(s.recent_exits || []);
     renderFillLatency(s.fill_latency || []);
     renderEvents(s.recent_events);
+}
+
+function renderResting(rows) {
+    if (rows.length === 0) {
+        setHTML("resting-wrap",
+          `<div class="card"><div class="empty">no orders resting at the venue right now</div></div>`);
+        return;
+    }
+    // Group by strategy so book-maker rows are visually clustered
+    // and the ad-hoc resting orders from other strategies don't
+    // interleave with them.
+    const byStrategy = {};
+    for (const r of rows) {
+        if (!byStrategy[r.strategy]) byStrategy[r.strategy] = [];
+        byStrategy[r.strategy].push(r);
+    }
+    const sections = Object.keys(byStrategy).sort().map(strat => {
+        const tbody = byStrategy[strat].map(r => {
+            // For a maker quote, action+side tell us whether
+            // it's a bid (buy YES) or an ask (sell YES).
+            // Display a compact tag so the operator can scan.
+            let kindTag = `<span class="pill muted">${escapeHtml(r.action)}</span>`;
+            if (r.side === 'yes' && r.action === 'buy') kindTag = `<span class="pill good">bid</span>`;
+            else if (r.side === 'yes' && r.action === 'sell') kindTag = `<span class="pill warn">ask</span>`;
+            else if (r.side === 'no' && r.action === 'buy') kindTag = `<span class="pill warn">ask*</span>`;
+            else if (r.side === 'no' && r.action === 'sell') kindTag = `<span class="pill good">bid*</span>`;
+            const price = r.price_cents != null ? `${r.price_cents}¢` : '—';
+            const ageS = Math.max(0, Math.round(Date.now()/1000 - r.ts));
+            const ageStr = ageS < 60 ? `${ageS}s` : ageS < 3600 ? `${Math.round(ageS/60)}m` : `${Math.round(ageS/3600)}h`;
+            const poStr = r.post_only ? `<span class="pill good">post-only</span>` : '';
+            const statusCls = r.status === 'partial_fill' ? 'pill warn' : 'pill muted';
+            return `
+              <tr>
+                <td class="market">${escapeHtml(r.ticker)}</td>
+                <td>${kindTag}</td>
+                <td>${price}</td>
+                <td>${r.qty}</td>
+                <td>${ageStr}</td>
+                <td><span class="${statusCls}">${escapeHtml(r.status)}</span> ${poStr}</td>
+              </tr>`;
+        }).join("");
+        return `
+          <div class="card" style="padding: 0; margin-bottom: 8px;">
+            <div style="padding: 10px 14px; border-bottom: 1px solid var(--border);">
+              <strong>${escapeHtml(strat)}</strong>
+              <span class="meta" style="color: var(--muted); margin-left: 8px;">
+                ${byStrategy[strat].length} resting
+              </span>
+            </div>
+            <table>
+              <thead><tr>
+                <th>market</th><th>kind</th><th>price</th>
+                <th>qty</th><th>age</th><th>status</th>
+              </tr></thead>
+              <tbody>${tbody}</tbody>
+            </table>
+          </div>`;
+    }).join("");
+    setHTML("resting-wrap", sections);
 }
 
 function renderFillLatency(rows) {

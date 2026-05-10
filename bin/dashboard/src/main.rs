@@ -162,6 +162,18 @@ struct Snapshot {
     /// when the additive calibration_reports table is absent or no
     /// report has run yet.
     calibration: Vec<CalibrationSummaryRow>,
+    /// Orders currently resting at the venue — `acked` or
+    /// `partial_fill` intents. Critical for monitoring the
+    /// `book-maker` strategy (which is the only one that posts
+    /// long-lived resting orders); incidental for the other
+    /// strategies whose IOC orders go terminal in milliseconds.
+    resting_orders: Vec<RestingOrderRow>,
+    /// Per-engine-strategy roll-up: today's filled count,
+    /// today's realized P&L, currently-resting count, currently-
+    /// open positions count. Distinct from `strategies` above
+    /// (which is the legacy per-daemon JSON-state view of
+    /// latency / settlement / cross-arb / weather).
+    engine_strategies: Vec<EngineStrategyRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -262,6 +274,52 @@ struct CalibrationSummaryRow {
     log_loss: Option<f64>,
     created_at: i64,
     diagnosis: serde_json::Value,
+}
+
+/// Per-strategy roll-up for the engine-side strategies (the
+/// ones running inside `predigy-engine`, as opposed to the
+/// retired per-daemon JSON-state view). Lets the operator see
+/// at a glance what each strategy did today + what it has
+/// open / resting right now.
+#[derive(Debug, Clone, Serialize)]
+struct EngineStrategyRow {
+    strategy: String,
+    /// Filled intent count in the current UTC day.
+    fills_today: i64,
+    /// Realized P&L from positions closed in the current UTC day.
+    realized_today_cents: i64,
+    /// Fees paid on positions touched in the current UTC day.
+    fees_today_cents: i64,
+    /// Currently-open position count for this strategy.
+    open_positions: i64,
+    /// Currently-resting orders at the venue.
+    resting_orders: i64,
+}
+
+/// One order currently alive at the venue (`acked` or
+/// `partial_fill`). For taker strategies these turn over in
+/// milliseconds; for `book-maker` they persist for the duration
+/// of a quote cycle.
+#[derive(Debug, Clone, Serialize)]
+struct RestingOrderRow {
+    /// Unix seconds — when the intent was first persisted.
+    ts: i64,
+    strategy: String,
+    ticker: String,
+    side: String,
+    /// `buy` or `sell`. For book-maker: a YES buy is a maker bid;
+    /// a YES sell is a maker ask.
+    action: String,
+    price_cents: Option<i32>,
+    qty: i32,
+    /// `acked` (resting at venue, no fills yet) or `partial_fill`
+    /// (some qty filled, remainder still resting).
+    status: String,
+    /// True if `intents.post_only` was set. Only book-maker
+    /// uses this. Surfacing it in the UI helps spot any taker
+    /// orders that accidentally rest (which would mean a
+    /// strategy bug, since IOC should always be terminal).
+    post_only: bool,
 }
 
 /// Phase 6 — one recent exit fire (TP/SL/force-flat). Pulled
@@ -799,6 +857,20 @@ async fn build_snapshot(
                 snap.last_refresh_error = Some(format!("calibration_summary: {e}"));
             }
         }
+        match db_resting_orders(pool).await {
+            Ok(rows) => snap.resting_orders = rows,
+            Err(e) => {
+                warn!(error = %e, "refresh: resting_orders failed");
+                snap.last_refresh_error = Some(format!("resting_orders: {e}"));
+            }
+        }
+        match db_engine_strategies(pool).await {
+            Ok(rows) => snap.engine_strategies = rows,
+            Err(e) => {
+                warn!(error = %e, "refresh: engine_strategies failed");
+                snap.last_refresh_error = Some(format!("engine_strategies: {e}"));
+            }
+        }
     }
 
     snap
@@ -1068,6 +1140,129 @@ async fn db_engine_positions(pool: &sqlx::PgPool) -> Result<Vec<EnginePositionRo
             // MarketDetail map shared with Kalshi-side positions.
             mark_cents: None,
             unrealized_pnl_cents: None,
+        })
+        .collect())
+}
+
+/// Per-engine-strategy roll-up. Single SQL query joining
+/// today's fills, today's closed positions, today's open
+/// positions, and currently-resting intents. One row per
+/// strategy seen in any of those.
+async fn db_engine_strategies(pool: &sqlx::PgPool) -> Result<Vec<EngineStrategyRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        strategy: String,
+        fills_today: i64,
+        realized_today_cents: i64,
+        fees_today_cents: i64,
+        open_positions: i64,
+        resting_orders: i64,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        r"
+        WITH today_fills AS (
+            SELECT strategy, COUNT(*) AS n
+              FROM fills
+             WHERE ts >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+             GROUP BY strategy
+        ),
+        today_closed AS (
+            SELECT strategy,
+                   SUM(realized_pnl_cents)::BIGINT AS realized,
+                   SUM(fees_paid_cents)::BIGINT AS fees
+              FROM positions
+             WHERE closed_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+             GROUP BY strategy
+        ),
+        open_pos AS (
+            SELECT strategy, COUNT(*) AS n
+              FROM positions
+             WHERE closed_at IS NULL AND current_qty != 0
+             GROUP BY strategy
+        ),
+        resting AS (
+            SELECT strategy, COUNT(*) AS n
+              FROM intents
+             WHERE status IN ('acked', 'partial_fill')
+             GROUP BY strategy
+        ),
+        all_strats AS (
+            SELECT strategy FROM today_fills UNION
+            SELECT strategy FROM today_closed UNION
+            SELECT strategy FROM open_pos UNION
+            SELECT strategy FROM resting
+        )
+        SELECT a.strategy AS strategy,
+               COALESCE(tf.n, 0)::BIGINT AS fills_today,
+               COALESCE(tc.realized, 0)::BIGINT AS realized_today_cents,
+               COALESCE(tc.fees, 0)::BIGINT AS fees_today_cents,
+               COALESCE(op.n, 0)::BIGINT AS open_positions,
+               COALESCE(r.n, 0)::BIGINT AS resting_orders
+          FROM all_strats a
+          LEFT JOIN today_fills  tf ON tf.strategy = a.strategy
+          LEFT JOIN today_closed tc ON tc.strategy = a.strategy
+          LEFT JOIN open_pos     op ON op.strategy = a.strategy
+          LEFT JOIN resting       r ON r.strategy  = a.strategy
+         ORDER BY a.strategy
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| EngineStrategyRow {
+            strategy: r.strategy,
+            fills_today: r.fills_today,
+            realized_today_cents: r.realized_today_cents,
+            fees_today_cents: r.fees_today_cents,
+            open_positions: r.open_positions,
+            resting_orders: r.resting_orders,
+        })
+        .collect())
+}
+
+/// Orders currently alive at the venue. `acked` = resting,
+/// nothing filled yet. `partial_fill` = some qty filled,
+/// remainder still resting. Excludes terminal states (filled /
+/// cancelled / rejected / expired) and excludes the
+/// `cancel_requested` limbo (the strategy already asked for the
+/// order to die, so showing it here as alive would be
+/// misleading).
+async fn db_resting_orders(pool: &sqlx::PgPool) -> Result<Vec<RestingOrderRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        strategy: String,
+        ticker: String,
+        side: String,
+        action: String,
+        price_cents: Option<i32>,
+        qty: i32,
+        status: String,
+        post_only: bool,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT submitted_at, strategy, ticker, side, action,
+                price_cents, qty, status, post_only
+           FROM intents
+          WHERE status IN ('acked', 'partial_fill')
+          ORDER BY strategy, ticker, side, submitted_at DESC
+          LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| RestingOrderRow {
+            ts: r.submitted_at.timestamp(),
+            strategy: r.strategy,
+            ticker: r.ticker,
+            side: r.side,
+            action: r.action,
+            price_cents: r.price_cents,
+            qty: r.qty,
+            status: r.status,
+            post_only: r.post_only,
         })
         .collect())
 }
