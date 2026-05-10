@@ -103,6 +103,38 @@ pub struct BookMakerConfig {
     pub inventory_skew_cents_per_contract: i32,
     /// Cadence to re-poll the config file for mtime changes.
     pub config_refresh_interval: Duration,
+
+    // ── Adaptive same-day exit logic (2026-05-10) ──
+    /// Lock-in profit: when an open position's unrealized P&L
+    /// per contract (mark − entry for long, entry − mark for
+    /// short) reaches this many cents, emit an IOC flatten at
+    /// the touch instead of waiting for our own maker quote to
+    /// be lifted. Caps the upside-to-downside ratio against
+    /// adverse settlement.
+    pub profit_take_cents: i32,
+    /// Stop-loss: when unrealized P&L per contract reaches
+    /// −stop_loss_cents, emit an IOC flatten. Caps the
+    /// per-position loss before settlement dominates it.
+    pub stop_loss_cents: i32,
+    /// Halt new quotes when time-to-settle drops below this
+    /// window (seconds). Existing acked orders stay alive but
+    /// we don't repost them on the next re-quote cycle.
+    pub pre_settle_halt_secs: i64,
+    /// Force-flatten when time-to-settle drops below this
+    /// window (seconds). Emits IOC sells/buys at the current
+    /// touch to dump any held inventory before the game outcome
+    /// dominates the P&L.
+    pub pre_settle_flatten_secs: i64,
+    /// Within this many hours of settle, the inventory skew
+    /// per contract DOUBLES — encouraging earlier flattening
+    /// as the settlement-risk-discount kicks in.
+    pub skew_escalation_t_hours: f64,
+    /// For sport tickers parsed to a START time, the strategy
+    /// estimates settlement at start + this many hours (typical
+    /// game length). Used only when `markets.close_time` is
+    /// not populated in the DB (which is the common case at
+    /// the moment for sport markets).
+    pub estimated_game_duration_hours: f64,
 }
 
 impl BookMakerConfig {
@@ -112,12 +144,24 @@ impl BookMakerConfig {
     /// - `PREDIGY_BOOK_MAKER_SKEW_CENTS_PER_CONTRACT` (i32,
     ///   default 1)
     /// - `PREDIGY_BOOK_MAKER_REFRESH_MS` (u64, default 30_000)
+    /// - `PREDIGY_BOOK_MAKER_PROFIT_TAKE_CENTS` (i32, default 5)
+    /// - `PREDIGY_BOOK_MAKER_STOP_LOSS_CENTS` (i32, default 8)
+    /// - `PREDIGY_BOOK_MAKER_PRE_SETTLE_HALT_SECS` (i64, default 1800)
+    /// - `PREDIGY_BOOK_MAKER_PRE_SETTLE_FLATTEN_SECS` (i64, default 600)
+    /// - `PREDIGY_BOOK_MAKER_SKEW_ESCALATION_HOURS` (f64, default 2.0)
+    /// - `PREDIGY_BOOK_MAKER_GAME_DURATION_HOURS` (f64, default 3.5)
     #[must_use]
     pub fn from_env(config_file: PathBuf) -> Self {
         let mut c = Self {
             config_file,
             inventory_skew_cents_per_contract: 1,
             config_refresh_interval: Duration::from_secs(30),
+            profit_take_cents: 5,
+            stop_loss_cents: 8,
+            pre_settle_halt_secs: 1800,
+            pre_settle_flatten_secs: 600,
+            skew_escalation_t_hours: 2.0,
+            estimated_game_duration_hours: 3.5,
         };
         if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_SKEW_CENTS_PER_CONTRACT")
             && let Ok(n) = v.parse()
@@ -128,6 +172,36 @@ impl BookMakerConfig {
             && let Ok(n) = v.parse::<u64>()
         {
             c.config_refresh_interval = Duration::from_millis(n);
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_PROFIT_TAKE_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.profit_take_cents = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_STOP_LOSS_CENTS")
+            && let Ok(n) = v.parse()
+        {
+            c.stop_loss_cents = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_PRE_SETTLE_HALT_SECS")
+            && let Ok(n) = v.parse()
+        {
+            c.pre_settle_halt_secs = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_PRE_SETTLE_FLATTEN_SECS")
+            && let Ok(n) = v.parse()
+        {
+            c.pre_settle_flatten_secs = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_SKEW_ESCALATION_HOURS")
+            && let Ok(n) = v.parse()
+        {
+            c.skew_escalation_t_hours = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_GAME_DURATION_HOURS")
+            && let Ok(n) = v.parse()
+        {
+            c.estimated_game_duration_hours = n;
         }
         c
     }
@@ -214,6 +288,83 @@ struct CachedTouch {
     yes_ask_cents: u8,
 }
 
+/// Parse the estimated settlement time (unix seconds) from a
+/// sport ticker that embeds the start time + date. Only MLB
+/// (KXMLBGAME) tickers carry an explicit HHMM in the symbol;
+/// for other formats we return None and the strategy operates
+/// without time-aware exits on those.
+///
+/// Format: `KXMLBGAME-{YY}{MMM}{DD}{HHMM}{matchup}-{team}`
+/// e.g.   `KXMLBGAME-26MAY111810LAACLE-LAA`
+///                       ^^^^^^^^^^^^
+///                       26 MAY 11 18:10  → May 11 2026 18:10 ET
+///
+/// Adds `estimated_game_duration_hours` to get a rough
+/// settlement estimate. ET → UTC conversion uses a fixed −4
+/// offset (EDT) — close enough for the strategy's purposes
+/// (the deltas we care about are minutes-to-settle order of
+/// magnitude, not exact UTC).
+#[must_use]
+pub fn parse_settlement_unix_from_ticker(
+    ticker: &str,
+    estimated_game_duration_hours: f64,
+) -> Option<i64> {
+    let prefix = "KXMLBGAME-";
+    let rest = ticker.strip_prefix(prefix)?;
+    // Need at least 11 chars: YY(2) + MMM(3) + DD(2) + HHMM(4).
+    if rest.len() < 11 {
+        return None;
+    }
+    let yy: i32 = rest[0..2].parse().ok()?;
+    let mmm = &rest[2..5];
+    let dd: u32 = rest[5..7].parse().ok()?;
+    let hhmm: u32 = rest[7..11].parse().ok()?;
+    let month: u32 = match mmm {
+        "JAN" => 1,
+        "FEB" => 2,
+        "MAR" => 3,
+        "APR" => 4,
+        "MAY" => 5,
+        "JUN" => 6,
+        "JUL" => 7,
+        "AUG" => 8,
+        "SEP" => 9,
+        "OCT" => 10,
+        "NOV" => 11,
+        "DEC" => 12,
+        _ => return None,
+    };
+    let hour = hhmm / 100;
+    let minute = hhmm % 100;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    let year = 2000 + yy;
+    let date = chrono::NaiveDate::from_ymd_opt(year, month, dd)?;
+    let naive = date.and_hms_opt(hour, minute, 0)?;
+    // ET start → UTC. EDT is UTC-4. (We don't bother detecting
+    // standard vs daylight; the strategy is robust to ±1h.)
+    let start_utc = naive.and_utc().timestamp() + 4 * 3600;
+    let settle_utc = start_utc + (estimated_game_duration_hours * 3600.0) as i64;
+    Some(settle_utc)
+}
+
+/// One open position for this strategy, with the price basis
+/// used for unrealized-P&L computation.
+#[derive(Debug, Clone)]
+struct OpenLeg {
+    /// Signed contract count. + long YES, − long NO (which we
+    /// represent as a negative YES exposure).
+    signed_qty: i32,
+    /// Average entry price in cents. For a long YES this is what
+    /// we paid; for a long NO this is what we paid for NO (so
+    /// our "YES-equivalent" cost basis is `100 − avg_entry`).
+    avg_entry_cents: i32,
+    /// Side string ("yes" | "no") — needed because mark
+    /// computation differs.
+    side: String,
+}
+
 #[derive(Debug)]
 pub struct BookMakerStrategy {
     config: BookMakerConfig,
@@ -229,6 +380,16 @@ pub struct BookMakerStrategy {
     /// In-memory inventory cache: net YES-equivalent contracts
     /// per ticker (positive = long YES, negative = short).
     inventory: HashMap<String, i32>,
+    /// Full open-leg cache (per ticker, per side) — used for
+    /// per-position unrealized-P&L computation. Distinct from
+    /// `inventory` (net qty) because NO positions don't combine
+    /// trivially with YES positions for mark/PnL math.
+    open_legs: HashMap<String, Vec<OpenLeg>>,
+    /// Estimated settlement time per ticker (unix seconds). For
+    /// MLB tickers we parse it directly from the ticker; for
+    /// others we leave it None and run without time-aware
+    /// behavior. Populated lazily.
+    settle_unix: HashMap<String, Option<i64>>,
     last_config_refresh: Option<Instant>,
     pending_intents: Vec<Intent>,
     pending_cancels: Vec<String>,
@@ -243,6 +404,8 @@ impl BookMakerStrategy {
             touches: HashMap::new(),
             active_orders: HashMap::new(),
             inventory: HashMap::new(),
+            open_legs: HashMap::new(),
+            settle_unix: HashMap::new(),
             last_config_refresh: None,
             pending_intents: Vec::new(),
             pending_cancels: Vec::new(),
@@ -337,22 +500,215 @@ impl BookMakerStrategy {
         )
     }
 
+    /// Estimated settlement unix time for a ticker. Tries DB
+    /// `markets.close_time` first (populated by other components
+    /// when available), then falls back to parsing the ticker
+    /// string for sport markets that embed start time. Caches
+    /// the result so we only do this work once per ticker.
+    fn settle_unix_for(&mut self, ticker: &str) -> Option<i64> {
+        if let Some(cached) = self.settle_unix.get(ticker) {
+            return *cached;
+        }
+        let parsed =
+            parse_settlement_unix_from_ticker(ticker, self.config.estimated_game_duration_hours);
+        self.settle_unix.insert(ticker.to_string(), parsed);
+        parsed
+    }
+
+    /// Inventory skew per contract — escalates as we approach
+    /// settle. Within `skew_escalation_t_hours` of settle, the
+    /// skew doubles (encouraging earlier flattening). When
+    /// `secs_to_settle` is None (no estimate), uses the base
+    /// configured skew unchanged.
+    fn effective_skew_for(&self, secs_to_settle: Option<i64>) -> i32 {
+        let base = self.config.inventory_skew_cents_per_contract;
+        match secs_to_settle {
+            Some(secs) if secs > 0 => {
+                let hours = secs as f64 / 3600.0;
+                if hours < self.config.skew_escalation_t_hours {
+                    base.saturating_mul(2)
+                } else {
+                    base
+                }
+            }
+            _ => base,
+        }
+    }
+
+    /// Per-position exit decisions. For each open leg on this
+    /// ticker, compute unrealized P&L and emit an IOC flatten
+    /// if it crosses a threshold (profit-take, stop-loss, or
+    /// pre-settle aggressive flatten).
+    fn evaluate_exits(&mut self, ticker: &str, touch: &CachedTouch, secs_to_settle: Option<i64>) {
+        let legs = match self.open_legs.get(ticker) {
+            Some(legs) if !legs.is_empty() => legs.clone(),
+            _ => return,
+        };
+        let in_flatten_window = secs_to_settle
+            .map(|s| s >= 0 && s < self.config.pre_settle_flatten_secs)
+            .unwrap_or(false);
+
+        for leg in legs {
+            if leg.signed_qty == 0 {
+                continue;
+            }
+            // Mark = price we'd unwind at on a market sell.
+            // For long YES: sell into yes_bid.
+            // For long NO (signed_qty > 0 with side="no"): we'd
+            // sell NO → buy YES at ask → effective "mark" is
+            // 100 − yes_ask (the NO bid we'd hit).
+            // We unwind via IOC at the touch.
+            let (mark, exit_action, exit_side, abs_qty) = if leg.side == "yes" {
+                let abs = leg.signed_qty.unsigned_abs();
+                if leg.signed_qty > 0 {
+                    // Long YES — sell at yes_bid.
+                    (
+                        i32::from(touch.yes_bid_cents),
+                        IntentAction::Sell,
+                        Side::Yes,
+                        abs,
+                    )
+                } else {
+                    // Short YES — buy back at yes_ask.
+                    (
+                        i32::from(touch.yes_ask_cents),
+                        IntentAction::Buy,
+                        Side::Yes,
+                        abs,
+                    )
+                }
+            } else if leg.side == "no" && leg.signed_qty > 0 {
+                // Long NO — sell at no_bid. no_bid = 100 - yes_ask.
+                let no_bid = 100i32.saturating_sub(i32::from(touch.yes_ask_cents));
+                (
+                    no_bid,
+                    IntentAction::Sell,
+                    Side::No,
+                    leg.signed_qty.unsigned_abs(),
+                )
+            } else {
+                continue;
+            };
+
+            // Unrealized P&L per contract.
+            let pnl_per = mark.saturating_sub(leg.avg_entry_cents);
+            let profit_take = pnl_per >= self.config.profit_take_cents;
+            let stop_loss = pnl_per <= -self.config.stop_loss_cents;
+
+            let reason_tag = if in_flatten_window {
+                "pre-settle"
+            } else if profit_take {
+                "tp"
+            } else if stop_loss {
+                "sl"
+            } else {
+                continue;
+            };
+
+            // IOC flatten at the current mark.
+            let exit_price = i32::from(mark.clamp(1, 99) as u8);
+            let minute = (chrono::Utc::now().timestamp() / 60) as u32;
+            let cid = format!(
+                "book-maker:{cid_t}:X:{tag}:{p:02}:{minute:08x}",
+                cid_t = cid_safe_ticker(ticker),
+                tag = reason_tag,
+                p = exit_price,
+            );
+            let qty = match i32::try_from(abs_qty) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            if qty == 0 {
+                continue;
+            }
+
+            info!(
+                ticker,
+                reason = reason_tag,
+                signed_qty = leg.signed_qty,
+                avg_entry = leg.avg_entry_cents,
+                mark,
+                pnl_per,
+                secs_to_settle = ?secs_to_settle,
+                "book-maker: emit exit"
+            );
+
+            self.pending_intents.push(Intent {
+                client_id: cid,
+                strategy: STRATEGY_ID.0,
+                market: MarketTicker::new(ticker),
+                side: exit_side,
+                action: exit_action,
+                price_cents: Some(exit_price),
+                qty,
+                order_type: OrderType::Limit,
+                tif: Tif::Ioc,
+                reason: Some(format!(
+                    "book-maker exit {tag}: entry={ec}c mark={mark}c pnl={pnl}c qty={qty}",
+                    tag = reason_tag,
+                    ec = leg.avg_entry_cents,
+                    pnl = pnl_per,
+                )),
+                post_only: false,
+            });
+        }
+    }
+
     /// For one configured market, emit any cancels for stale
     /// quotes and any new intents for missing or repriced quotes.
     fn evaluate_market(&mut self, market_idx: usize) {
-        let m = &self.markets[market_idx];
-        let ticker = m.ticker.clone();
+        // Snapshot the config we need up-front so the mutable
+        // borrows below (settle_unix_for, evaluate_exits, etc.)
+        // don't fight an immutable borrow of self.markets[].
+        let (ticker, quote_size, max_inventory, min_spread_cents) = {
+            let m = &self.markets[market_idx];
+            (
+                m.ticker.clone(),
+                m.quote_size,
+                m.max_inventory_contracts,
+                m.min_spread_cents,
+            )
+        };
         let touch = match self.touches.get(&ticker).copied() {
             Some(t) if t.yes_bid_cents > 0 && t.yes_ask_cents > 0 => t,
             _ => return,
         };
+
+        // ── 1. P&L exits + time-to-settle flatten ──
+        // These fire BEFORE we evaluate new quotes. If the strategy
+        // is going to dump inventory this tick, we don't want to
+        // re-post quotes that immediately get cancel-replaced.
+        let now_unix = chrono::Utc::now().timestamp();
+        let settle_unix = self.settle_unix_for(&ticker);
+        let secs_to_settle = settle_unix.map(|t| t.saturating_sub(now_unix));
+        self.evaluate_exits(&ticker, &touch, secs_to_settle);
+
+        // ── 2. Quote suppression near settle ──
+        // Inside the halt window, stop posting NEW quotes. The
+        // exit logic above is the only thing that emits intents
+        // for this ticker in this window.
+        if let Some(secs) = secs_to_settle
+            && secs >= 0
+            && secs < self.config.pre_settle_halt_secs
+        {
+            debug!(
+                ticker,
+                secs_to_settle = secs,
+                "book-maker: in halt window; suppressing new quotes"
+            );
+            self.cancel_active_for_ticker(&ticker);
+            return;
+        }
+
+        // ── 3. Normal quote computation with dynamic skew ──
         let inv = self.inventory.get(&ticker).copied().unwrap_or(0);
+        let effective_skew = self.effective_skew_for(secs_to_settle);
         let Some((desired_bid, desired_ask)) = compute_desired_quotes(
             touch.yes_bid_cents,
             touch.yes_ask_cents,
             inv,
-            self.config.inventory_skew_cents_per_contract,
-            m.min_spread_cents,
+            effective_skew,
+            min_spread_cents,
         ) else {
             // Book too tight — cancel anything we have here.
             self.cancel_active_for_ticker(&ticker);
@@ -360,9 +716,9 @@ impl BookMakerStrategy {
         };
 
         // Inventory cap: skip the side that would breach.
-        let cap = m.max_inventory_contracts;
-        let bid_allowed = inv + m.quote_size <= cap;
-        let ask_allowed = -(inv - m.quote_size) <= cap;
+        let cap = max_inventory;
+        let bid_allowed = inv + quote_size <= cap;
+        let ask_allowed = -(inv - quote_size) <= cap;
 
         for (side, desired_price, allowed) in [
             (QuoteSide::Bid, desired_bid, bid_allowed),
@@ -402,7 +758,7 @@ impl BookMakerStrategy {
                 side: Side::Yes,
                 action: side.intent_action(),
                 price_cents: Some(i32::from(desired_price)),
-                qty: m.quote_size,
+                qty: quote_size,
                 order_type: OrderType::Limit,
                 tif: Tif::Gtc,
                 reason: Some(format!(
@@ -437,16 +793,21 @@ impl BookMakerStrategy {
         }
     }
 
-    /// Refresh `inventory` and `active_orders` from the DB. One
-    /// query each, cheap. Called at most once per BookUpdate that
-    /// lands on a configured ticker.
+    /// Refresh `inventory`, `open_legs`, and `active_orders`
+    /// from the DB. Two queries, cheap. Called at most once per
+    /// BookUpdate that lands on a configured ticker.
     async fn refresh_state_from_db(
         &mut self,
         db: &predigy_engine_core::Db,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Positions: map ticker → net YES-equivalent qty.
+        // Positions: map ticker → net YES-equivalent qty, AND
+        // ticker → list of per-side legs (for P&L exits).
         let mut inv = HashMap::new();
+        let mut legs: HashMap<String, Vec<OpenLeg>> = HashMap::new();
         for p in db.open_positions(Some(STRATEGY_ID.0)).await? {
+            if p.current_qty == 0 {
+                continue;
+            }
             // YES side: signed qty as-is. NO side: -qty (a long-NO
             // = short-YES exposure). The maker's quotes are on
             // YES, so YES-equivalent inventory drives skew.
@@ -455,9 +816,15 @@ impl BookMakerStrategy {
                 "no" => -p.current_qty,
                 _ => 0,
             };
-            *inv.entry(p.ticker).or_insert(0) += signed;
+            *inv.entry(p.ticker.clone()).or_insert(0) += signed;
+            legs.entry(p.ticker).or_default().push(OpenLeg {
+                signed_qty: p.current_qty,
+                avg_entry_cents: p.avg_entry_cents,
+                side: p.side,
+            });
         }
         self.inventory = inv;
+        self.open_legs = legs;
 
         // Active intents: rebuild active_orders from authoritative
         // DB state. This catches:
@@ -632,6 +999,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_mlb_ticker_settlement_time() {
+        // KXMLBGAME-26MAY111810LAACLE-LAA → May 11 2026 18:10 ET
+        // 18:10 ET + 4h offset = 22:10 UTC start. Plus 3.5h game
+        // duration = 01:40 UTC on May 12.
+        let t = parse_settlement_unix_from_ticker("KXMLBGAME-26MAY111810LAACLE-LAA", 3.5).unwrap();
+        // Sanity: should be within a sensible 2026 range.
+        assert!(t > 1_777_000_000); // ~Mid Apr 2026
+        assert!(t < 1_790_000_000); // ~Sep 2026
+
+        // Different start time → different settle.
+        let t2 = parse_settlement_unix_from_ticker("KXMLBGAME-26MAY112005AZTEX-AZ", 3.5).unwrap();
+        assert!(t2 > t, "later-starting game settles later");
+        // Same date 20:05 ET vs 18:10 ET = 1h55min later.
+        assert!(t2 - t >= 6900 && t2 - t < 7200);
+    }
+
+    #[test]
+    fn parser_rejects_non_mlb_tickers() {
+        // NHL/NBA/other formats don't embed start time — parser
+        // returns None and the strategy operates without
+        // time-aware exits on those.
+        assert!(parse_settlement_unix_from_ticker("KXNHLGAME-26MAY12ANAVGK-ANA", 3.5).is_none());
+        assert!(parse_settlement_unix_from_ticker("KXNBASERIES-26MINSASR2-SAS", 3.5).is_none());
+        assert!(parse_settlement_unix_from_ticker("KXPAYROLLS-26AUG-T20000", 3.5).is_none());
+    }
+
+    #[test]
+    fn parser_rejects_garbage() {
+        assert!(parse_settlement_unix_from_ticker("not-a-ticker", 3.5).is_none());
+        assert!(parse_settlement_unix_from_ticker("KXMLBGAME-", 3.5).is_none());
+        assert!(parse_settlement_unix_from_ticker("KXMLBGAME-26ZZZ111810XX-Y", 3.5).is_none());
+    }
+
+    #[test]
     fn config_loads_default_qty_and_spread() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("book-maker.json");
@@ -646,6 +1047,12 @@ mod tests {
             config_file: path,
             inventory_skew_cents_per_contract: 1,
             config_refresh_interval: Duration::from_secs(30),
+            profit_take_cents: 5,
+            stop_loss_cents: 8,
+            pre_settle_halt_secs: 1800,
+            pre_settle_flatten_secs: 600,
+            skew_escalation_t_hours: 2.0,
+            estimated_game_duration_hours: 3.5,
         });
         s.reload_markets();
         assert_eq!(s.market_count(), 1);
