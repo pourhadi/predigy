@@ -14,6 +14,42 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-10 23:45 UTC — book-maker min_spread_cents 2 → 4 (cut adverse selection)
+
+**Why**: post-stampede cleanup analysis showed 12 exit fills
+(7 SL, 5 TP) all concentrated on 3 live-game tickers (STLSD,
+PITSF, BUFMTL). The stop-losses fired because live-sports book
+volatility (5-15¢ moves on game events) exceeds the 2¢ spread
+the maker was capturing — adverse selection eats the position
+within seconds of a fresh fill. -$2.59 realized on book-maker
+today is dominated by these adverse-selection SLs.
+
+**Change**: `min_spread_cents` 2 → 4 across all 70 tickers in
+`~/.config/predigy/book-maker-config.json`. Now the strategy
+only quotes on books with raw spread ≥6¢ (step-inside-by-1¢
+each side leaves 4¢ between our quotes). Fewer fills but
+each clean round-trip captures 4¢ vs the previous 2¢ —
+which gives the strategy a wider margin against adverse
+selection.
+
+**Side effect**: fewer concurrent quotes means lower
+in-flight pressure. The 200-cap stampede earlier today
+won't recur at this filter level.
+
+**Live evidence** (within 1 minute of the config-reload
+mtime poll picking up the new value): 1 acked quote in
+flight, down from the cap-pegged 200 earlier. Most books
+on the 70-ticker universe are at 3-4¢ raw spread, below the
+new threshold.
+
+**Re-evaluate** after a few hours: if fill rate is too low
+(no round-trips at all), consider:
+- Loosening back to 3 (1¢ inner spread, more fills but more
+  adverse selection)
+- Adding volatility-aware widening (currently no such logic)
+- Trimming to a smaller universe of consistently-wide-spread
+  markets
+
 ## 2026-05-10 22:12 UTC — book-maker config trimmed to pre-game tickers only
 
 **Why**: first 4 hours of the 94-ticker book-maker run produced
