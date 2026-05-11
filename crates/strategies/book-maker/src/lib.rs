@@ -135,6 +135,11 @@ pub struct BookMakerConfig {
     /// not populated in the DB (which is the common case at
     /// the moment for sport markets).
     pub estimated_game_duration_hours: f64,
+    /// Per-ticker quote-refresh cooldown. Higher = quotes rest
+    /// longer at venue (more fill probability) but track moving
+    /// books less aggressively. Suspended inside the flatten
+    /// window where every-tick aggression matters.
+    pub quote_refresh_cooldown: Duration,
 }
 
 impl BookMakerConfig {
@@ -150,6 +155,7 @@ impl BookMakerConfig {
     /// - `PREDIGY_BOOK_MAKER_PRE_SETTLE_FLATTEN_SECS` (i64, default 600)
     /// - `PREDIGY_BOOK_MAKER_SKEW_ESCALATION_HOURS` (f64, default 2.0)
     /// - `PREDIGY_BOOK_MAKER_GAME_DURATION_HOURS` (f64, default 3.5)
+    /// - `PREDIGY_BOOK_MAKER_QUOTE_REFRESH_SECS` (u64, default 10)
     #[must_use]
     pub fn from_env(config_file: PathBuf) -> Self {
         let mut c = Self {
@@ -162,6 +168,7 @@ impl BookMakerConfig {
             pre_settle_flatten_secs: 600,
             skew_escalation_t_hours: 2.0,
             estimated_game_duration_hours: 3.5,
+            quote_refresh_cooldown: Duration::from_secs(10),
         };
         if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_SKEW_CENTS_PER_CONTRACT")
             && let Ok(n) = v.parse()
@@ -202,6 +209,11 @@ impl BookMakerConfig {
             && let Ok(n) = v.parse()
         {
             c.estimated_game_duration_hours = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_QUOTE_REFRESH_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            c.quote_refresh_cooldown = Duration::from_secs(n);
         }
         c
     }
@@ -749,15 +761,19 @@ impl BookMakerStrategy {
         // Sub-second book micro-moves trigger constant
         // cancel+repost churn across 70+ markets, blowing
         // through the OMS in-flight cap. Limit one re-quote
-        // cycle per ticker per 2s. Inside the flatten window
-        // we skip the cooldown so urgent flatten attempts go
-        // through.
+        // cycle per ticker per `quote_refresh_cooldown_secs`.
+        // The longer the cooldown, the longer our quotes rest
+        // at venue (more chance to be lifted by a taker) at
+        // the cost of staler prices. Default 10s — captures
+        // most fill opportunities while bounding churn.
+        // Inside the flatten window we skip the cooldown so
+        // urgent flatten attempts go through.
         let in_flatten = secs_to_settle
             .map(|s| s >= 0 && s < self.config.pre_settle_flatten_secs)
             .unwrap_or(false);
         if !in_flatten
             && let Some(&last) = self.last_quote_at.get(&ticker)
-            && last.elapsed() < Duration::from_secs(2)
+            && last.elapsed() < self.config.quote_refresh_cooldown
         {
             return;
         }
@@ -1116,6 +1132,7 @@ mod tests {
             pre_settle_flatten_secs: 600,
             skew_escalation_t_hours: 2.0,
             estimated_game_duration_hours: 3.5,
+            quote_refresh_cooldown: Duration::from_secs(10),
         });
         s.reload_markets();
         assert_eq!(s.market_count(), 1);
