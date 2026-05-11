@@ -14,6 +14,33 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-11 01:30 UTC — book-maker reverts to min_spread=2 with tighter SL/TP
+
+**Why**: the 4c min_spread was too restrictive. Only 2 intents
+fired in 20 minutes after the change — the maker was starved.
+
+**Reverted in `~/.config/predigy/book-maker-config.json`**:
+- `min_spread_cents` 4 → 2 across all 70 tickers (back to
+  maximum fill rate)
+
+**Tightened in `~/.zprofile`**:
+- `PREDIGY_BOOK_MAKER_STOP_LOSS_CENTS=4` (was 8) — cuts the
+  damage per adverse-selection fill in half
+- `PREDIGY_BOOK_MAKER_PROFIT_TAKE_CENTS=4` (was 5) —
+  symmetric P&L thresholds
+
+**Math** at the new settings:
+- 2c spread × ~50% round-trip rate = +1c per fill gross
+- 4c SL × ~10% adverse rate = -0.4c per fill
+- Net ~0.6c per fill if spreads capture cleanly
+- At 100+ fills/session → $0.60+/day vs $0.16/day at the
+  wider filter
+
+**Live evidence (within 30s of bounce)**: book-maker
+registered n_markets=70, immediately resumed multi-market
+quote acks (NYYBAL, MIAMIN, SFLAD all posting both bid+ask).
+Higher fill rate restored.
+
 ## 2026-05-10 23:45 UTC — book-maker min_spread_cents 2 → 4 (cut adverse selection)
 
 **Why**: post-stampede cleanup analysis showed 12 exit fills
