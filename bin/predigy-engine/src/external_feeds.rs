@@ -163,19 +163,28 @@ async fn nws_dispatcher_task(
     mut rx: mpsc::Receiver<NwsAlert>,
     consumers: Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>,
 ) {
+    use tokio::sync::mpsc::error::TrySendError;
     while let Some(alert) = rx.recv().await {
         let payload = nws_alert_to_payload(alert);
         let ev = Event::External(ExternalEvent::NwsAlert(payload));
         for (strategy, tx) in consumers.iter() {
+            // Skip strategies whose supervisor has permanently
+            // exited; see fan_out_external() for rationale.
+            if tx.is_closed() {
+                continue;
+            }
             // Use try_send so a slow strategy doesn't backpressure
             // the dispatcher (alerts are fan-out; one strategy's
             // queue full shouldn't stall the others).
-            if let Err(e) = tx.try_send(ev.clone()) {
-                warn!(
-                    strategy = strategy.0,
-                    error = %e,
-                    "external_feeds: nws fan-out failed (queue full or closed)"
-                );
+            match tx.try_send(ev.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Closed(_)) => {}
+                Err(TrySendError::Full(_)) => {
+                    warn!(
+                        strategy = strategy.0,
+                        "external_feeds: nws fan-out queue full"
+                    );
+                }
             }
         }
     }
@@ -309,14 +318,25 @@ fn fan_out_external(
     consumers: &Arc<Vec<(StrategyId, mpsc::Sender<Event>)>>,
     payload: ExternalEvent,
 ) {
+    use tokio::sync::mpsc::error::TrySendError;
     let ev = Event::External(payload);
     for (strategy, tx) in consumers.iter() {
-        if let Err(e) = tx.try_send(ev.clone()) {
-            warn!(
-                strategy = strategy.0,
-                error = %e,
-                "external_feeds: poly fan-out failed"
-            );
+        // Skip strategies whose supervisor has permanently exited
+        // (flap-stop or clean shutdown). The supervisor already
+        // logged the STOPPING line; we don't need to warn every
+        // delivery attempt thereafter.
+        if tx.is_closed() {
+            continue;
+        }
+        match tx.try_send(ev.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(
+                    strategy = strategy.0,
+                    "external_feeds: poly fan-out queue full"
+                );
+            }
         }
     }
 }

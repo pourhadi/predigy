@@ -524,6 +524,7 @@ async fn handle_event(
 }
 
 async fn fan_out(subs: &Arc<RwLock<Subscriptions>>, market: &str, book: &OrderBook) {
+    use tokio::sync::mpsc::error::TrySendError;
     let senders = {
         let s = subs.read().await;
         s.senders_for(market)
@@ -534,18 +535,27 @@ async fn fan_out(subs: &Arc<RwLock<Subscriptions>>, market: &str, book: &OrderBo
     // Clone the book once per strategy. Books are small (BTreeMap
     // of price levels), <1KB typical.
     for (strategy, tx) in senders {
+        // Skip strategies whose supervisor has permanently exited
+        // (flap-stop or clean shutdown). The supervisor already
+        // logged the STOPPING line; we don't spam a warn for every
+        // book update thereafter.
+        if tx.is_closed() {
+            continue;
+        }
         let ev = Event::BookUpdate {
             market: MarketTicker::new(market),
             book: book.clone(),
         };
-        if let Err(e) = tx.try_send(ev) {
-            // Slow strategy: don't block the router. Log + drop.
-            warn!(
-                strategy = strategy.0,
-                error = %e,
-                market,
-                "router: strategy event queue full or closed; dropping book update"
-            );
+        match tx.try_send(ev) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(
+                    strategy = strategy.0,
+                    market,
+                    "router: strategy event queue full; dropping book update"
+                );
+            }
         }
     }
 }

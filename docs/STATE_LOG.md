@@ -14,6 +14,74 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-12 05:18 UTC — engine restart: fan-out leak fix + DB pool raise
+
+**Why**: status check uncovered cross-arb had been generating
+~100 channel-closed warnings/second for ~7 hours, ballooning
+`engine.stderr.log` to 271 MB. Root cause: at 2026-05-11 19:47
+UTC the Postgres connection pool (`max_connections=8`) exhausted
+under combined load (6 strategies + venue-rest submitter +
+reconciliation + kill-switch pollers + persist-market-row +
+dashboard's own pool). cross-arb's supervisor saw 6 crashes in
+56s on `pool timed out` and flap-stopped the strategy
+permanently (`flap_threshold=5/120s`). But the market-data router
+and external-feeds dispatcher kept fanning every Kalshi book
+delta and Polymarket update to the dead channel, each `try_send`
+returning `Closed` and producing a WARN.
+
+Separate finding: `target/release/` directory had been deleted
+while the engine + dashboard processes kept running off
+in-memory binaries. All curator launchd jobs (`stat-curate`,
+`wx-curate`, `wx-stat-curate`, `arb-config-curate`,
+`cross-arb-curate`, `calibration`, `opportunity-scanner`,
+`paper-trader`) had been exiting 127 since the deletion.
+
+**Code changes** (`bin/predigy-engine/`):
+
+- `external_feeds.rs` — `fan_out_external` + `nws_dispatcher_task`
+  now check `tx.is_closed()` before `try_send` and match on
+  `TrySendError::Closed` to skip silently. WARN preserved only
+  for `TrySendError::Full` (genuine slow-strategy backpressure,
+  not dead-strategy noise).
+- `market_data.rs` — same treatment in the book-update `fan_out`.
+- `main.rs` — `connect_with_retry` PgPool sized
+  `max_connections=8 → 32`, `acquire_timeout=5s → 10s`. Sized
+  for the engine's concurrent load with headroom; nowhere near
+  Postgres default `max_connections=100`.
+
+**Deploy steps**:
+- `cargo build --release` — rebuilt all binaries (target/release
+  restored, ~3m25s).
+- Rotated `engine.stderr.log` → `engine.stderr.log.preFix.20260512_051810`
+  (271 MB preserved for forensics).
+- `launchctl kickstart -k gui/$(id -u)/com.predigy.engine` +
+  `com.predigy.dashboard`.
+- Manually kicked + verified each curator script.
+
+**Live verification**:
+- Engine log post-restart: 153 lines / 31 KB, **0 channel-closed**,
+  **0 ERROR** (vs 1.58M / 433k / many before).
+- cross-arb supervisor: registered, boot grace ended, healthy.
+- Reconciliation immediately caught the 2 stale phantom positions
+  the old engine was carrying (`KXNBAPTS-26MAY11DETCLE-CLEEMOBLEY4-15`
+  -25 → 0, `KXMLBGAME-26MAY111907TBTOR-TB` 1 → 0). open positions
+  4 strategies / 23 rows → 3 strategies / 19 rows.
+- Dashboard: HTTP 200 sub-ms on `/`, `/api/state`, `/healthz`;
+  no DB pool exhaustion since restart.
+- launchctl status: 9/10 jobs last-exit 0; wx-stat-curate's status
+  reflects a pre-rebuild attempt and will heal on next hourly run.
+
+**Known follow-up**: `book-maker` still thrashes IOC sl exits on
+`KXNHLGAME-26MAY12ANAVGK-ANA` — engine's local touch is stale
+(yes_ask=43 cached) but the Kalshi REST `markets/.../orderbook`
+shows venue has NO bids or asks. Every 8s the strategy emits an
+IOC buy @43 that venue immediately cancels (no liquidity to
+match). Harmless to capital (cancelled IOCs cost no fees) but
+noisy. Principled fix: per-ticker consecutive-failed-exit
+counter that suspends emission after N cancellations without a
+position change. Out of scope this round; see SESSIONS.md
+"Open work".
+
 ## 2026-05-11 01:30 UTC — book-maker reverts to min_spread=2 with tighter SL/TP
 
 **Why**: the 4c min_spread was too restrictive. Only 2 intents

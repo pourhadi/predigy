@@ -16,7 +16,13 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-09, post arb-scaling raise)
+## What is running RIGHT NOW (2026-05-12, post fan-out-leak fix)
+
+Latest engine bounce: 2026-05-12 05:18 UTC. Rebuilt + restarted
+to deploy two engine fixes (fan-out leak that silently dropped
+delivery to flap-stopped strategies, and DB pool size raise
+8→32 that caused the cascading crash). Full timeline:
+`docs/STATE_LOG.md` § 2026-05-12 05:18 UTC.
 
 ```
 launchctl list | grep predigy
@@ -24,7 +30,7 @@ launchctl list | grep predigy
 
 | Job | What it does | State |
 |---|---|---|
-| `com.predigy.engine` | Consolidated trader. Owns OMS, market data, exec, **6 active strategies** post-audit. | running, mode=Live |
+| `com.predigy.engine` | Consolidated trader. Owns OMS, market data, exec, **5 active strategies** (book-maker era). | running, mode=Live |
 | `com.predigy.cross-arb-curate` | Anthropic-driven Kalshi×Polymarket pair curator. 2-min cron (post-Phase-A). | scheduled |
 | `com.predigy.stat-curate` | model_p curator for stat strategy. | scheduled |
 | `com.predigy.wx-curate` | NWS-state-aware weather rule curator. (Was for the now-disabled latency strategy; kept running so rules don't go stale if latency is re-enabled later.) | scheduled |
@@ -39,10 +45,25 @@ launchctl list | grep predigy
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
 `stat-rules.json` on every import tick.
 
-**Active engine strategies (5, post-2026-05-09 wx-stat halt):**
-`stat`, `settlement`, `cross-arb`, `internal-arb`, `implication-arb`.
+**Active engine strategies (5, post-2026-05-12 restart):**
+`stat`, `settlement`, `cross-arb`, `implication-arb`, `book-maker`.
 
-**Disabled engine strategies (5):** `wx-stat`, `book-imbalance`,
+`book-maker` was deployed 2026-05-10 (commits `3673f77`,
+`d204119`, plus 7 subsequent tuning commits). Post-only YES
+quoting across 70 family tickers (NHL/NBA/MLB/EPL/Serie A/La
+Liga game markets). High activity by design: 2,062 cancellations
+/ 235 fills since 2026-05-09 (~89% cancel rate is normal for
+post-only requoting). Net P&L since deploy: −$5.21 / 101 closed.
+
+`internal-arb` was **halted** 2026-05-10 (commit `038dd98`:
+"halt internal-arb, expand book-maker"). Its 2-leg event-family
+alpha is now harvested by `book-maker` as a maker instead of a
+taker. Two residual positions still on the books (will resolve at
+settlement). Net since cutover: **+$2.46** (the only profitable
+strategy lane).
+
+**Disabled engine strategies (6):** `internal-arb` (halted
+2026-05-10), `wx-stat` (halted 2026-05-09), `book-imbalance`,
 `variance-fade`, `latency`, `news-trader`. Disabled by unsetting
 their config env vars in `~/.zprofile` (engine skips registration
 when `PREDIGY_*_CONFIG` / `PREDIGY_*_RULE_FILE` /
@@ -264,17 +285,37 @@ snapshot.
 
 The 2026-05-08 mechanism audit (see `docs/AUDIT_2026-05-08.md`)
 is the current strategic frame. Live fleet has been narrowed
-from 10 → 6 strategies; force-flatten of 32/52 positions freed capital;
-legacy launchd traders + `predigy-import` are disabled; engine is
-**disarmed and trading** as of the 2026-05-08 ops cleanup. Account value
-is roughly mid-$70s ($100 deposited net minus shake-down losses).
+from 10 → 5 strategies (`internal-arb` halted 2026-05-10 in favor
+of `book-maker`); legacy launchd traders + `predigy-import` are
+disabled; engine is **disarmed and trading** as of the
+2026-05-12 fan-out-leak fix. Account value approximately mid-$70s
+($100 deposited net minus net realized P&L of −$37.69 across
+249 closed positions since 2026-05-07 cutover).
 
-1. **Watch the surviving 6 for ≥30 closed trades each before
+0. **`book-maker` SL-thrash on stale-touch tickers — needs a
+   principled fix.** As of 2026-05-12 the strategy fires IOC sl
+   exits every 8s on `KXNHLGAME-26MAY12ANAVGK-ANA` (−1 yes @
+   49, local touch yes_ask=43). Kalshi REST shows venue has NO
+   bids/asks for this ticker — so every IOC buy @43 cancels with
+   0 fill. Harmless to capital (cancelled IOCs cost no fees) but
+   noisy. Principled fix: in `crates/strategies/book-maker/src/lib.rs`,
+   track a per-ticker `consecutive_failed_exits` counter incremented
+   when `evaluate_exits` emits without the position changing,
+   reset on any fill that touches the position; after N (suggest 5)
+   consecutive failed emits, suspend exit emission for that ticker
+   for a cooldown (suggest 10m) and emit a single WARN. This
+   prevents infinite thrash when venue liquidity has evaporated
+   under the strategy's stale local touch.
+
+1. **Watch the surviving 5 for ≥30 closed trades each before
    scaling caps.** The audit's mechanism verdict is theoretical —
    live realized P&L on unforced exits is what proves it.
-   Highest-conviction strategies: `wx-stat` (NBM is genuinely
-   skilled), `internal-arb` and `implication-arb` (real arb math).
-   On probation: `stat`, `settlement`, `cross-arb`.
+   Highest-conviction strategies: `implication-arb` (real arb math).
+   On probation: `stat` (no rules active), `settlement`,
+   `cross-arb`, `book-maker`. The freshly-deployed `book-maker`
+   needs its own 30-closed-trades observation window — current
+   sample (101 closed, −$5.21 net) is dominated by tuning iterations
+   and isn't a fair read yet.
 
 2. **Residual short-dated weather positions auto-settle in 24-48h**
    from the 2026-05-07 force-flatten. The ops cleanup aligned DB

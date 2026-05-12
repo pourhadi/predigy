@@ -748,9 +748,18 @@ async fn connect_with_retry(url: &str) -> Result<sqlx::PgPool> {
     let mut backoff = Duration::from_secs(1);
     let max = Duration::from_secs(30);
     for attempt in 1..=10 {
+        // Pool sized for the consolidated engine's concurrent
+        // load: 6 strategy supervisors each emitting submits +
+        // venue-rest submitter (drain_submits / drain_cancels) +
+        // OMS reconciliation loop + kill-switch pollers (global +
+        // per-strategy) + router persist-market-row + book/fill
+        // event consumers. At 8 the pool would briefly exhaust
+        // under a busy quote-burst, time out, and crash strategy
+        // tasks. 32 leaves room for headroom without coming
+        // anywhere near Postgres's default max_connections=100.
         match PgPoolOptions::new()
-            .max_connections(8)
-            .acquire_timeout(Duration::from_secs(5))
+            .max_connections(32)
+            .acquire_timeout(Duration::from_secs(10))
             .connect(url)
             .await
         {
