@@ -1,55 +1,76 @@
 # Operational runbook
 
 > Day-to-day commands for running, debugging, and intervening
-> with the predigy stack on macOS.
+> with the predigy stack.
+>
+> **Production host as of 2026-05-12 is the Pi at `nas.local`**
+> (`dan@192.168.1.35`) — see [`DEPLOY.md`](./DEPLOY.md) for the
+> deploy layout and cutover/rollback runbooks. The Linux commands
+> below are the canonical ones; the macOS commands underneath each
+> section are the rollback path only.
 
 ## Health checks
 
 ### Is everything running?
 
+**Pi (production):**
+
+```sh
+ssh dan@nas.local 'systemctl --user list-units "predigy-*"'
+ssh dan@nas.local 'systemctl --user list-timers "predigy-*"'
+```
+
+Expected: `predigy-engine.service` + `predigy-dashboard.service`
+`active (running)`; eight timers (`*-curate`, `calibration`,
+`paper-trader`, `opportunity-scanner`, `eval-daily`, `db-backup`)
+`active (waiting)`. Any `failed` state is an error — inspect with
+`systemctl --user status predigy-<unit>` or `journalctl --user -u
+predigy-<unit>`.
+
+**Laptop (rollback path — services should currently be inactive):**
+
 ```sh
 launchctl list | grep predigy
 ```
 
-Expected (post-2026-05-08 ops cleanup):
-
-```
-<pid>  0  com.predigy.engine
-<pid>  0  com.predigy.dashboard
-<pid>  0  com.predigy.cross-arb-curate     # only when cron-firing
-   -   0  com.predigy.{stat,wx,wx-stat}-curate
-```
-
-`com.predigy.import` and the legacy trader jobs
-`{latency-trader,stat-trader,settlement,cross-arb}` should be absent and
-persistently disabled:
+If a row shows a non-zero second column, that's an error. Legacy
+trader jobs `{latency-trader,stat-trader,settlement,cross-arb}`
+plus `import` should be absent and persistently disabled:
 
 ```sh
 launchctl print-disabled "gui/$(id -u)" | grep 'com.predigy'
 ```
 
-The `<pid>  0` rows are running; the `-  0` rows are scheduled cron
-tasks waiting for next fire. Anything with a non-zero second column
-is in error.
-
 ### Engine status
+
+**Pi:**
 
 ```sh
 # Liveness:
-launchctl print "gui/$(id -u)/com.predigy.engine" | grep -E '^\s*state\s*='
+ssh dan@nas.local 'systemctl --user is-active predigy-engine.service'
 
-# Mode:
-grep "oms ready" ~/Library/Logs/predigy/engine.stderr.log | tail -1
+# Mode (Live vs Shadow):
+ssh dan@nas.local 'grep "oms ready" ~/.local/state/predigy/logs/engine.stderr.log | tail -1'
 
 # Recent activity:
+ssh dan@nas.local 'tail -n 50 ~/.local/state/predigy/logs/engine.stderr.log'
+# or via journald:
+ssh dan@nas.local 'journalctl --user -u predigy-engine -n 50 --no-pager'
+```
+
+**Laptop (rollback only):**
+
+```sh
+launchctl print "gui/$(id -u)/com.predigy.engine" | grep -E '^\s*state\s*='
+grep "oms ready" ~/Library/Logs/predigy/engine.stderr.log | tail -1
 tail -n 50 ~/Library/Logs/predigy/engine.stderr.log
 ```
 
 ### Dashboard
 
 ```sh
-open http://localhost:8080            # local
-open http://192.168.1.217:8080        # LAN (your phone)
+open http://nas.local:8080            # production
+open http://localhost:8080            # only if rolled back to laptop
 ```
 
 Top-level pill: green = engine fresh, warn = stale, bad = down.
@@ -135,9 +156,18 @@ psql -d predigy -c "SELECT strategy, COUNT(*) FROM model_p_snapshots WHERE ts > 
 
 ## Kill switch (panic button)
 
+**Pi (production):**
+
+```sh
+ssh dan@nas.local 'echo armed > ~/.config/predigy/kill-switch.flag'   # ARM
+ssh dan@nas.local ': > ~/.config/predigy/kill-switch.flag'            # DISARM (truncate)
+```
+
+**Laptop (rollback only):**
+
 ```sh
 echo armed > ~/.config/predigy/kill-switch.flag   # ARM
-: > ~/.config/predigy/kill-switch.flag            # DISARM (truncate)
+: > ~/.config/predigy/kill-switch.flag            # DISARM
 ```
 
 Engine + dashboard poll every 5s. Within 5s of arming, the engine
@@ -153,37 +183,42 @@ Treat it as a trading-control endpoint, not a read-only dashboard.
 
 ## Redeploy
 
+**Pi (production):**
+
+```sh
+ssh dan@nas.local 'cd ~/code/predigy && git pull && source ~/.cargo/env && cargo build --release -p predigy-engine'
+ssh dan@nas.local 'systemctl --user restart predigy-engine.service'
+ssh dan@nas.local 'tail -f ~/.local/state/predigy/logs/engine.stderr.log'
+```
+
+If a systemd unit file under `deploy/linux/systemd/` changed:
+
+```sh
+ssh dan@nas.local 'cd ~/code/predigy && git pull && bash deploy/linux/install-systemd.sh'
+```
+
+`install-systemd.sh` is idempotent — it re-copies units, runs
+`daemon-reload`, and `enable --now`s the services. It does not
+restart already-running services on its own; do that explicitly
+if you want the new unit definition to take effect on a running
+process.
+
+**Laptop (rollback only):**
+
 ```sh
 cd ~/code/predigy
 cargo build --release -p predigy-engine
-
-# Pick up the new binary (KeepAlive restarts the process):
 launchctl kickstart -k "gui/$(id -u)/com.predigy.engine"
-
-# Tail the new boot:
 tail -f ~/Library/Logs/predigy/engine.stderr.log
 ```
 
-If the plist itself changed (`deploy/macos/com.predigy.engine.plist`):
-
-```sh
-cp deploy/macos/com.predigy.engine.plist ~/Library/LaunchAgents/
-launchctl bootout "gui/$(id -u)/com.predigy.engine"
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.engine.plist
-```
-
-Scanner/calibration launchd jobs are non-order-entry jobs (`opportunity-scanner`
-currently every 15m, `calibration` hourly). The calibration job now runs
-`reconcile-venue-flat --write` after settlement sync; it can close DB-only
-stale positions only when authenticated venue exposure is flat and Kalshi
-market detail has a final binary outcome. Install/reload:
-
-```sh
-cp deploy/macos/com.predigy.opportunity-scanner.plist ~/Library/LaunchAgents/
-cp deploy/macos/com.predigy.calibration.plist ~/Library/LaunchAgents/
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.opportunity-scanner.plist
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.predigy.calibration.plist
-```
+Scanner/calibration jobs are non-order-entry. The calibration job
+runs `reconcile-venue-flat --write` after settlement sync; it can
+close DB-only stale positions only when authenticated venue
+exposure is flat and Kalshi market detail has a final binary
+outcome. On the Pi those are `predigy-calibration.timer` (15 m)
+and `predigy-opportunity-scanner.timer` (5 m) — managed by the
+same `install-systemd.sh` re-run shown above.
 
 ## Debugging
 
