@@ -442,6 +442,14 @@ fn should_suppress_exit_attempt(
     false
 }
 
+fn pnl_per_contract(mark_cents: i32, avg_entry_cents: i32, signed_qty: i32) -> i32 {
+    if signed_qty > 0 {
+        mark_cents.saturating_sub(avg_entry_cents)
+    } else {
+        avg_entry_cents.saturating_sub(mark_cents)
+    }
+}
+
 #[derive(Debug)]
 pub struct BookMakerStrategy {
     config: BookMakerConfig,
@@ -724,8 +732,9 @@ impl BookMakerStrategy {
                 continue;
             };
 
-            // Unrealized P&L per contract.
-            let pnl_per = mark.saturating_sub(leg.avg_entry_cents);
+            // Unrealized P&L per contract. Short YES inventory profits
+            // when the YES ask falls, not when it rises.
+            let pnl_per = pnl_per_contract(mark, leg.avg_entry_cents, leg.signed_qty);
             let profit_take = pnl_per >= self.config.profit_take_cents;
             let stop_loss = pnl_per <= -self.config.stop_loss_cents;
 
@@ -1124,6 +1133,23 @@ impl Strategy for BookMakerStrategy {
 mod tests {
     use super::*;
 
+    fn test_strategy() -> BookMakerStrategy {
+        BookMakerStrategy::new(BookMakerConfig {
+            config_file: PathBuf::from("/tmp/book-maker-test.json"),
+            inventory_skew_cents_per_contract: 1,
+            config_refresh_interval: Duration::from_secs(30),
+            profit_take_cents: 5,
+            stop_loss_cents: 8,
+            pre_settle_halt_secs: 1800,
+            pre_settle_flatten_secs: 600,
+            skew_escalation_t_hours: 2.0,
+            estimated_game_duration_hours: 3.5,
+            quote_refresh_cooldown: Duration::from_secs(10),
+            exit_failure_threshold: 5,
+            exit_failure_cooldown: Duration::from_secs(600),
+        })
+    }
+
     #[test]
     fn quote_steps_inside_touch() {
         let q = compute_desired_quotes(40, 60, 0, 1, 2).unwrap();
@@ -1187,6 +1213,64 @@ mod tests {
         // that bit the engine cutover (commit 0c05c40).
         let cid = BookMakerStrategy::build_cid("KXBRAZILINF-T4.30", QuoteSide::Bid, 50);
         assert!(!cid.contains('.'));
+    }
+
+    #[test]
+    fn short_yes_profit_take_uses_entry_minus_mark() {
+        let mut s = test_strategy();
+        s.open_legs.insert(
+            "KXFOO".to_string(),
+            vec![OpenLeg {
+                signed_qty: -1,
+                avg_entry_cents: 49,
+                side: "yes".to_string(),
+            }],
+        );
+
+        s.evaluate_exits(
+            "KXFOO",
+            &CachedTouch {
+                yes_bid_cents: 39,
+                yes_ask_cents: 41,
+            },
+            None,
+        );
+
+        assert_eq!(s.pending_intents.len(), 1);
+        let intent = &s.pending_intents[0];
+        assert_eq!(intent.action, IntentAction::Buy);
+        assert_eq!(intent.price_cents, Some(41));
+        assert!(intent.reason.as_deref().unwrap().contains("exit tp"));
+        assert!(intent.reason.as_deref().unwrap().contains("pnl=8c"));
+    }
+
+    #[test]
+    fn short_yes_stop_loss_uses_entry_minus_mark() {
+        let mut s = test_strategy();
+        s.open_legs.insert(
+            "KXFOO".to_string(),
+            vec![OpenLeg {
+                signed_qty: -1,
+                avg_entry_cents: 49,
+                side: "yes".to_string(),
+            }],
+        );
+
+        s.evaluate_exits(
+            "KXFOO",
+            &CachedTouch {
+                yes_bid_cents: 55,
+                yes_ask_cents: 57,
+            },
+            None,
+        );
+
+        assert_eq!(s.pending_intents.len(), 1);
+        let intent = &s.pending_intents[0];
+        assert_eq!(intent.action, IntentAction::Buy);
+        assert_eq!(intent.price_cents, Some(57));
+        assert!(intent.reason.as_deref().unwrap().contains("exit sl"));
+        assert!(intent.reason.as_deref().unwrap().contains("pnl=-8c"));
     }
 
     #[test]
