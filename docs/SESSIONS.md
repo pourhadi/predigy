@@ -16,33 +16,52 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-12, post OMS cleanup)
+## What is running RIGHT NOW (2026-05-12, post host-cutover)
 
-Latest engine bounce: 2026-05-12 06:15 UTC. Rebuilt + restarted
-to deploy the zero-fill IOC/FOK terminal-status fix in the REST
-submitter. Earlier in the same incident window the engine also
-deployed conservative OMS cleanup for venue-only Predigy orders,
-the fan-out leak fix, and the DB pool size raise (8→32) that
-stopped the cross-arb flap-stop / channel-closed log flood. Full
-timeline: `docs/STATE_LOG.md` § 2026-05-12 06:16 UTC, §
-2026-05-12 06:00 UTC, and § 2026-05-12 05:18 UTC.
+**Production host: Raspberry Pi 5 at `nas.local` (`dan@192.168.1.35`).**
+Host cutover from the operator's macOS laptop landed 2026-05-12
+07:23 UTC. Engine restarted on the Pi in `mode=Live`; 21 open
+positions restored from the laptop's `pg_dump`; reconciliation
+clean (no venue drift). The macOS launchd plists are still
+installed but `launchctl bootout`'d — they're the rollback path
+for ~7 days via `deploy/linux/rollback.sh`.
 
+Prior engine bounces that landed earlier the same day are
+captured in `docs/STATE_LOG.md` (zero-fill IOC/FOK terminal-status
+fix § 06:16 UTC, conservative OMS cleanup § 06:00 UTC, fan-out
+leak + DB pool 8→32 § 05:18 UTC) — all of those fixes shipped
+in the binary that the Pi is now running.
+
+See [`docs/DEPLOY.md`](./DEPLOY.md) for the full deploy layout,
+cutover/rollback runbooks, and day-to-day commands.
+
+```sh
+ssh dan@nas.local 'systemctl --user list-units "predigy-*"'
+ssh dan@nas.local 'systemctl --user list-timers "predigy-*"'
 ```
-launchctl list | grep predigy
-```
 
-| Job | What it does | State |
+| User unit | What it does | State |
 |---|---|---|
-| `com.predigy.engine` | Consolidated trader. Owns OMS, market data, exec, **5 active strategies** (book-maker era). | running, mode=Live |
-| `com.predigy.cross-arb-curate` | Anthropic-driven Kalshi×Polymarket pair curator. 2-min cron (post-Phase-A). | scheduled |
-| `com.predigy.stat-curate` | model_p curator for stat strategy. | scheduled |
-| `com.predigy.wx-curate` | NWS-state-aware weather rule curator. (Was for the now-disabled latency strategy; kept running so rules don't go stale if latency is re-enabled later.) | scheduled |
-| `com.predigy.wx-stat-curate` | NBM-quantile probabilistic weather rules. Hourly post-Phase-A. | scheduled |
-| `com.predigy.dashboard` | HTTP/HTML dashboard at port 8080; includes `/calibration`. | running |
-| `com.predigy.opportunity-scanner` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. | scheduled every **5m** (post-2026-05-09) |
-| `com.predigy.calibration` | Settlement sync + reliability report writer. | scheduled hourly |
-| `com.predigy.arb-config-curate` | Validates implication-arb / internal-arb configs against Kalshi state, drops settled, seeds new active ladders + 2-leg families. | scheduled every 30m + RunAtLoad (post-2026-05-08) |
-| `com.predigy.paper-trader` | Shadow-executes stat-curator rules vs live Kalshi prices into `paper_trades`; reconciles on settlement. **No orders submitted.** Evidence layer gating `stat` re-enable. | scheduled every 5m (post-2026-05-09) |
+| `predigy-engine.service` | Consolidated trader. Owns OMS, market data, exec, **5 active strategies** (book-maker era). | running, mode=Live |
+| `predigy-dashboard.service` | HTTP/HTML dashboard at `http://nas.local:8080`; includes `/calibration`. | running |
+| `predigy-cross-arb-curate.timer` | Anthropic-driven Kalshi×Polymarket pair curator. 2-min cadence. | scheduled |
+| `predigy-stat-curate.timer` | model_p curator for stat strategy. 6h calendar (02/08/14/20 local). | scheduled |
+| `predigy-arb-config-curate.timer` | Validates implication-arb / internal-arb configs against Kalshi state, drops settled, seeds new active ladders + 2-leg families. 30m. | scheduled |
+| `predigy-calibration.timer` | Settlement sync + venue-flat reconcile + reliability reports. 15m. | scheduled |
+| `predigy-paper-trader.timer` | Shadow-executes stat-curator rules vs live Kalshi prices into `paper_trades`; reconciles on settlement. **No orders submitted.** Evidence layer gating `stat` re-enable. 5m. | scheduled |
+| `predigy-opportunity-scanner.timer` | Observation-only scanner writing `opportunity_observations`; no OMS/orders. 5m. | scheduled |
+| `predigy-eval-daily.timer` | 24h strategy report → `~/.local/state/predigy/logs/eval/`. 23:55 local. | scheduled |
+| `predigy-db-backup.timer` | `pg_dump` + gzip + 30-day rotation to `~/.local/state/predigy/backups/`. Daily 03:00 local. | scheduled |
+
+**Skipped on the Pi by design:** `wx-curate` (latency strategy
+DISABLED 2026-05-08) and `wx-stat-curate` (`wx-stat` strategy
+DISABLED 2026-05-09). Add the units back when those strategies
+re-enable.
+
+Pre-cutover, the same workload ran under launchd on the laptop
+(`com.predigy.*` plists still under `~/Library/LaunchAgents/`
+for rollback only — see [`deploy/macos/`](../deploy/macos/) for
+the source plists).
 
 `com.predigy.import` is intentionally **disabled**. With legacy traders
 retired, the JSON mirror was stale and re-enabled disabled `stat` rules from
