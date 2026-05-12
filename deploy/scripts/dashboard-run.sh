@@ -12,7 +12,7 @@ set -euo pipefail
 
 PREDIGY_HOME="${PREDIGY_HOME:-$HOME/code/predigy}"
 CONFIG_DIR="${HOME}/.config/predigy"
-LOG_DIR="${HOME}/Library/Logs/predigy"
+LOG_DIR="${PREDIGY_LOG_DIR:-${HOME}/Library/Logs/predigy}"
 
 KALSHI_KEY_ID="${KALSHI_KEY_ID:?KALSHI_KEY_ID env var required}"
 KALSHI_PEM="${KALSHI_PEM:-${CONFIG_DIR}/kalshi.pem}"

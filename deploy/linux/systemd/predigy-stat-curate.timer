@@ -1,0 +1,14 @@
+[Unit]
+Description=Schedule predigy stat-curator every 6h (02/08/14/20 local)
+
+[Timer]
+# Matches com.predigy.stat-curate.plist's StartCalendarInterval.
+OnCalendar=*-*-* 02,08,14,20:00:00
+# Fire on enable to mirror RunAtLoad=true on macOS.
+OnActiveSec=1min
+# Catch up if the Pi was off when the calendar tick fired.
+Persistent=true
+Unit=predigy-stat-curate.service
+
+[Install]
+WantedBy=timers.target

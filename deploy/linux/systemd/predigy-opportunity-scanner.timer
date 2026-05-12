@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule predigy opportunity-scanner every 5 minutes
+
+[Timer]
+# Matches com.predigy.opportunity-scanner.plist StartInterval=300 (tightened from 15m on 2026-05-09).
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=predigy-opportunity-scanner.service
+
+[Install]
+WantedBy=timers.target

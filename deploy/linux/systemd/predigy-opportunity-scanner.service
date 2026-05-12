@@ -1,0 +1,12 @@
+[Unit]
+Description=predigy opportunity-scanner (read-only arbitrage observations)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/predigy
+EnvironmentFile=%h/.config/predigy/env
+ExecStart=%h/code/predigy/deploy/scripts/opportunity-scanner-run.sh
+StandardOutput=append:%h/.local/state/predigy/logs/opportunity-scanner.stdout.log
+StandardError=append:%h/.local/state/predigy/logs/opportunity-scanner.stderr.log

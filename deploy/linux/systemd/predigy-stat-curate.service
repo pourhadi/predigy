@@ -1,0 +1,12 @@
+[Unit]
+Description=predigy stat-curator (Claude-driven stat rule generation)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/predigy
+EnvironmentFile=%h/.config/predigy/env
+ExecStart=%h/code/predigy/deploy/scripts/stat-curate.sh
+StandardOutput=append:%h/.local/state/predigy/logs/stat-curate.stdout.log
+StandardError=append:%h/.local/state/predigy/logs/stat-curate.stderr.log

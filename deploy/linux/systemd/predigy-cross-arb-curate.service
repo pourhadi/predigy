@@ -1,0 +1,12 @@
+[Unit]
+Description=predigy cross-arb-curator (Kalshi x Polymarket pair finder)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/predigy
+EnvironmentFile=%h/.config/predigy/env
+ExecStart=%h/code/predigy/deploy/scripts/cross-arb-curate.sh
+StandardOutput=append:%h/.local/state/predigy/logs/cross-arb-curate.stdout.log
+StandardError=append:%h/.local/state/predigy/logs/cross-arb-curate.stderr.log

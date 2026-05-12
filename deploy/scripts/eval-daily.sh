@@ -13,7 +13,7 @@
 set -euo pipefail
 
 PREDIGY_HOME="${PREDIGY_HOME:-$HOME/code/predigy}"
-LOG_DIR="${HOME}/Library/Logs/predigy/eval"
+LOG_DIR="${PREDIGY_LOG_DIR:-${HOME}/Library/Logs/predigy}/eval"
 mkdir -p "$LOG_DIR"
 
 today=$(date +%Y-%m-%d)
