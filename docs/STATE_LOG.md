@@ -50,6 +50,17 @@ and polluted logs.
 - 70s post-suppression watch: no further KXNHLGAME exit emits,
   no new KXNHLGAME intents, engine healthy.
 
+**Follow-up 2026-05-12 05:54 UTC**: tightened retry behavior.
+The first deployed suppression allowed a full 5-attempt burst
+again every 10 minutes after cooldown expiry. `ExitAttemptState`
+now keeps `consecutive_emits` above threshold when a suppression
+window expires, so an unchanged position receives exactly one
+liquidity probe before immediate re-suppression. Verified by new
+unit test `expired_exit_suppression_allows_only_one_probe`
+(`cargo test -p predigy-strategy-book-maker`: 14/14 passed) and
+live redeploy. Engine remained healthy; the post-restart in-memory
+counter naturally started fresh, hit 5 attempts, then suppressed.
+
 ## 2026-05-12 05:18 UTC — engine restart: fan-out leak fix + DB pool raise
 
 **Why**: status check uncovered cross-arb had been generating

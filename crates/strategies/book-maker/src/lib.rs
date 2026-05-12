@@ -417,6 +417,31 @@ struct ExitAttemptState {
     suppressed_until: Option<Instant>,
 }
 
+fn should_suppress_exit_attempt(
+    state: &mut ExitAttemptState,
+    signature: &ExitPositionSignature,
+    now: Instant,
+) -> bool {
+    if state.signature != *signature {
+        state.signature = signature.clone();
+        state.consecutive_emits = 0;
+        state.suppressed_until = None;
+        return false;
+    }
+    if let Some(until) = state.suppressed_until {
+        if until > now {
+            return true;
+        }
+        // Keep the counter above threshold after the cooldown
+        // expires. That turns the next unchanged-position exit
+        // into a single liquidity probe; if it still does not
+        // change the position, we immediately suppress again
+        // instead of allowing another full threshold-sized burst.
+        state.suppressed_until = None;
+    }
+    false
+}
+
 #[derive(Debug)]
 pub struct BookMakerStrategy {
     config: BookMakerConfig,
@@ -630,16 +655,8 @@ impl BookMakerStrategy {
                 consecutive_emits: 0,
                 suppressed_until: None,
             });
-        if state.signature != signature {
-            state.signature = signature.clone();
-            state.consecutive_emits = 0;
-            state.suppressed_until = None;
-        } else if let Some(until) = state.suppressed_until {
-            if until > now {
-                return;
-            }
-            state.consecutive_emits = 0;
-            state.suppressed_until = None;
+        if should_suppress_exit_attempt(state, &signature, now) {
+            return;
         }
         let in_flatten_window = secs_to_settle
             .map(|s| s >= 0 && s < self.config.pre_settle_flatten_secs)
@@ -1253,5 +1270,28 @@ mod tests {
         ];
         let b = vec![a[1].clone(), a[0].clone()];
         assert_eq!(exit_position_signature(&a), exit_position_signature(&b));
+    }
+
+    #[test]
+    fn expired_exit_suppression_allows_only_one_probe() {
+        let signature = vec![("yes".to_string(), -1, 49)];
+        let now = Instant::now();
+        let mut state = ExitAttemptState {
+            signature: signature.clone(),
+            consecutive_emits: 5,
+            suppressed_until: Some(now - Duration::from_secs(1)),
+        };
+
+        assert!(!should_suppress_exit_attempt(&mut state, &signature, now));
+        assert_eq!(state.consecutive_emits, 5);
+        assert!(state.suppressed_until.is_none());
+
+        state.suppressed_until = Some(now + Duration::from_secs(600));
+        assert!(should_suppress_exit_attempt(&mut state, &signature, now));
+
+        let changed = vec![("yes".to_string(), 0, 49)];
+        assert!(!should_suppress_exit_attempt(&mut state, &changed, now));
+        assert_eq!(state.consecutive_emits, 0);
+        assert!(state.suppressed_until.is_none());
     }
 }

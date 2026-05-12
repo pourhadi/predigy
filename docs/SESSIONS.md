@@ -295,7 +295,10 @@ disabled; engine is **disarmed and trading** as of the
 0. **`book-maker` stale-touch SL-thrash fixed 2026-05-12 05:37
    UTC.** The strategy now tracks unchanged-position IOC exit
    attempts per ticker and suppresses further exits after 5
-   consecutive attempts for 10 minutes. Live verification on
+   consecutive attempts for 10 minutes. A 05:54 follow-up tightened
+   cooldown expiry to one liquidity probe before immediate
+   re-suppression, so stale touches no longer get a fresh 5-attempt
+   burst every 10 minutes. Live verification on
    `KXNHLGAME-26MAY12ANAVGK-ANA`: suppression fired at exactly
    5 attempts and no new emits/intents appeared in the 70s watch
    window. If this becomes too conservative, tune
