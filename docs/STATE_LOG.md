@@ -14,6 +14,41 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-12 06:00 UTC — OMS cancels venue-only Predigy orders during reconciliation
+
+**Why**: after the fan-out / DB-pool fix, reconciliation still
+warned once per minute about 5 `orders_only_at_venue` entries.
+Postgres had no active intents and no rows with those
+`venue_order_id`s, so the orders were live at Kalshi but unmanaged
+by the DB-backed OMS. Leaving them open risks unmanaged fills and
+keeps reconciliation noisy.
+
+**Code change** (`bin/predigy-engine/src/oms_db.rs`):
+
+- During `Oms::reconcile`, venue-only resting orders are now
+  cancelled automatically **only if** their venue `client_order_id`
+  starts with a known Predigy strategy prefix (`book-maker:`,
+  `cross-arb:`, `stat:`, etc.).
+- Manual / unknown client IDs are left alone and continue to appear
+  in `orders_only_at_venue` so the operator can inspect them.
+- Added unit coverage that prefix detection is bounded and does
+  not match strings like `manual:book-maker:...`.
+
+**Verification**:
+
+- `cargo test -p predigy-engine predigy_client_order_id_detection_is_prefix_bounded`: passed.
+- `cargo fmt && cargo build --release -p predigy-engine`: passed.
+- Engine restarted live at 05:59 UTC.
+- First reconciliation pass cancelled all 5 venue-only Predigy
+  orders (`reduced_by=1.00` each):
+  `da550ae5-175f-41fa-84f0-c81533187ac2`,
+  `c658559c-9c27-4f5d-b5bd-55e888a597ad`,
+  `d1ba9c51-faa0-48e4-83dc-cb47612ce22a`,
+  `705f3e4e-3eae-43c2-9155-2e800a139972`,
+  `facba00e-a6f8-427b-91df-a37cbe42657d`.
+- No reconciliation WARNs after 06:01 UTC; active nonterminal DB
+  intents remained 0.
+
 ## 2026-05-12 05:37 UTC — book-maker stale-touch exit suppression
 
 **Why**: after the 05:18 engine restart, `book-maker` resumed a

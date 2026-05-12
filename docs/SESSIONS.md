@@ -16,13 +16,15 @@ wants:
 - No fallbacks. Find the root cause; fix it.
 - Comprehensive production-ready code. No demos.
 
-## What is running RIGHT NOW (2026-05-12, post fan-out-leak fix)
+## What is running RIGHT NOW (2026-05-12, post OMS cleanup)
 
-Latest engine bounce: 2026-05-12 05:18 UTC. Rebuilt + restarted
-to deploy two engine fixes (fan-out leak that silently dropped
-delivery to flap-stopped strategies, and DB pool size raise
-8→32 that caused the cascading crash). Full timeline:
-`docs/STATE_LOG.md` § 2026-05-12 05:18 UTC.
+Latest engine bounce: 2026-05-12 05:59 UTC. Rebuilt + restarted
+to deploy conservative OMS cleanup for venue-only Predigy orders.
+Earlier in the same incident window the engine also deployed the
+fan-out leak fix and DB pool size raise (8→32) that stopped the
+cross-arb flap-stop / channel-closed log flood. Full timeline:
+`docs/STATE_LOG.md` § 2026-05-12 06:00 UTC and § 2026-05-12
+05:18 UTC.
 
 ```
 launchctl list | grep predigy
@@ -292,7 +294,16 @@ disabled; engine is **disarmed and trading** as of the
 ($100 deposited net minus net realized P&L of −$37.69 across
 249 closed positions since 2026-05-07 cutover).
 
-0. **`book-maker` stale-touch SL-thrash fixed 2026-05-12 05:37
+0. **OMS venue-only Predigy order cleanup deployed 2026-05-12
+   06:00 UTC.** Reconciliation now automatically cancels resting
+   venue-only orders only when their Kalshi `client_order_id` starts
+   with a known Predigy strategy prefix. Manual/unknown venue-only
+   orders are still left alone and reported. The first live pass
+   cancelled all 5 unmanaged Predigy orders left over from the prior
+   crash window; no reconciliation WARNs appeared after 06:01 UTC,
+   and active nonterminal DB intents remained 0.
+
+1. **`book-maker` stale-touch SL-thrash fixed 2026-05-12 05:37
    UTC.** The strategy now tracks unchanged-position IOC exit
    attempts per ticker and suppresses further exits after 5
    consecutive attempts for 10 minutes. A 05:54 follow-up tightened
@@ -305,7 +316,7 @@ disabled; engine is **disarmed and trading** as of the
    `PREDIGY_BOOK_MAKER_EXIT_FAILURE_THRESHOLD` or
    `PREDIGY_BOOK_MAKER_EXIT_FAILURE_COOLDOWN_SECS` in `~/.zprofile`.
 
-1. **Watch the surviving 5 for ≥30 closed trades each before
+2. **Watch the surviving 5 for ≥30 closed trades each before
    scaling caps.** The audit's mechanism verdict is theoretical —
    live realized P&L on unforced exits is what proves it.
    Highest-conviction strategies: `implication-arb` (real arb math).
@@ -315,13 +326,13 @@ disabled; engine is **disarmed and trading** as of the
    sample (101 closed, −$5.21 net) is dominated by tuning iterations
    and isn't a fair read yet.
 
-2. **Residual short-dated weather positions auto-settle in 24-48h**
+3. **Residual short-dated weather positions auto-settle in 24-48h**
    from the 2026-05-07 force-flatten. The ops cleanup aligned DB
    aggregate exposure to Kalshi venue exposure, but realized P&L from
    the force-flatten/settlement mess is still not clean strategy evidence.
    Don't conflate it with post-cleanup unforced strategy P&L.
 
-3. **stat econ rules disabled pending recalibration.** All 9
+4. **stat econ rules disabled pending recalibration.** All 9
    active stat rules were econ markets (BRAZILINF, ECONSTATU3,
    PAYROLLS, U3) — the audit said model_p calibration on these
    is unproven. `stat-curator --shadow-db` and `predigy-calibration`
@@ -329,19 +340,19 @@ disabled; engine is **disarmed and trading** as of the
    calibration report shows enough settled out-of-sample samples and
    positive after-fee expectancy.
 
-4. **wx-stat is the highest-leverage strategy to watch.** New
+5. **wx-stat is the highest-leverage strategy to watch.** New
    defaults: `min_ask_cents=5` (skip lottery tickets) and
    `max_notional_per_fire_cents=500` ($5/ticker cap). Active
    exits remain settlement-only. If hit-rate × edge × size is
    positive over 30+ closed trades, raise the per-fire cap.
 
-5. **cross-arb on probation.** `min_edge_cents` 1 → 3 fixes the
+6. **cross-arb on probation.** `min_edge_cents` 1 → 3 fixes the
    fee-floor bug. 18 venue-reconcile phantom rows purged from
    the contract-cap accounting, and the legacy `cross-arb` launchd
    job is disabled so the curator cannot restart the old trader.
    Watch for actual fires from the consolidated engine only.
 
-6. **Disabled-strategy re-enable conditions** (per
+7. **Disabled-strategy re-enable conditions** (per
    `docs/AUDIT_2026-05-08.md`):
    - `book-imbalance`: signal-quality study + same-ticker
      both-side gate.
@@ -350,15 +361,15 @@ disabled; engine is **disarmed and trading** as of the
    - `news-trader`: classifier service deployed and writing JSONL.
    - `latency`: B4 FIX access + us-east-2 VPS.
 
-7. **Phase 4b (FIX)** remains blocked on Kalshi institutional
+8. **Phase 4b (FIX)** remains blocked on Kalshi institutional
    access. Email draft in `docs/KALSHI_FIX_REQUEST.md`.
 
-8. **Phase 7 — retire legacy daemons** completely (delete
+9. **Phase 7 — retire legacy daemons** completely (delete
    `bin/{latency-trader,stat-trader,settlement-trader,cross-arb-trader}`,
    their plists, their JSON state files). Wait until ≥1 week of
    stable engine operation.
 
-9. **Cap raises — math-proven arbs scaled 2026-05-09.** Updated rule:
+10. **Cap raises — math-proven arbs scaled 2026-05-09.** Updated rule:
    the original gate ("≥30 unforced closed trades after fees") still
    holds for **calibration-dependent strategies** (`wx-stat`, `stat`,
    `cross-arb`, `settlement`). It does **not** hold for
@@ -371,7 +382,7 @@ disabled; engine is **disarmed and trading** as of the
    positive after-fee EV over ≥30 unforced closed trades. The
    `stat` strategy remains gated (only 1 residual rule active).
 
-10. **News-trader rebuild plan drafted (deferred).** See
+11. **News-trader rebuild plan drafted (deferred).** See
     `plans/2026-05-08-news-trader-implementation.md`. Research
     showed the breaking-news speed race is unwinnable from a
     laptop without enterprise wires; plan pivots to scheduled

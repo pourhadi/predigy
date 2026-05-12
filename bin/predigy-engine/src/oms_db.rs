@@ -860,7 +860,36 @@ impl Oms for DbBackedOms {
                             .fetch_optional(&self.pool)
                             .await?;
                     if known.is_none() {
-                        diff.orders_only_at_venue.push(order.order_id);
+                        if is_predigy_client_order_id(&order.client_order_id) {
+                            match rest.cancel_order(&order.order_id).await {
+                                Ok(resp) => {
+                                    info!(
+                                        venue_order_id = %resp.order_id,
+                                        client_id = ?resp.client_order_id,
+                                        reduced_by = ?resp.reduced_by,
+                                        "oms: cancelled venue-only predigy order during reconciliation"
+                                    );
+                                }
+                                Err(RestError::Api { status: 404, .. }) => {
+                                    info!(
+                                        venue_order_id = %order.order_id,
+                                        client_id = %order.client_order_id,
+                                        "oms: venue-only predigy order already gone during reconciliation"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        venue_order_id = %order.order_id,
+                                        client_id = %order.client_order_id,
+                                        error = %e,
+                                        "oms: failed to cancel venue-only predigy order"
+                                    );
+                                    diff.orders_only_at_venue.push(order.order_id);
+                                }
+                            }
+                        } else {
+                            diff.orders_only_at_venue.push(order.order_id);
+                        }
                     }
                 }
             }
@@ -1101,6 +1130,23 @@ async fn reconcile_order_status(
         _ => {}
     }
     Ok(())
+}
+
+fn is_predigy_client_order_id(client_id: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "book-maker:",
+        "book-imbalance:",
+        "cross-arb:",
+        "implication-arb:",
+        "internal-arb:",
+        "latency:",
+        "news-trader:",
+        "settlement:",
+        "stat:",
+        "variance-fade:",
+        "wx-stat:",
+    ];
+    PREFIXES.iter().any(|prefix| client_id.starts_with(prefix))
 }
 
 async fn catch_up_order_fills(
@@ -1504,7 +1550,10 @@ fn execution_status_str(s: ExecutionStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{domain_mark_cents, rest_fill_price_cents_for_intent_side, risk_mark_cents};
+    use super::{
+        domain_mark_cents, is_predigy_client_order_id, rest_fill_price_cents_for_intent_side,
+        risk_mark_cents,
+    };
     use predigy_kalshi_rest::types::FillRecord;
 
     #[test]
@@ -1588,5 +1637,14 @@ mod tests {
     fn rest_fill_price_rejects_unknown_side() {
         let fill = fill_record();
         assert!(rest_fill_price_cents_for_intent_side(&fill, "maybe").is_err());
+    }
+
+    #[test]
+    fn predigy_client_order_id_detection_is_prefix_bounded() {
+        assert!(is_predigy_client_order_id("book-maker:KXFOO:B:42"));
+        assert!(is_predigy_client_order_id("cross-arb:KXFOO:99:0001"));
+        assert!(is_predigy_client_order_id("stat:KXFOO:55:0001"));
+        assert!(!is_predigy_client_order_id("manual:book-maker:KXFOO"));
+        assert!(!is_predigy_client_order_id("not-predigy"));
     }
 }
