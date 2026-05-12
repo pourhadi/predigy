@@ -2,6 +2,8 @@
 Description=predigy dashboard (HTTP, kill-switch UI)
 After=network-online.target postgresql.service
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -10,8 +12,6 @@ EnvironmentFile=%h/.config/predigy/env
 ExecStart=%h/code/predigy/deploy/scripts/dashboard-run.sh
 Restart=on-failure
 RestartSec=15
-StartLimitIntervalSec=600
-StartLimitBurst=5
 StandardOutput=append:%h/.local/state/predigy/logs/dashboard.stdout.log
 StandardError=append:%h/.local/state/predigy/logs/dashboard.stderr.log
 

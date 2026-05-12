@@ -8,6 +8,9 @@
 Description=predigy trading engine (consolidated)
 After=network-online.target postgresql.service
 Wants=network-online.target
+# Cap restart loops the way launchd's ThrottleInterval did.
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -16,9 +19,6 @@ EnvironmentFile=%h/.config/predigy/env
 ExecStart=%h/code/predigy/deploy/scripts/engine-run.sh
 Restart=on-failure
 RestartSec=30
-# Cap restart loops the way launchd's ThrottleInterval did.
-StartLimitIntervalSec=600
-StartLimitBurst=5
 # Stream stderr to a tail-able file (the dashboard reads strategy
 # logs via file path; same file scheme as macOS, just under XDG).
 StandardOutput=append:%h/.local/state/predigy/logs/engine.stdout.log
