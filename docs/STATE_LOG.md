@@ -14,6 +14,41 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-12 06:16 UTC — REST submitter terminates zero-fill IOC/FOK responses immediately
+
+**Why**: the OMS venue-only cleanup succeeded, but the live watch
+caught a separate transient reconciliation WARN at 06:10 UTC:
+`status_mismatches: [(..., "acked", "canceled")]`. Root cause:
+Kalshi's create-order response for a stale-touch IOC already returned
+`fill_count="0.00"` and `remaining_count="0.00"`, but
+`venue_rest` still marked every successful create response `acked`.
+With no fill event to apply, reconciliation corrected the row to
+`cancelled` on the next pass and logged drift.
+
+**Code change** (`bin/predigy-engine/src/venue_rest.rs`):
+
+- For IOC/FOK create responses with parsed `fill_count == 0` and
+  `remaining_count == 0`, mark the intent `cancelled` immediately
+  and persist the returned `venue_order_id`.
+- GTC zero-fill creates still go through the normal `acked` path.
+- IOC/FOK responses with any fill count still wait for the existing
+  fill path so position accounting stays centralized.
+
+**Verification**:
+
+- `cargo test -p predigy-engine venue_rest`: 12/12 venue_rest tests passed.
+- `cargo build --release -p predigy-engine`: passed.
+- Engine restarted live at 06:15 UTC.
+- The next live stale-touch probe
+  `book-maker:KXNHLGAME-26MAY12ANAVGK-ANA:X:sl:43:01c45018`
+  logged `venue_rest: immediate order cancelled unfilled` with
+  `fill_count=Some("0.00")`, `remaining_count=Some("0.00")`.
+- Postgres row for that client id was `status='cancelled'` with the
+  venue order id at 06:16:06, without waiting for reconciliation.
+- No new `oms: reconciliation found drift` entries appeared through
+  the 06:18 live watch window; last such entry remained the
+  pre-fix 06:10 probe.
+
 ## 2026-05-12 06:00 UTC — OMS cancels venue-only Predigy orders during reconciliation
 
 **Why**: after the fan-out / DB-pool fix, reconciliation still

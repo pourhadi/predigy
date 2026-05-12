@@ -30,7 +30,8 @@
 use anyhow::{Context as _, Result};
 use predigy_core::side::Side;
 use predigy_kalshi_rest::types::{
-    CreateOrderRequest, OrderAction, OrderSideV2, SelfTradePreventionV2, TimeInForceV2,
+    CreateOrderRequest, CreateOrderResponse, OrderAction, OrderSideV2, SelfTradePreventionV2,
+    TimeInForceV2,
 };
 use predigy_kalshi_rest::{Client as RestClient, Error as RestError, Signer};
 use sqlx::PgPool;
@@ -162,6 +163,19 @@ async fn submit_one(pool: &PgPool, rest: &Arc<RestClient>, row: &SubmittedIntent
     match rest.create_order(&req).await {
         Ok(resp) => {
             let response_payload = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+            if is_unfilled_immediate_response(row, &resp) {
+                mark_cancelled_after_create(pool, &row.client_id, &resp.order_id, response_payload)
+                    .await
+                    .context("mark_cancelled_after_create")?;
+                info!(
+                    client_id = %row.client_id,
+                    venue_order_id = %resp.order_id,
+                    fill_count = ?resp.fill_count,
+                    remaining_count = ?resp.remaining_count,
+                    "venue_rest: immediate order cancelled unfilled"
+                );
+                return Ok(());
+            }
             mark_acked(pool, &row.client_id, &resp.order_id, response_payload)
                 .await
                 .context("mark_acked")?;
@@ -398,6 +412,20 @@ fn build_create_request(row: &SubmittedIntent) -> Result<CreateOrderRequest> {
     })
 }
 
+fn is_unfilled_immediate_response(row: &SubmittedIntent, resp: &CreateOrderResponse) -> bool {
+    matches!(row.tif.as_str(), "ioc" | "fok")
+        && parse_count_fp(resp.fill_count.as_deref()) == Some(0)
+        && parse_count_fp(resp.remaining_count.as_deref()) == Some(0)
+}
+
+fn parse_count_fp(s: Option<&str>) -> Option<i32> {
+    let f: f64 = s?.parse().ok()?;
+    if !f.is_finite() || f < 0.0 {
+        return None;
+    }
+    i32::try_from(f.floor() as i64).ok()
+}
+
 fn map_side_action(side: Side, action: &str) -> Result<(OrderSideV2, OrderAction)> {
     let act = match action {
         "buy" => OrderAction::Buy,
@@ -451,6 +479,37 @@ async fn mark_acked(
     sqlx::query(
         "INSERT INTO intent_events (client_id, status, venue_payload)
          VALUES ($1, 'acked', $2)",
+    )
+    .bind(client_id)
+    .bind(&payload)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn mark_cancelled_after_create(
+    pool: &PgPool,
+    client_id: &str,
+    venue_order_id: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE intents
+            SET status = 'cancelled',
+                venue_order_id = $2,
+                last_updated_at = now()
+          WHERE client_id = $1
+            AND status = 'submitted'",
+    )
+    .bind(client_id)
+    .bind(venue_order_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO intent_events (client_id, status, venue_payload)
+         VALUES ($1, 'cancelled', $2)",
     )
     .bind(client_id)
     .bind(&payload)
@@ -544,6 +603,20 @@ mod tests {
         }
     }
 
+    fn create_response(
+        fill_count: Option<&str>,
+        remaining_count: Option<&str>,
+    ) -> CreateOrderResponse {
+        CreateOrderResponse {
+            order_id: "order-1".into(),
+            client_order_id: Some("stat:KXFOO-X:00012345".into()),
+            fill_count: fill_count.map(str::to_string),
+            remaining_count: remaining_count.map(str::to_string),
+            average_fill_price: None,
+            average_fee_paid: None,
+        }
+    }
+
     #[test]
     fn buy_yes_maps_to_bid_yes_at_native_price() {
         let req = build_create_request(&intent("yes", "buy", Some(42), "ioc")).unwrap();
@@ -607,6 +680,27 @@ mod tests {
         let mut row = intent("yes", "buy", Some(50), "ioc");
         row.order_type = "market".into();
         assert!(build_create_request(&row).is_err());
+    }
+
+    #[test]
+    fn unfilled_ioc_create_response_is_terminal_cancelled() {
+        let row = intent("yes", "buy", Some(42), "ioc");
+        let resp = create_response(Some("0.00"), Some("0.00"));
+        assert!(is_unfilled_immediate_response(&row, &resp));
+    }
+
+    #[test]
+    fn zero_fill_gtc_create_response_still_waits_for_ack_path() {
+        let row = intent("yes", "buy", Some(42), "gtc");
+        let resp = create_response(Some("0.00"), Some("0.00"));
+        assert!(!is_unfilled_immediate_response(&row, &resp));
+    }
+
+    #[test]
+    fn filled_ioc_create_response_still_waits_for_fill_path() {
+        let row = intent("yes", "buy", Some(42), "ioc");
+        let resp = create_response(Some("1.00"), Some("0.00"));
+        assert!(!is_unfilled_immediate_response(&row, &resp));
     }
 
     #[test]

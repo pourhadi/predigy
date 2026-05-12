@@ -18,13 +18,14 @@ wants:
 
 ## What is running RIGHT NOW (2026-05-12, post OMS cleanup)
 
-Latest engine bounce: 2026-05-12 05:59 UTC. Rebuilt + restarted
-to deploy conservative OMS cleanup for venue-only Predigy orders.
-Earlier in the same incident window the engine also deployed the
-fan-out leak fix and DB pool size raise (8→32) that stopped the
-cross-arb flap-stop / channel-closed log flood. Full timeline:
-`docs/STATE_LOG.md` § 2026-05-12 06:00 UTC and § 2026-05-12
-05:18 UTC.
+Latest engine bounce: 2026-05-12 06:15 UTC. Rebuilt + restarted
+to deploy the zero-fill IOC/FOK terminal-status fix in the REST
+submitter. Earlier in the same incident window the engine also
+deployed conservative OMS cleanup for venue-only Predigy orders,
+the fan-out leak fix, and the DB pool size raise (8→32) that
+stopped the cross-arb flap-stop / channel-closed log flood. Full
+timeline: `docs/STATE_LOG.md` § 2026-05-12 06:16 UTC, §
+2026-05-12 06:00 UTC, and § 2026-05-12 05:18 UTC.
 
 ```
 launchctl list | grep predigy
@@ -294,14 +295,19 @@ disabled; engine is **disarmed and trading** as of the
 ($100 deposited net minus net realized P&L of −$37.69 across
 249 closed positions since 2026-05-07 cutover).
 
-0. **OMS venue-only Predigy order cleanup deployed 2026-05-12
-   06:00 UTC.** Reconciliation now automatically cancels resting
-   venue-only orders only when their Kalshi `client_order_id` starts
-   with a known Predigy strategy prefix. Manual/unknown venue-only
-   orders are still left alone and reported. The first live pass
-   cancelled all 5 unmanaged Predigy orders left over from the prior
-   crash window; no reconciliation WARNs appeared after 06:01 UTC,
-   and active nonterminal DB intents remained 0.
+0. **OMS cleanup + zero-fill IOC status fix deployed 2026-05-12
+   06:00-06:16 UTC.** Reconciliation now automatically cancels
+   resting venue-only orders only when their Kalshi `client_order_id`
+   starts with a known Predigy strategy prefix. Manual/unknown
+   venue-only orders are still left alone and reported. The first
+   live pass cancelled all 5 unmanaged Predigy orders left over from
+   the prior crash window. A follow-up fixed zero-fill IOC/FOK create
+   responses so unfilled probes are marked `cancelled` immediately
+   instead of going `acked` until reconciliation. Live verification:
+   the 06:16 `book-maker` stale-touch probe was cancelled immediately
+   by `venue_rest`, active nonterminal DB intents remained 0, and no
+   new `oms: reconciliation found drift` entries appeared through the
+   06:18 watch window.
 
 1. **`book-maker` stale-touch SL-thrash fixed 2026-05-12 05:37
    UTC.** The strategy now tracks unchanged-position IOC exit
