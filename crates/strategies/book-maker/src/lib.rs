@@ -140,6 +140,14 @@ pub struct BookMakerConfig {
     /// books less aggressively. Suspended inside the flatten
     /// window where every-tick aggression matters.
     pub quote_refresh_cooldown: Duration,
+    /// If we emit this many consecutive IOC exits for the same
+    /// unchanged position and the position does not change, pause
+    /// exit attempts for that ticker. This prevents stale-touch /
+    /// no-liquidity loops from spamming cancelled IOCs forever.
+    pub exit_failure_threshold: u32,
+    /// Cooldown applied after `exit_failure_threshold` unchanged
+    /// exit attempts.
+    pub exit_failure_cooldown: Duration,
 }
 
 impl BookMakerConfig {
@@ -156,6 +164,8 @@ impl BookMakerConfig {
     /// - `PREDIGY_BOOK_MAKER_SKEW_ESCALATION_HOURS` (f64, default 2.0)
     /// - `PREDIGY_BOOK_MAKER_GAME_DURATION_HOURS` (f64, default 3.5)
     /// - `PREDIGY_BOOK_MAKER_QUOTE_REFRESH_SECS` (u64, default 10)
+    /// - `PREDIGY_BOOK_MAKER_EXIT_FAILURE_THRESHOLD` (u32, default 5)
+    /// - `PREDIGY_BOOK_MAKER_EXIT_FAILURE_COOLDOWN_SECS` (u64, default 600)
     #[must_use]
     pub fn from_env(config_file: PathBuf) -> Self {
         let mut c = Self {
@@ -169,6 +179,8 @@ impl BookMakerConfig {
             skew_escalation_t_hours: 2.0,
             estimated_game_duration_hours: 3.5,
             quote_refresh_cooldown: Duration::from_secs(10),
+            exit_failure_threshold: 5,
+            exit_failure_cooldown: Duration::from_secs(600),
         };
         if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_SKEW_CENTS_PER_CONTRACT")
             && let Ok(n) = v.parse()
@@ -214,6 +226,16 @@ impl BookMakerConfig {
             && let Ok(n) = v.parse::<u64>()
         {
             c.quote_refresh_cooldown = Duration::from_secs(n);
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_EXIT_FAILURE_THRESHOLD")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            c.exit_failure_threshold = n;
+        }
+        if let Ok(v) = std::env::var("PREDIGY_BOOK_MAKER_EXIT_FAILURE_COOLDOWN_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            c.exit_failure_cooldown = Duration::from_secs(n);
         }
         c
     }
@@ -377,6 +399,24 @@ struct OpenLeg {
     side: String,
 }
 
+type ExitPositionSignature = Vec<(String, i32, i32)>;
+
+fn exit_position_signature(legs: &[OpenLeg]) -> ExitPositionSignature {
+    let mut sig: ExitPositionSignature = legs
+        .iter()
+        .map(|l| (l.side.clone(), l.signed_qty, l.avg_entry_cents))
+        .collect();
+    sig.sort();
+    sig
+}
+
+#[derive(Debug, Clone)]
+struct ExitAttemptState {
+    signature: ExitPositionSignature,
+    consecutive_emits: u32,
+    suppressed_until: Option<Instant>,
+}
+
 #[derive(Debug)]
 pub struct BookMakerStrategy {
     config: BookMakerConfig,
@@ -418,6 +458,11 @@ pub struct BookMakerStrategy {
     /// in-flight cap. This cooldown bounds re-quote frequency
     /// to one per N seconds per ticker.
     last_quote_at: HashMap<String, Instant>,
+    /// Repeated IOC exit attempts against a stale local touch can
+    /// return venue cancels forever when the real venue book has no
+    /// executable liquidity. Track unchanged-position exit emissions
+    /// and pause after a small burst.
+    exit_attempts: HashMap<String, ExitAttemptState>,
     last_config_refresh: Option<Instant>,
     pending_intents: Vec<Intent>,
     pending_cancels: Vec<String>,
@@ -436,6 +481,7 @@ impl BookMakerStrategy {
             settle_unix: HashMap::new(),
             last_exit_at: HashMap::new(),
             last_quote_at: HashMap::new(),
+            exit_attempts: HashMap::new(),
             last_config_refresh: None,
             pending_intents: Vec::new(),
             pending_cancels: Vec::new(),
@@ -574,6 +620,27 @@ impl BookMakerStrategy {
             Some(legs) if !legs.is_empty() => legs.clone(),
             _ => return,
         };
+        let signature = exit_position_signature(&legs);
+        let now = Instant::now();
+        let state = self
+            .exit_attempts
+            .entry(ticker.to_string())
+            .or_insert_with(|| ExitAttemptState {
+                signature: signature.clone(),
+                consecutive_emits: 0,
+                suppressed_until: None,
+            });
+        if state.signature != signature {
+            state.signature = signature.clone();
+            state.consecutive_emits = 0;
+            state.suppressed_until = None;
+        } else if let Some(until) = state.suppressed_until {
+            if until > now {
+                return;
+            }
+            state.consecutive_emits = 0;
+            state.suppressed_until = None;
+        }
         let in_flatten_window = secs_to_settle
             .map(|s| s >= 0 && s < self.config.pre_settle_flatten_secs)
             .unwrap_or(false);
@@ -707,7 +774,28 @@ impl BookMakerStrategy {
         // for exit," not just "we emitted." That way a ticker
         // whose position isn't threshold-tripping yet doesn't
         // get re-evaluated every BookUpdate either.
-        let _ = emitted_any; // suppress unused-var warning
+        if emitted_any {
+            let state = self
+                .exit_attempts
+                .entry(ticker.to_string())
+                .or_insert_with(|| ExitAttemptState {
+                    signature,
+                    consecutive_emits: 0,
+                    suppressed_until: None,
+                });
+            state.consecutive_emits = state.consecutive_emits.saturating_add(1);
+            if self.config.exit_failure_threshold > 0
+                && state.consecutive_emits >= self.config.exit_failure_threshold
+            {
+                state.suppressed_until = Some(Instant::now() + self.config.exit_failure_cooldown);
+                warn!(
+                    ticker,
+                    consecutive_exit_emits = state.consecutive_emits,
+                    cooldown_secs = self.config.exit_failure_cooldown.as_secs(),
+                    "book-maker: suppressing exits after repeated unchanged-position attempts"
+                );
+            }
+        }
         self.last_exit_at.insert(ticker.to_string(), Instant::now());
     }
 
@@ -904,6 +992,13 @@ impl BookMakerStrategy {
         }
         self.inventory = inv;
         self.open_legs = legs;
+        let open_tickers = self
+            .open_legs
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        self.exit_attempts
+            .retain(|ticker, _| open_tickers.contains(ticker));
 
         // Active intents: rebuild active_orders from authoritative
         // DB state. This catches:
@@ -1133,10 +1228,30 @@ mod tests {
             skew_escalation_t_hours: 2.0,
             estimated_game_duration_hours: 3.5,
             quote_refresh_cooldown: Duration::from_secs(10),
+            exit_failure_threshold: 5,
+            exit_failure_cooldown: Duration::from_secs(600),
         });
         s.reload_markets();
         assert_eq!(s.market_count(), 1);
         assert_eq!(s.markets[0].quote_size, 1);
         assert_eq!(s.markets[0].min_spread_cents, 2);
+    }
+
+    #[test]
+    fn exit_position_signature_is_order_stable() {
+        let a = vec![
+            OpenLeg {
+                signed_qty: -1,
+                avg_entry_cents: 49,
+                side: "yes".to_string(),
+            },
+            OpenLeg {
+                signed_qty: 2,
+                avg_entry_cents: 35,
+                side: "no".to_string(),
+            },
+        ];
+        let b = vec![a[1].clone(), a[0].clone()];
+        assert_eq!(exit_position_signature(&a), exit_position_signature(&b));
     }
 }

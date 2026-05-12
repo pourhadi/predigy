@@ -552,8 +552,7 @@ async fn fan_out(subs: &Arc<RwLock<Subscriptions>>, market: &str, book: &OrderBo
             Err(TrySendError::Full(_)) => {
                 warn!(
                     strategy = strategy.0,
-                    market,
-                    "router: strategy event queue full; dropping book update"
+                    market, "router: strategy event queue full; dropping book update"
                 );
             }
         }

@@ -14,6 +14,42 @@
 > This file is for *what we did and when*. Future Claude sessions
 > reconstruct context from here.
 
+## 2026-05-12 05:37 UTC — book-maker stale-touch exit suppression
+
+**Why**: after the 05:18 engine restart, `book-maker` resumed a
+known IOC stop-loss loop on `KXNHLGAME-26MAY12ANAVGK-ANA`. The
+strategy held a short YES position (-1 @49) and saw a cached
+local touch `yes_ask=43`, so it emitted IOC buy-to-close orders
+at 43. Kalshi REST showed the venue book had **no bids / no asks**
+on that ticker, so every IOC cancelled with 0 fill. Cancelled IOCs
+cost no fees, but the loop wasted REST/order-management bandwidth
+and polluted logs.
+
+**Code change** (`crates/strategies/book-maker/src/lib.rs`):
+
+- Added per-ticker `ExitAttemptState` keyed by the open-position
+  signature (`side`, `signed_qty`, `avg_entry_cents`).
+- `evaluate_exits` now counts consecutive IOC exit emissions where
+  the position signature is unchanged.
+- After `PREDIGY_BOOK_MAKER_EXIT_FAILURE_THRESHOLD` unchanged
+  attempts (default **5**), exit emissions for that ticker are
+  suppressed for `PREDIGY_BOOK_MAKER_EXIT_FAILURE_COOLDOWN_SECS`
+  (default **600s**).
+- Any position change resets the counter; closed positions are
+  pruned from the tracker during the DB refresh.
+
+**Verification**:
+
+- `cargo test -p predigy-strategy-book-maker`: 13/13 passed.
+- `cargo fmt && cargo build --release -p predigy-engine`: passed.
+- Engine restarted at 05:36 UTC.
+- Live log showed exactly the desired behavior:
+  `book-maker: suppressing exits after repeated unchanged-position attempts`
+  for `KXNHLGAME-26MAY12ANAVGK-ANA`, `consecutive_exit_emits=5`,
+  `cooldown_secs=600`.
+- 70s post-suppression watch: no further KXNHLGAME exit emits,
+  no new KXNHLGAME intents, engine healthy.
+
 ## 2026-05-12 05:18 UTC — engine restart: fan-out leak fix + DB pool raise
 
 **Why**: status check uncovered cross-arb had been generating
@@ -71,16 +107,9 @@ in-memory binaries. All curator launchd jobs (`stat-curate`,
 - launchctl status: 9/10 jobs last-exit 0; wx-stat-curate's status
   reflects a pre-rebuild attempt and will heal on next hourly run.
 
-**Known follow-up**: `book-maker` still thrashes IOC sl exits on
-`KXNHLGAME-26MAY12ANAVGK-ANA` — engine's local touch is stale
-(yes_ask=43 cached) but the Kalshi REST `markets/.../orderbook`
-shows venue has NO bids or asks. Every 8s the strategy emits an
-IOC buy @43 that venue immediately cancels (no liquidity to
-match). Harmless to capital (cancelled IOCs cost no fees) but
-noisy. Principled fix: per-ticker consecutive-failed-exit
-counter that suspends emission after N cancellations without a
-position change. Out of scope this round; see SESSIONS.md
-"Open work".
+**Follow-up completed 2026-05-12 05:37 UTC**: the `book-maker`
+stale-touch IOC exit loop now has a per-ticker unchanged-position
+suppression counter. See the entry above.
 
 ## 2026-05-11 01:30 UTC — book-maker reverts to min_spread=2 with tighter SL/TP
 

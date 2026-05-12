@@ -292,20 +292,15 @@ disabled; engine is **disarmed and trading** as of the
 ($100 deposited net minus net realized P&L of −$37.69 across
 249 closed positions since 2026-05-07 cutover).
 
-0. **`book-maker` SL-thrash on stale-touch tickers — needs a
-   principled fix.** As of 2026-05-12 the strategy fires IOC sl
-   exits every 8s on `KXNHLGAME-26MAY12ANAVGK-ANA` (−1 yes @
-   49, local touch yes_ask=43). Kalshi REST shows venue has NO
-   bids/asks for this ticker — so every IOC buy @43 cancels with
-   0 fill. Harmless to capital (cancelled IOCs cost no fees) but
-   noisy. Principled fix: in `crates/strategies/book-maker/src/lib.rs`,
-   track a per-ticker `consecutive_failed_exits` counter incremented
-   when `evaluate_exits` emits without the position changing,
-   reset on any fill that touches the position; after N (suggest 5)
-   consecutive failed emits, suspend exit emission for that ticker
-   for a cooldown (suggest 10m) and emit a single WARN. This
-   prevents infinite thrash when venue liquidity has evaporated
-   under the strategy's stale local touch.
+0. **`book-maker` stale-touch SL-thrash fixed 2026-05-12 05:37
+   UTC.** The strategy now tracks unchanged-position IOC exit
+   attempts per ticker and suppresses further exits after 5
+   consecutive attempts for 10 minutes. Live verification on
+   `KXNHLGAME-26MAY12ANAVGK-ANA`: suppression fired at exactly
+   5 attempts and no new emits/intents appeared in the 70s watch
+   window. If this becomes too conservative, tune
+   `PREDIGY_BOOK_MAKER_EXIT_FAILURE_THRESHOLD` or
+   `PREDIGY_BOOK_MAKER_EXIT_FAILURE_COOLDOWN_SECS` in `~/.zprofile`.
 
 1. **Watch the surviving 5 for ≥30 closed trades each before
    scaling caps.** The audit's mechanism verdict is theoretical —
