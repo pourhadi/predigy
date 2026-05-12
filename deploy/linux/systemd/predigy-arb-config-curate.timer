@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule predigy arb-config-curator every 30 minutes
+
+[Timer]
+# Matches com.predigy.arb-config-curate.plist StartInterval=1800 + RunAtLoad.
+OnBootSec=1min
+OnUnitActiveSec=30min
+Unit=predigy-arb-config-curate.service
+
+[Install]
+WantedBy=timers.target

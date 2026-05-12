@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule predigy paper-trader every 5 minutes
+
+[Timer]
+# Matches com.predigy.paper-trader.plist StartInterval=300.
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=predigy-paper-trader.service
+
+[Install]
+WantedBy=timers.target

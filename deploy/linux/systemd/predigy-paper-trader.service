@@ -1,0 +1,12 @@
+[Unit]
+Description=predigy paper-trader (shadow execution evidence for stat calibration)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/predigy
+EnvironmentFile=%h/.config/predigy/env
+ExecStart=%h/code/predigy/deploy/scripts/predigy-paper-trader-run.sh
+StandardOutput=append:%h/.local/state/predigy/logs/paper-trader.stdout.log
+StandardError=append:%h/.local/state/predigy/logs/paper-trader.stderr.log

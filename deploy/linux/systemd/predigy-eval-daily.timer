@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule predigy eval-daily at 23:55 local
+
+[Timer]
+# Matches com.predigy.eval-daily.plist StartCalendarInterval Hour=23 Minute=55.
+OnCalendar=*-*-* 23:55:00
+Persistent=true
+Unit=predigy-eval-daily.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule predigy calibration every 15 minutes
+
+[Timer]
+# Matches com.predigy.calibration.plist StartInterval=900 (tightened from 1h on 2026-05-09).
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=predigy-calibration.service
+
+[Install]
+WantedBy=timers.target

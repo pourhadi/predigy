@@ -1,0 +1,12 @@
+[Unit]
+Description=predigy arb-config-curator (implication-arb + internal-arb configs)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/predigy
+EnvironmentFile=%h/.config/predigy/env
+ExecStart=%h/code/predigy/deploy/scripts/arb-config-curate.sh
+StandardOutput=append:%h/.local/state/predigy/logs/arb-config-curate.stdout.log
+StandardError=append:%h/.local/state/predigy/logs/arb-config-curate.stderr.log

@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule predigy cross-arb-curator every 2 minutes
+
+[Timer]
+# Matches com.predigy.cross-arb-curate.plist StartInterval=120.
+OnBootSec=1min
+OnUnitActiveSec=2min
+Unit=predigy-cross-arb-curate.service
+
+[Install]
+WantedBy=timers.target

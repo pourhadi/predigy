@@ -148,11 +148,16 @@ fn env_engine_mode(name: &str, default: EngineMode) -> EngineMode {
 }
 
 fn dirs_log_default() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join("Library/Logs/predigy")
-    } else {
-        PathBuf::from("/tmp/predigy-logs")
+    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(state).join("predigy/logs");
     }
+    if let Some(home) = std::env::var_os("HOME") {
+        if cfg!(target_os = "macos") {
+            return PathBuf::from(home).join("Library/Logs/predigy");
+        }
+        return PathBuf::from(home).join(".local/state/predigy/logs");
+    }
+    PathBuf::from("/tmp/predigy-logs")
 }
 
 fn dirs_kill_switch_default() -> PathBuf {

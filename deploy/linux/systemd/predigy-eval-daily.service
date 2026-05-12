@@ -1,0 +1,16 @@
+[Unit]
+Description=predigy eval-daily (24h strategy report)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/predigy
+EnvironmentFile=%h/.config/predigy/env
+ExecStart=%h/code/predigy/deploy/scripts/eval-daily.sh
+# eval-daily exits non-zero when a strategy carries a critical
+# diagnosis. Don't treat that as a unit failure — the operator's
+# log review picks up the exit code.
+SuccessExitStatus=1
+StandardOutput=append:%h/.local/state/predigy/logs/eval-daily.stdout.log
+StandardError=append:%h/.local/state/predigy/logs/eval-daily.stderr.log
