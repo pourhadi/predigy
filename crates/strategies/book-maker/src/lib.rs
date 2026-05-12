@@ -423,7 +423,7 @@ fn should_suppress_exit_attempt(
     now: Instant,
 ) -> bool {
     if state.signature != *signature {
-        state.signature = signature.clone();
+        state.signature.clone_from(signature);
         state.consecutive_emits = 0;
         state.suppressed_until = None;
         return false;
