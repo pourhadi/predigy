@@ -46,6 +46,7 @@ members = [
     "bin/predigy-paper-trader",
     "bin/predigy-import",
     "bin/predigy-engine",
+    "crates/venue-reconcile",
 ]
 
 [workspace.package]
@@ -162,6 +163,7 @@ predigy-ext-feeds = { path = "crates/ext-feeds" }
 predigy-signals = { path = "crates/signals" }
 predigy-kalshi-fix = { path = "crates/kalshi-fix" }
 predigy-engine-core = { path = "crates/engine-core" }
+predigy-venue-reconcile = { path = "crates/venue-reconcile" }
 predigy-strategy-stat = { path = "crates/strategies/stat" }
 predigy-strategy-settlement = { path = "crates/strategies/settlement" }
 predigy-strategy-latency = { path = "crates/strategies/latency" }

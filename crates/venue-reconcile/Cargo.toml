@@ -1,5 +1,5 @@
 [package]
-name = "predigy-calibration"
+name = "predigy-venue-reconcile"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,19 +9,11 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "predigy-calibration"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
 predigy-kalshi-rest = { workspace = true }
-predigy-venue-reconcile = { workspace = true }
-clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }

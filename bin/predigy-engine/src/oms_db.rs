@@ -24,6 +24,7 @@ use predigy_engine_core::oms::{
 };
 use predigy_kalshi_rest::types::{FillRecord, MarketPosition, OrderRecord};
 use predigy_kalshi_rest::{Client as RestClient, Error as RestError};
+use predigy_venue_reconcile::{DriftResolution, resolve_settled_drift_ticker};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -900,8 +901,86 @@ impl Oms for DbBackedOms {
         }
 
         reconcile_positions(self, rest, &mut diff).await?;
+
+        // Auto-resolve venue-flat drift: when the DB has a stale
+        // open row for a ticker the venue says is flat AND the
+        // market has actually settled, close the row with realized
+        // P&L baked in from the settlement outcome. The
+        // `predigy-calibration` timer runs the same logic as a
+        // belt-and-suspenders sweep; doing it inline here cuts the
+        // settlement-to-cleanup latency from ~timer-interval down to
+        // ~one reconcile pass (60s by default). Any entry we close
+        // is dropped from `diff.position_mismatches` so the WARN
+        // below only fires on genuinely unresolved state.
+        let mut resolved_idx: Vec<usize> = Vec::new();
+        let mut n_closed_rows = 0_usize;
+        let mut realized_delta_total = 0_i64;
+        for (i, (ticker, _db_qty, venue_qty)) in diff.position_mismatches.iter().enumerate() {
+            if *venue_qty != 0 {
+                continue;
+            }
+            match resolve_settled_drift_ticker(&self.pool, rest, ticker).await {
+                Ok(DriftResolution::Closed {
+                    closed_rows,
+                    realized_pnl_delta_cents,
+                    outcome,
+                    settled_at,
+                }) => {
+                    info!(
+                        ticker = %ticker,
+                        closed_rows,
+                        realized_pnl_delta_cents,
+                        outcome,
+                        settled_at = %settled_at,
+                        "oms: auto-resolved settled venue-flat drift"
+                    );
+                    resolved_idx.push(i);
+                    n_closed_rows += closed_rows;
+                    realized_delta_total += realized_pnl_delta_cents;
+                }
+                Ok(DriftResolution::NoOpenRows) => {
+                    // DB rows already closed (race with calibration
+                    // sweep or a prior reconcile pass).
+                    resolved_idx.push(i);
+                }
+                Ok(DriftResolution::NotYetSettled) => {
+                    // Market not yet settled — next pass will retry.
+                }
+                Ok(DriftResolution::MarketDetailMissing) => {
+                    // Kalshi 404'd the ticker; calibration sweep
+                    // covers the long tail.
+                }
+                Err(e) => {
+                    warn!(
+                        ticker = %ticker,
+                        error = %e,
+                        "oms: settled-drift auto-resolve failed; retrying next pass"
+                    );
+                }
+            }
+        }
+        if !resolved_idx.is_empty() {
+            let mut keep =
+                Vec::with_capacity(diff.position_mismatches.len() - resolved_idx.len());
+            for (i, entry) in diff.position_mismatches.drain(..).enumerate() {
+                if !resolved_idx.contains(&i) {
+                    keep.push(entry);
+                }
+            }
+            diff.position_mismatches = keep;
+        }
+
         if diff.is_clean() {
-            debug!("oms: reconciliation clean");
+            if resolved_idx.is_empty() {
+                debug!("oms: reconciliation clean");
+            } else {
+                info!(
+                    n_tickers_resolved = resolved_idx.len(),
+                    n_closed_rows,
+                    realized_pnl_delta_cents = realized_delta_total,
+                    "oms: reconciliation clean after auto-resolving settled drift"
+                );
+            }
         } else {
             warn!(?diff, "oms: reconciliation found drift");
         }

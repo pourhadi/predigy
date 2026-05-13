@@ -1707,6 +1707,7 @@ dependencies = [
  "chrono",
  "clap",
  "predigy-kalshi-rest",
+ "predigy-venue-reconcile",
  "serde",
  "serde_json",
  "sqlx",
@@ -1770,6 +1771,7 @@ dependencies = [
  "predigy-strategy-stat",
  "predigy-strategy-variance-fade",
  "predigy-strategy-wx-stat",
+ "predigy-venue-reconcile",
  "serde",
  "serde_json",
  "sqlx",
@@ -2189,6 +2191,19 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "predigy-venue-reconcile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "predigy-kalshi-rest",
+ "serde",
+ "serde_json",
+ "sqlx",
  "tracing",
 ]
 

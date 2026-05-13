@@ -1,10 +1,14 @@
 [Unit]
-Description=Schedule predigy calibration every 15 minutes
+Description=Schedule predigy calibration every 2 minutes
 
 [Timer]
-# Matches com.predigy.calibration.plist StartInterval=900 (tightened from 1h on 2026-05-09).
+# History: was 1h pre-2026-05-09, then 15min, dropped to 2min on
+# 2026-05-13 once the engine itself started invoking the venue-flat
+# resolver inside its own reconcile loop. The engine resolves drift
+# within ~60s; this timer remains as a belt-and-suspenders + the
+# settlement-sync + report subcommands also live in the same run.
 OnBootSec=2min
-OnUnitActiveSec=15min
+OnUnitActiveSec=2min
 Unit=predigy-calibration.service
 
 [Install]

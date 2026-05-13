@@ -24,6 +24,7 @@ predigy-ext-feeds = { workspace = true }
 predigy-poly-md = { workspace = true }
 predigy-kalshi-rest = { workspace = true }
 predigy-kalshi-md = { workspace = true }
+predigy-venue-reconcile = { workspace = true }
 predigy-strategy-stat = { workspace = true }
 predigy-strategy-settlement = { workspace = true }
 predigy-strategy-latency = { workspace = true }
