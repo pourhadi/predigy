@@ -731,5 +731,4 @@ mod tests {
             detail: None,
         }
     }
-
 }

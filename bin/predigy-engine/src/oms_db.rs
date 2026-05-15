@@ -960,8 +960,7 @@ impl Oms for DbBackedOms {
             }
         }
         if !resolved_idx.is_empty() {
-            let mut keep =
-                Vec::with_capacity(diff.position_mismatches.len() - resolved_idx.len());
+            let mut keep = Vec::with_capacity(diff.position_mismatches.len() - resolved_idx.len());
             for (i, entry) in diff.position_mismatches.drain(..).enumerate() {
                 if !resolved_idx.contains(&i) {
                     keep.push(entry);

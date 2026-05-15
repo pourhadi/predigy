@@ -141,7 +141,11 @@ pub fn venue_position_qty(position_contracts: Option<f64>) -> i32 {
     let Some(qty) = position_contracts else {
         return 0;
     };
-    if qty.is_finite() { qty.round() as i32 } else { 0 }
+    if qty.is_finite() {
+        qty.round() as i32
+    } else {
+        0
+    }
 }
 
 pub fn venue_flat_candidates(
@@ -159,7 +163,11 @@ pub fn venue_flat_candidates(
             continue;
         }
         let db_qty = signed_db_qty(&rows);
-        candidates.push(VenueFlatCandidate { ticker, db_qty, rows });
+        candidates.push(VenueFlatCandidate {
+            ticker,
+            db_qty,
+            rows,
+        });
     }
     (db_open_tickers, candidates)
 }
