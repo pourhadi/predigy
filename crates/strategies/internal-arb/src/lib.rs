@@ -39,18 +39,38 @@
 //! - **No NO-side arb.** The mirror "buy NO on every leg" arb
 //!   exists when Σ no_ask > (n - 1) + edge — left for a
 //!   follow-up if the YES path proves out.
-//! - **No partial-fill recovery.** I7's cancellation cascade
-//!   handles a leg-level venue rejection by cancelling the
-//!   siblings — but if leg 1 fully fills and leg 2 only partially
-//!   fills, the operator is left with an asymmetric position. The
-//!   strategy does not currently recover from that. IOC TIF
-//!   bounds the worst case to one tick of slippage.
+//! - **No NO-basket arb execution.** Only the proven YES-basket
+//!   path executes; the NO-basket mirror remains in
+//!   `InternalArbDirection` for scanner/payoff tests but is not
+//!   yet wired through `evaluate_family`.
+//!
+//! ## Partial-fill hedge-completion (added 2026-05-16)
+//!
+//! IOC leg groups do leg-out in production: one leg fills, the
+//! sibling's ask moves before its IOC arrives at Kalshi → the
+//! sibling cancels with zero fill, leaving the filled leg as a
+//! full-size unhedged directional position. The 2026-05-15 audit
+//! quantified this: 0 fully-hedged groups in 36h vs 23 partials.
+//!
+//! `refresh_exposure` now also runs `detect_partial_fills` over
+//! the open-position snapshot it already fetches. Any ticker with
+//! a one-legged YES exposure on a binary family — and no NO
+//! offset and no sibling-YES — is queued for a hedge. The
+//! `emit_pending_hedges` pass emits a single-leg
+//! `Buy NO @ best_no_ask, qty=yes_qty, IOC` for each. YES + NO =
+//! 100c at settlement, so this locks in
+//! `yes_entry + no_ask - 100` per pair (typically 2-6c) instead
+//! of carrying a ±50c directional bet to settlement.
+//!
+//! Multi-leg (≥3 ticker) families are NOT hedged in this version
+//! — the simple "buy NO on the filled ticker" trick only
+//! flattens binary baskets. Detection logs a warning and skips.
 
 use async_trait::async_trait;
 use predigy_book::OrderBook;
 use predigy_core::market::MarketTicker;
 use predigy_core::side::Side;
-use predigy_engine_core::db::Db;
+use predigy_engine_core::db::{Db, OpenPosition};
 use predigy_engine_core::events::Event;
 use predigy_engine_core::intent::{
     Intent, IntentAction, LegGroup, OrderType, Tif, cid_safe_ticker,
@@ -276,6 +296,85 @@ fn per_unit_taker_fee_cents(price_cents: u8, size: u32) -> Option<i32> {
     Some((total_fee + size_i32 - 1) / size_i32)
 }
 
+/// Identify ticker positions left orphaned after a partial-fill
+/// leg group: open YES qty with no offsetting NO position AND no
+/// sibling YES in the same configured family. Binary families
+/// only; 3+ leg families are skipped with a warning since their
+/// hedge construction is non-trivial (the simple
+/// "buy NO on the filled ticker" trick that works for 2-leg
+/// families only flattens directional exposure when the family
+/// is exactly two mutually-exclusive outcomes).
+///
+/// Pure function on the inputs so it's testable without a live
+/// DB. Inputs are the strategy's cached family config and the
+/// rows returned by `Db::open_positions`.
+fn detect_partial_fills<'a, I>(
+    families: &[CachedFamily],
+    ticker_to_families: &HashMap<String, Vec<usize>>,
+    positions: I,
+) -> HashMap<String, PartialFillInfo>
+where
+    I: IntoIterator<Item = &'a OpenPosition>,
+{
+    let mut yes_open: HashMap<String, &OpenPosition> = HashMap::new();
+    let mut no_open_tickers: HashSet<String> = HashSet::new();
+    for p in positions {
+        if p.current_qty == 0 {
+            continue;
+        }
+        match p.side.as_str() {
+            "yes" => {
+                yes_open.insert(p.ticker.clone(), p);
+            }
+            "no" => {
+                no_open_tickers.insert(p.ticker.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut partials = HashMap::new();
+    for (ticker, yes_pos) in &yes_open {
+        // Already hedged via a prior NO fill — nothing to do.
+        if no_open_tickers.contains(ticker) {
+            continue;
+        }
+        let Some(family_idxs) = ticker_to_families.get(ticker) else {
+            continue;
+        };
+        for &fam_idx in family_idxs {
+            let fam = &families[fam_idx];
+            if fam.tickers.len() != 2 {
+                warn!(
+                    family = fam.family_id,
+                    ticker = ticker,
+                    n_tickers = fam.tickers.len(),
+                    "internal-arb: partial-fill on non-binary family; hedge construction not yet supported"
+                );
+                continue;
+            }
+            let sibling_has_yes = fam
+                .tickers
+                .iter()
+                .any(|t| t != ticker && yes_open.contains_key(t));
+            if sibling_has_yes {
+                // Both YES legs are open — the basket arb is
+                // complete; nothing orphaned.
+                continue;
+            }
+            partials.insert(
+                ticker.clone(),
+                PartialFillInfo {
+                    family_id: fam.family_id.clone(),
+                    yes_qty: yes_pos.current_qty,
+                    yes_avg_entry_cents: yes_pos.avg_entry_cents,
+                },
+            );
+        }
+    }
+    partials
+}
+
 #[derive(Debug)]
 pub struct InternalArbStrategy {
     config: InternalArbConfig,
@@ -303,6 +402,35 @@ pub struct InternalArbStrategy {
     /// minute, expensive leg never lifts, underdog YES exposure
     /// stacks" pathology that the audit found post-cap-raise.
     exposed_tickers: HashSet<String>,
+    /// 2026-05-16 partial-fill hedge-completion. Latest NO-ask in
+    /// cents per ticker, derived from `100 - best_yes_bid`. Used
+    /// to price hedge orders when a leg group resolves with one
+    /// YES leg filled and the sibling cancelled.
+    no_ask_cents: HashMap<String, u8>,
+    /// Available qty at the NO touch per ticker (caps the hedge
+    /// size).
+    no_ask_qty: HashMap<String, u32>,
+    /// Tickers with a one-legged YES exposure detected on the
+    /// most recent `refresh_exposure` — i.e. a partial-fill ghost
+    /// that needs a NO-side hedge to lock in YES+NO = 100c.
+    /// Cleared automatically once the YES position is offset by a
+    /// NO-side fill (or settles). Only binary families are
+    /// flagged; multi-leg partials are logged and skipped.
+    partial_fill_positions: HashMap<String, PartialFillInfo>,
+    /// Tickers with an in-flight `internal-arb-hedge:` intent.
+    /// Rebuilt from `Db::active_intents` on every refresh so a
+    /// cancelled IOC hedge can be retried on the next BookUpdate
+    /// without double-submitting.
+    hedge_in_flight: HashSet<String>,
+}
+
+/// One-legged exposure that needs a NO-side hedge to neutralize
+/// the directional bet left behind by a partial-fill leg group.
+#[derive(Debug, Clone)]
+pub struct PartialFillInfo {
+    pub family_id: String,
+    pub yes_qty: i32,
+    pub yes_avg_entry_cents: i32,
 }
 
 impl InternalArbStrategy {
@@ -317,6 +445,10 @@ impl InternalArbStrategy {
             last_config_refresh: None,
             pending_groups: Vec::new(),
             exposed_tickers: HashSet::new(),
+            no_ask_cents: HashMap::new(),
+            no_ask_qty: HashMap::new(),
+            partial_fill_positions: HashMap::new(),
+            hedge_in_flight: HashSet::new(),
         }
     }
 
@@ -328,22 +460,25 @@ impl InternalArbStrategy {
         self.ticker_to_families.keys().cloned().collect()
     }
 
-    /// Rebuild `exposed_tickers` from current open positions +
-    /// in-flight intents. Two small DB reads. Called from
-    /// `on_event` on every BookUpdate that lands on a configured
-    /// ticker.
+    /// Rebuild exposure + partial-fill state from current open
+    /// positions + in-flight intents. Two small DB reads. Called
+    /// from `on_event` on every BookUpdate that lands on a
+    /// configured ticker.
     async fn refresh_exposure(
         &mut self,
         db: &Db,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let positions = db.open_positions(Some(STRATEGY_ID.0)).await?;
+        let active = db.active_intents(Some(STRATEGY_ID.0)).await?;
+
         let mut set = HashSet::new();
-        for p in db.open_positions(Some(STRATEGY_ID.0)).await? {
+        for p in &positions {
             if p.current_qty != 0 {
-                set.insert(p.ticker);
+                set.insert(p.ticker.clone());
             }
         }
-        for i in db.active_intents(Some(STRATEGY_ID.0)).await? {
-            set.insert(i.ticker);
+        for i in &active {
+            set.insert(i.ticker.clone());
         }
         if set != self.exposed_tickers {
             info!(
@@ -353,6 +488,27 @@ impl InternalArbStrategy {
             );
         }
         self.exposed_tickers = set;
+
+        // Partial-fill detection on the same data we just fetched
+        // (no extra DB round trip).
+        let partials =
+            detect_partial_fills(&self.families, &self.ticker_to_families, positions.iter());
+        let hedge_in_flight: HashSet<String> = active
+            .iter()
+            .filter(|i| i.client_id.starts_with("internal-arb-hedge:"))
+            .map(|i| i.ticker.clone())
+            .collect();
+        if partials.len() != self.partial_fill_positions.len()
+            || hedge_in_flight.len() != self.hedge_in_flight.len()
+        {
+            info!(
+                n_partial_fills = partials.len(),
+                n_hedge_in_flight = hedge_in_flight.len(),
+                "internal-arb: partial-fill state updated"
+            );
+        }
+        self.partial_fill_positions = partials;
+        self.hedge_in_flight = hedge_in_flight;
         Ok(())
     }
 
@@ -431,17 +587,105 @@ impl InternalArbStrategy {
         let yes_ask = book
             .best_no_bid()
             .and_then(|(p, _)| 100u8.checked_sub(p.cents()));
-        let qty = book.best_no_bid().map(|(_, q)| q).unwrap_or(0);
+        let yes_ask_qty = book.best_no_bid().map(|(_, q)| q).unwrap_or(0);
         match yes_ask {
             Some(c) if c > 0 => {
                 self.yes_ask_cents.insert(key.clone(), c);
-                self.yes_ask_qty.insert(key, qty);
+                self.yes_ask_qty.insert(key.clone(), yes_ask_qty);
             }
             _ => {
                 self.yes_ask_cents.remove(&key);
                 self.yes_ask_qty.remove(&key);
             }
         }
+        // NO-ask = 100 - best_yes_bid (mirror of YES-ask derivation).
+        // Used to price hedge orders for partial-fill recovery.
+        let no_ask = book
+            .best_yes_bid()
+            .and_then(|(p, _)| 100u8.checked_sub(p.cents()));
+        let no_ask_qty = book.best_yes_bid().map(|(_, q)| q).unwrap_or(0);
+        match no_ask {
+            Some(c) if c > 0 => {
+                self.no_ask_cents.insert(key.clone(), c);
+                self.no_ask_qty.insert(key, no_ask_qty);
+            }
+            _ => {
+                self.no_ask_cents.remove(&key);
+                self.no_ask_qty.remove(&key);
+            }
+        }
+    }
+
+    /// Build hedge intents for every partial-fill ticker whose
+    /// book currently shows enough NO-side liquidity to cover the
+    /// open YES qty and whose hedge isn't already in flight.
+    ///
+    /// Each hedge is a single-leg IOC `Buy NO` on the same ticker
+    /// as the orphaned YES position. YES + NO = 100c at
+    /// settlement, so the strategy locks in a known
+    /// `yes_entry + no_ask - 100` loss per pair (typically the
+    /// bid/ask spread + the price drift since the leg-out)
+    /// instead of a ±50c directional outcome.
+    fn emit_pending_hedges(&mut self) -> Vec<Intent> {
+        let mut out = Vec::new();
+        for (ticker, info) in &self.partial_fill_positions {
+            if self.hedge_in_flight.contains(ticker) {
+                continue;
+            }
+            let Some(&no_ask) = self.no_ask_cents.get(ticker) else {
+                continue;
+            };
+            let book_qty = self.no_ask_qty.get(ticker).copied().unwrap_or(0);
+            let needed = u32::try_from(info.yes_qty.abs()).unwrap_or(0);
+            if needed == 0 || book_qty < needed {
+                continue;
+            }
+
+            let ts_sec = chrono::Utc::now().timestamp() as u32;
+            let client_id = format!(
+                "internal-arb-hedge:{cid_ticker}:{ask:02}:{size:04}:{ts:08x}",
+                cid_ticker = cid_safe_ticker(ticker),
+                ask = no_ask,
+                size = needed,
+                ts = ts_sec,
+            );
+            let lock_in_cents = info.yes_avg_entry_cents + i32::from(no_ask);
+            info!(
+                family = info.family_id,
+                ticker = ticker,
+                yes_qty = info.yes_qty,
+                yes_avg_entry_cents = info.yes_avg_entry_cents,
+                no_ask_cents = no_ask,
+                lock_in_total_cents = lock_in_cents,
+                "internal-arb: emitting partial-fill hedge"
+            );
+            out.push(Intent {
+                client_id,
+                strategy: STRATEGY_ID.0,
+                market: MarketTicker::new(ticker),
+                side: Side::No,
+                action: IntentAction::Buy,
+                price_cents: Some(i32::from(no_ask)),
+                qty: i32::try_from(needed).unwrap_or(i32::MAX),
+                order_type: OrderType::Limit,
+                tif: Tif::Ioc,
+                reason: Some(format!(
+                    "internal-arb-hedge[{family}]: yes_qty={yq} yes_entry={ye}c no_ask={na}c lock_in={li}c",
+                    family = info.family_id,
+                    yq = info.yes_qty,
+                    ye = info.yes_avg_entry_cents,
+                    na = no_ask,
+                    li = lock_in_cents,
+                )),
+                post_only: false,
+            });
+            // Reserve in-memory so a second BookUpdate in the same
+            // tick can't double-emit before the engine persists the
+            // intent. The next `refresh_exposure` will overwrite
+            // this from authoritative DB state.
+            self.hedge_in_flight.insert(ticker.clone());
+        }
+        out
     }
 
     fn evaluate_family(&mut self, family_idx: usize, now: Instant) -> Option<LegGroup> {
@@ -614,6 +858,13 @@ impl Strategy for InternalArbStrategy {
                 // strategy uses the same per-event inventory
                 // refresh pattern.
                 self.refresh_exposure(&state.db).await?;
+                // Hedge any partial fills we observed on this
+                // refresh BEFORE evaluating new arb opportunities.
+                // This ensures the orphaned YES leg gets a NO-side
+                // companion the next time the OMS submits, locking
+                // YES+NO=100c instead of riding a ±50c directional
+                // bet to settlement.
+                let hedges = self.emit_pending_hedges();
                 let now = Instant::now();
                 for idx in candidate_indexes {
                     if let Some(group) = self.evaluate_family(idx, now) {
@@ -627,7 +878,7 @@ impl Strategy for InternalArbStrategy {
                         self.pending_groups.push(group);
                     }
                 }
-                Ok(Vec::new())
+                Ok(hedges)
             }
             _ => Ok(Vec::new()),
         }
@@ -921,5 +1172,213 @@ mod tests {
         assert_eq!(kx_a.len(), 2);
         let kx_b = s.ticker_to_families.get("KX-B").unwrap();
         assert_eq!(kx_b.len(), 1);
+    }
+
+    // ─── Partial-fill hedge-completion tests ────────────────
+
+    fn mk_open_pos(ticker: &str, side: &str, qty: i32, entry: i32) -> OpenPosition {
+        OpenPosition {
+            strategy: STRATEGY_ID.0.to_string(),
+            ticker: ticker.to_string(),
+            side: side.to_string(),
+            current_qty: qty,
+            avg_entry_cents: entry,
+            realized_pnl_cents: 0,
+            fees_paid_cents: 0,
+            opened_at: chrono::Utc::now(),
+            last_fill_at: None,
+        }
+    }
+
+    fn loaded_strategy(families: serde_json::Value) -> InternalArbStrategy {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("families.json");
+        std::fs::write(&path, serde_json::to_string(&families).unwrap()).unwrap();
+        let mut s = InternalArbStrategy::new(cfg(path));
+        s.reload_families();
+        // Keep tempdir alive for the duration of the strategy by
+        // leaking it — the strategy holds the path but never
+        // re-reads it after the initial load in these tests.
+        std::mem::forget(dir);
+        s
+    }
+
+    #[test]
+    fn detect_partial_fill_flags_one_legged_yes() {
+        let s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        let positions = vec![mk_open_pos("KX-A", "yes", 1, 46)];
+        let partials = detect_partial_fills(&s.families, &s.ticker_to_families, positions.iter());
+        assert_eq!(partials.len(), 1);
+        let info = partials.get("KX-A").expect("partial flagged");
+        assert_eq!(info.family_id, "GAME");
+        assert_eq!(info.yes_qty, 1);
+        assert_eq!(info.yes_avg_entry_cents, 46);
+    }
+
+    #[test]
+    fn detect_partial_fill_ignores_fully_hedged_basket() {
+        // Both YES legs filled — the basket arb is complete, no orphan.
+        let s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        let positions = vec![
+            mk_open_pos("KX-A", "yes", 1, 46),
+            mk_open_pos("KX-B", "yes", 1, 51),
+        ];
+        let partials = detect_partial_fills(&s.families, &s.ticker_to_families, positions.iter());
+        assert!(partials.is_empty());
+    }
+
+    #[test]
+    fn detect_partial_fill_ignores_ticker_with_existing_no_hedge() {
+        // YES filled, NO already filled on the same ticker — the
+        // hedge already completed; nothing to do.
+        let s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        let positions = vec![
+            mk_open_pos("KX-A", "yes", 1, 46),
+            mk_open_pos("KX-A", "no", 1, 56),
+        ];
+        let partials = detect_partial_fills(&s.families, &s.ticker_to_families, positions.iter());
+        assert!(partials.is_empty());
+    }
+
+    #[test]
+    fn detect_partial_fill_skips_non_binary_family() {
+        // 3-team family — hedge construction is non-trivial for
+        // multi-leg baskets; the detector skips with a warning.
+        let s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "TRIPLE", "tickers": ["KX-A", "KX-B", "KX-C"] }
+            ]
+        }));
+        let positions = vec![mk_open_pos("KX-A", "yes", 1, 33)];
+        let partials = detect_partial_fills(&s.families, &s.ticker_to_families, positions.iter());
+        assert!(partials.is_empty());
+    }
+
+    #[test]
+    fn detect_partial_fill_ignores_unconfigured_ticker() {
+        // Open position on a ticker that isn't in any configured
+        // family — outside this strategy's scope.
+        let s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        let positions = vec![mk_open_pos("KX-Z", "yes", 1, 50)];
+        let partials = detect_partial_fills(&s.families, &s.ticker_to_families, positions.iter());
+        assert!(partials.is_empty());
+    }
+
+    fn book_with_both_sides(yes_ask_cents: u8, no_ask_cents: u8, qty: u32) -> OrderBook {
+        // YES ask = 100 - NO bid → NO bid at (100 - yes_ask).
+        // NO  ask = 100 - YES bid → YES bid at (100 - no_ask).
+        let mut b = OrderBook::new("KX-A");
+        let snap = predigy_book::Snapshot {
+            seq: 1,
+            yes_bids: vec![(Price::from_cents(100 - no_ask_cents).unwrap(), qty)],
+            no_bids: vec![(Price::from_cents(100 - yes_ask_cents).unwrap(), qty)],
+        };
+        b.apply_snapshot(snap);
+        b
+    }
+
+    #[test]
+    fn emit_pending_hedges_builds_no_buy_for_partial_fill() {
+        let mut s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        // Book has both sides quoted: YES ask 44, NO ask 58.
+        s.record_book(&MarketTicker::new("KX-A"), &book_with_both_sides(44, 58, 5));
+        s.partial_fill_positions.insert(
+            "KX-A".to_string(),
+            PartialFillInfo {
+                family_id: "GAME".to_string(),
+                yes_qty: 1,
+                yes_avg_entry_cents: 46,
+            },
+        );
+        let intents = s.emit_pending_hedges();
+        assert_eq!(intents.len(), 1);
+        let hedge = &intents[0];
+        assert_eq!(hedge.market.as_str(), "KX-A");
+        assert_eq!(hedge.side, Side::No);
+        assert_eq!(hedge.action, IntentAction::Buy);
+        assert_eq!(hedge.price_cents, Some(58));
+        assert_eq!(hedge.qty, 1);
+        assert_eq!(hedge.tif, Tif::Ioc);
+        assert!(hedge.client_id.starts_with("internal-arb-hedge:"));
+        // Defensive in-memory reservation set so a second emit in
+        // the same tick is a no-op.
+        assert!(s.hedge_in_flight.contains("KX-A"));
+        assert!(s.emit_pending_hedges().is_empty());
+    }
+
+    #[test]
+    fn emit_pending_hedges_skips_when_hedge_already_in_flight() {
+        let mut s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        s.record_book(&MarketTicker::new("KX-A"), &book_with_both_sides(44, 58, 5));
+        s.partial_fill_positions.insert(
+            "KX-A".to_string(),
+            PartialFillInfo {
+                family_id: "GAME".to_string(),
+                yes_qty: 1,
+                yes_avg_entry_cents: 46,
+            },
+        );
+        s.hedge_in_flight.insert("KX-A".to_string());
+        assert!(s.emit_pending_hedges().is_empty());
+    }
+
+    #[test]
+    fn emit_pending_hedges_skips_when_no_side_lacks_liquidity() {
+        let mut s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        // NO-side qty is 0 → not enough to cover the YES qty=3 hedge.
+        s.record_book(&MarketTicker::new("KX-A"), &book_with_both_sides(44, 58, 0));
+        s.partial_fill_positions.insert(
+            "KX-A".to_string(),
+            PartialFillInfo {
+                family_id: "GAME".to_string(),
+                yes_qty: 3,
+                yes_avg_entry_cents: 46,
+            },
+        );
+        assert!(s.emit_pending_hedges().is_empty());
+        // Must NOT pre-reserve when we couldn't actually emit.
+        assert!(!s.hedge_in_flight.contains("KX-A"));
+    }
+
+    #[test]
+    fn record_book_tracks_both_yes_and_no_asks() {
+        let mut s = loaded_strategy(serde_json::json!({
+            "families": [
+                { "family_id": "GAME", "tickers": ["KX-A", "KX-B"] }
+            ]
+        }));
+        s.record_book(&MarketTicker::new("KX-A"), &book_with_both_sides(42, 60, 7));
+        assert_eq!(s.yes_ask_cents.get("KX-A"), Some(&42));
+        assert_eq!(s.yes_ask_qty.get("KX-A"), Some(&7));
+        assert_eq!(s.no_ask_cents.get("KX-A"), Some(&60));
+        assert_eq!(s.no_ask_qty.get("KX-A"), Some(&7));
     }
 }
